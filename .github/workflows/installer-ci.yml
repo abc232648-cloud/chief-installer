@@ -77,4 +77,4 @@ jobs:
 
       - name: Run packaged executable help test
         run: |
-          python3 dist/installer/linux/chief-installer --help
+          ./dist/installer/linux/chief-installer --help
