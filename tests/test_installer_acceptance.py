@@ -34,6 +34,7 @@ class AcceptancePlatformAdapter(PlatformAdapter):
 
     def __init__(self, username: str = "testowner"):
         self.username = username
+        self.os_name = "linux"
         self.calls: List[str] = []
         self.installed_units: List[Path] = []
 
@@ -152,6 +153,9 @@ def _find_chief_agent_repo() -> Optional[Path]:
 
 def test_clean_host_acceptance_with_real_chief_deployment_contract(tmp_path):
     """End-to-end acceptance test executing real Chief Agent contract without mock fallback."""
+    if sys.version_info < (3, 11):
+        pytest.skip("chief-agent requires Python 3.11+ (hashlib.file_digest); skipping acceptance test on Python 3.10")
+
     chief_agent_repo = _find_chief_agent_repo()
     if not chief_agent_repo:
         pytest.skip("chief-agent peer repo not present; skipping end-to-end acceptance test")
@@ -162,31 +166,39 @@ def test_clean_host_acceptance_with_real_chief_deployment_contract(tmp_path):
     except ImportError as exc:
         pytest.skip(f"Chief Agent dependencies missing ({exc}); skipping end-to-end acceptance test")
 
-    # Setup isolated test filesystem layout
-    custom_root = tmp_path / "chief_share"
-    custom_home = tmp_path / "chief_home"
+    # Setup isolated test filesystem layout (resolving symlinks for strict _plain checks)
+    custom_root = (tmp_path / "chief_share").resolve()
+    custom_home = (tmp_path / "chief_home").resolve()
     paths = InstallerPaths.create(custom_root=custom_root, home=custom_home)
 
     # Point tooling and release source to the local clean chief-agent repository
-    paths.tooling = chief_agent_repo
-    paths.release_source = chief_agent_repo
-    paths.python = Path(sys.executable)
+    paths.tooling = chief_agent_repo.resolve()
+    paths.release_source = chief_agent_repo.resolve()
+    paths.python = Path(sys.executable).resolve()
 
-    # Set up real browser configuration in advance
-    paths.browser_config.parent.mkdir(parents=True, exist_ok=True)
+    # Set up real regular browser binary (non-symlink) in advance
+    browser_bin = (custom_root / "browser" / ("chrome.exe" if os.name == "nt" else "chrome")).resolve()
+    browser_bin.parent.mkdir(parents=True, exist_ok=True)
+    browser_bin.write_bytes(b"CHIEF-BROWSER-BINARY-REGULAR-FILE\x00\x01\x02\x03\x04\x05")
+    try:
+        browser_bin.chmod(0o755)
+    except Exception:
+        pass
+
     import hashlib
-    real_sha = hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest()
+    real_sha = hashlib.sha256(browser_bin.read_bytes()).hexdigest()
     browser_data = {
-        "executable": sys.executable,
+        "executable": str(browser_bin),
         "sha256": real_sha,
         "version": "130.0.0.0",
     }
+    paths.browser_config.parent.mkdir(parents=True, exist_ok=True)
     paths.browser_config.write_text(json.dumps(browser_data), encoding="utf-8")
 
     # Real deployment client wired to target tooling
     deployment_client = ChiefAgentDeploymentClient(
         agent_root=paths.tooling,
-        python_bin=Path(sys.executable),
+        python_bin=paths.python,
     )
 
     platform = AcceptancePlatformAdapter(username="testowner")
@@ -223,7 +235,12 @@ def test_clean_host_acceptance_with_real_chief_deployment_contract(tmp_path):
 
     # Pre-stage mock caddy binary to validate caddyfile handling without downloading external binary
     (paths.caddy_root / "bin").mkdir(parents=True, exist_ok=True)
-    (paths.caddy_root / "bin" / "caddy").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    caddy_file = paths.caddy_root / "bin" / "caddy"
+    caddy_file.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    try:
+        caddy_file.chmod(0o755)
+    except Exception:
+        pass
 
     # Pre-stage mock caddy CA root certificate
     ca_dir = paths.caddy_root / "data" / "caddy" / "pki" / "authorities" / "local"

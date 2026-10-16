@@ -488,10 +488,14 @@ class InstallerOrchestrator:
         self.logger.info(f"Downloading Caddy binary archive from {tar_url}")
         urllib.request.urlretrieve(tar_url, str(tar_path))
 
-        actual_tar_sha256 = hashlib.sha256(tar_path.read_bytes()).hexdigest()
-        if actual_tar_sha256.lower() != expected_file_sha256.lower():
+        if len(expected_file_sha256) == 128:
+            actual_tar_hash = hashlib.sha512(tar_path.read_bytes()).hexdigest()
+        else:
+            actual_tar_hash = hashlib.sha256(tar_path.read_bytes()).hexdigest()
+
+        if actual_tar_hash.lower() != expected_file_sha256.lower():
             raise ReleaseMismatchError(
-                f"Caddy archive verification failed. Expected {expected_file_sha256}, got {actual_tar_sha256}"
+                f"Caddy archive verification failed. Expected {expected_file_sha256}, got {actual_tar_hash}"
             )
 
         (self.paths.caddy_root / "bin").mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -970,7 +974,7 @@ class InstallerOrchestrator:
         self.paths.caddyfile.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.paths.caddyfile.write_text(caddyfile_content, encoding="utf-8")
 
-        if getattr(self.platform, "os_name", "") == "linux" and shutil.which(str(caddy_bin)):
+        if os.name != "nt" and getattr(self.platform, "os_name", "") == "linux" and shutil.which(str(caddy_bin)):
             val_res = subprocess.run(
                 [str(caddy_bin), "validate", "--config", str(self.paths.caddyfile), "--adapter", "caddyfile"],
                 capture_output=True,
