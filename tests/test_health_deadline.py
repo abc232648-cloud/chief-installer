@@ -131,6 +131,10 @@ def test_health_check_enforces_15_second_wall_clock_deadline(tmp_path, monkeypat
         deployment_client=_DeploymentClient(),
     )
 
+    # Isolate the health step while preserving its valid predecessor state.
+    orchestrator.state_machine.current_step = StepId.LOCAL_DISCOVERY
+    orchestrator.state_machine.current_status = StepStatus.SUCCESS
+
     with pytest.raises(InstallerError, match="15-second deadline"):
         orchestrator._step_health_check()
 
