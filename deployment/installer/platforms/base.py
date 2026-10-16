@@ -19,6 +19,11 @@ class PlatformAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def get_current_username(self) -> str:
+        """Return operating-system user account executing the installation."""
+        raise NotImplementedError
+
+    @abstractmethod
     def run_preflight_checks(self) -> PreflightReport:
         """Check host capabilities (disk space, network, permissions, dependencies)."""
         raise NotImplementedError

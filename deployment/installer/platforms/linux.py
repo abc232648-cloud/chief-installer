@@ -48,6 +48,10 @@ class LinuxPlatformAdapter(PlatformAdapter):
         except FileNotFoundError as exc:
             raise PrivilegeError(f"Privilege elevation helper not found: {exc}") from exc
 
+    def get_current_username(self) -> str:
+        import getpass
+        return os.environ.get("USER") or os.environ.get("LOGNAME") or getpass.getuser()
+
     def get_platform_info(self) -> PlatformInfo:
         distro_id = "linux"
         distro_name = "Linux"

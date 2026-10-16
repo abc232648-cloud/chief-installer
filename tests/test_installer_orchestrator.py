@@ -28,6 +28,10 @@ class FakePlatformAdapter(PlatformAdapter):
         self.has_existing_install = has_existing_install
         self.calls: List[str] = []
 
+    def get_current_username(self) -> str:
+        self.calls.append("get_current_username")
+        return "testuser"
+
     def get_platform_info(self) -> PlatformInfo:
         self.calls.append("get_platform_info")
         return PlatformInfo(

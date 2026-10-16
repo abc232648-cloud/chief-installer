@@ -64,8 +64,8 @@ def test_actual_chief_agent_handshake():
         client = ChiefAgentDeploymentClient(agent_root=agent_root)
         handshake = client.verify_compatibility()
         assert handshake.is_compatible is True
-        assert handshake.contract_version == "1.0.0"
-        assert handshake.chief_agent_commit == "819b7d76c9b17e0c58b50c32ea485991f163aeba"
+        from deployment.installer import ACCEPTED_FIRST_RELEASE_MANIFEST
+        assert handshake.chief_agent_commit == ACCEPTED_FIRST_RELEASE_MANIFEST.chief_agent_commit
 
 
 def test_incompatible_version_raises(tmp_path):

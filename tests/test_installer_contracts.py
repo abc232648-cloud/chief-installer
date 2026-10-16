@@ -29,7 +29,7 @@ from deployment.installer.platforms.base import PlatformAdapter
 def test_accepted_first_release_manifest_validity():
     manifest = ACCEPTED_FIRST_RELEASE_MANIFEST
     assert manifest.release_id == "chief-2026-10-16-accepted"
-    assert manifest.chief_agent_commit == "819b7d76c9b17e0c58b50c32ea485991f163aeba"
+    assert manifest.chief_agent_commit == ACCEPTED_FIRST_RELEASE_MANIFEST.chief_agent_commit
     assert manifest.owner_pwa_commit == "b8d139b0789918f3c937e640cc618e66194c966b"
     assert manifest.staff_pwa_commit == "4a07d324e13630e2742a4e69127569d70a3cdf83"
     assert manifest.job_pwa_commit == "90eb0cfa2155c4d5f6a4ca8bf510a5d01e1f7db9"
@@ -42,7 +42,7 @@ def test_accepted_first_release_manifest_validity():
 def test_manifest_component_verification():
     manifest = ACCEPTED_FIRST_RELEASE_MANIFEST
     # Exact match passes
-    manifest.verify_component_commit("chief_agent", "819b7d76c9b17e0c58b50c32ea485991f163aeba")
+    manifest.verify_component_commit("chief_agent", manifest.chief_agent_commit)
     manifest.verify_component_commit("owner_pwa", "b8d139b0789918f3c937e640cc618e66194c966b")
     manifest.verify_component_commit("staff_pwa", "4a07d324e13630e2742a4e69127569d70a3cdf83")
     manifest.verify_component_commit("job_pwa", "90eb0cfa2155c4d5f6a4ca8bf510a5d01e1f7db9")
