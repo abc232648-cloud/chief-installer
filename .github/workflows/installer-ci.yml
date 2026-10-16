@@ -89,6 +89,6 @@ jobs:
         run: |
           pytest tests/test_packaged_linux_acceptance.py -v
 
-      - name: Run Xubuntu packaged qualification acceptance script
+      - name: Run Linux packaged artifact qualification script
         run: |
           bash packaging/installer/linux/run_xubuntu_acceptance.sh

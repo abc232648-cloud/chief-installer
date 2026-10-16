@@ -1047,19 +1047,33 @@ class InstallerOrchestrator:
                 pass
 
         health_url = f"http://127.0.0.1:{port}/api/health"
-        max_attempts = 15
+        health_deadline_seconds = 15.0
+        deadline = time.monotonic() + health_deadline_seconds
         healthy = False
 
-        self.logger.info(f"Probing application health endpoint at {health_url}...")
-        for attempt in range(1, max_attempts + 1):
-            if self.platform.probe_health_endpoint(health_url, timeout=2.0):
+        self.logger.info(
+            f"Probing application health endpoint at {health_url} for up to "
+            f"{health_deadline_seconds:.0f} seconds..."
+        )
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+
+            probe_timeout = min(2.0, remaining)
+            if self.platform.probe_health_endpoint(health_url, timeout=probe_timeout):
                 healthy = True
                 break
-            time.sleep(1)
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(1.0, remaining))
 
         if not healthy:
             raise InstallerError(
-                f"Chief health endpoint at {health_url} failed to respond with 200 OK after {max_attempts} seconds."
+                f"Chief health endpoint at {health_url} failed to respond with 200 OK "
+                f"within the {health_deadline_seconds:.0f}-second deadline."
             )
 
         self.state_machine.transition(StepId.HEALTH_CHECK, StepStatus.SUCCESS, message="All services active and healthy.")

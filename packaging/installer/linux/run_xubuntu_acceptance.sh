@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Chief Unified Installer — Reference Xubuntu / Linux Acceptance Test Script
+# Chief Unified Installer — Packaged Linux Artifact Qualification
 #
-# Executes the packaged Chief Installer artifact on a live Linux system,
-# validating preflight requirements, unprivileged service execution,
-# local mDNS discovery, and Caddy TLS proxy health verification.
+# This CI-safe script validates the built Linux installer artifact itself:
+# package presence, SHA-256 integrity, CLI availability, and fail-closed
+# argument validation.
+#
+# IMPORTANT: This is NOT a real-host Xubuntu installation acceptance test. It
+# does not claim to validate live systemd user services, Avahi/mDNS discovery,
+# Caddy TLS startup, or the deployed /api/health endpoint. Those checks require
+# a separate acceptance run on a real supported Xubuntu host.
 # ==============================================================================
 set -euo pipefail
 
@@ -13,7 +18,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 PACKAGE_DIR="$PROJECT_ROOT/dist/installer/linux"
 PACKAGE_BIN="$PACKAGE_DIR/chief-installer"
 
-echo "=== Chief Linux / Xubuntu Packaged Artifact Acceptance Test ==="
+echo "=== Chief Linux Packaged Artifact Qualification ==="
 
 # 1. Ensure package exists or build it
 if [[ ! -x "$PACKAGE_BIN" ]]; then
@@ -53,4 +58,5 @@ if "$PACKAGE_BIN" --non-interactive >/dev/null 2>&1; then
 fi
 echo "[OK] Fail-closed argument validation verified"
 
-echo "=== Packaged artifact qualification test passed successfully ==="
+echo "=== Packaged artifact qualification passed successfully ==="
+echo "NOTE: Real-host Xubuntu service/mDNS/TLS/health acceptance remains a separate release gate."
