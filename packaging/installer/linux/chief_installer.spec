@@ -20,6 +20,7 @@ a = Analysis(
         'tkinter.ttk',
         'tkinter.messagebox',
         'deployment.installer',
+        'deployment.installer.contract',
         'deployment.installer.models',
         'deployment.installer.errors',
         'deployment.installer.events',

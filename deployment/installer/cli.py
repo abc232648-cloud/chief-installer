@@ -26,8 +26,7 @@ def get_default_platform_adapter() -> PlatformAdapter:
     if system == "Linux":
         return LinuxPlatformAdapter()
     else:
-        # Fallback or future platform adapter
-        from .platforms.linux import LinuxPlatformAdapter
+        # Fallback or future platform adapter (e.g. Windows/macOS)
         return LinuxPlatformAdapter()
 
 

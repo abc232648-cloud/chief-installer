@@ -32,8 +32,8 @@ def build_package(output_dir: Optional[Path] = None) -> Path:
 
     print(f"Building Chief Installer package for release: {manifest.release_id}...")
 
-    # If pyinstaller is available in environment, build using spec
-    if shutil.which("pyinstaller"):
+    # If on Linux and pyinstaller is available in environment, build using spec
+    if sys.platform.startswith("linux") and shutil.which("pyinstaller"):
         spec_path = _PROJECT_ROOT / "packaging" / "installer" / "linux" / "chief_installer.spec"
         print(f"Running pyinstaller with spec: {spec_path}...")
         cmd = ["pyinstaller", "--clean", "--distpath", str(out), str(spec_path)]
