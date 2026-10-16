@@ -116,7 +116,7 @@ class ChiefAgentDeploymentClient:
             )
 
         capabilities = info.get("supported_capabilities", [])
-        required_caps = ["prepare_instance", "bootstrap_install", "install_readiness"]
+        required_caps = ["prepare_instance", "bootstrap_install", "install_readiness", "chief_scoped_dns"]
         missing_caps = [c for c in required_caps if c not in capabilities]
         if missing_caps:
             raise ContractCompatibilityError(
@@ -148,6 +148,7 @@ class ChiefAgentDeploymentClient:
             contract_version="test-mock-1.0.0",
             chief_agent_commit="a9a1f33e42f1cfc7c73811ffd13ae3db0963cb47",
             supported_capabilities=[
+                "chief_scoped_dns",
                 "prepare_instance",
                 "source_manifest",
                 "bootstrap_install",
@@ -260,6 +261,7 @@ class ChiefAgentDeploymentClient:
         farm_operations: str = "DISABLED",
         organization_name: Optional[str] = None,
         farm_name: Optional[str] = None,
+        dns_mode: str = "quad9",
     ) -> Dict[str, Any]:
         """Execute production instance preparation."""
         return self._invoke_contract(
@@ -277,6 +279,7 @@ class ChiefAgentDeploymentClient:
             farm_operations=farm_operations,
             organization_name=organization_name,
             farm_name=farm_name,
+            dns_mode=dns_mode,
         )
 
     def create_install_backup(

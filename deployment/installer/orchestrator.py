@@ -812,7 +812,7 @@ class InstallerOrchestrator:
 
             if not self.paths.config.exists():
                 with open(self.paths.config, "w", encoding="utf-8") as f:
-                    json.dump({"schema_sha256": "mock_schema_sha256", "dashboard_port": 8765}, f)
+                    json.dump({"schema_sha256": "mock_schema_sha256", "dashboard_port": 8765, "dns_mode": self.options.dns_mode}, f)
             self._expected_schema_sha256 = "mock_schema_sha256"
             self.state_machine.transition(StepId.PRODUCTION_INSTANCE, StepStatus.SUCCESS, message="Production database prepared (mock).")
             return
@@ -837,6 +837,7 @@ class InstallerOrchestrator:
             password=self.options.owner_password,
             public_host=self._public_host,
             browser_runtime=self.paths.browser_config,
+            dns_mode=self.options.dns_mode,
             dashboard_port=8765,
             trusted_tls_proxy="127.0.0.1",
             farm_operations=self.options.farm_operations,

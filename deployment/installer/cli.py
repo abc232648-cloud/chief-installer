@@ -62,6 +62,8 @@ def run_cli(argv: Optional[List[str]] = None, platform_adapter: Optional[Platfor
     parser.add_argument("--manifest", help="Path to release manifest JSON.")
     parser.add_argument("--non-interactive", action="store_true", help="Fail if required fields are missing instead of prompting.")
 
+    parser.add_argument('--dns-mode', choices=['quad9', 'system'], default='quad9',
+                        help='Chief DNS: Quad9 Secure DoH (default) or System DNS. Host DNS is unchanged.')
     args = parser.parse_args(argv)
 
     # Resolve platform
@@ -163,6 +165,7 @@ def run_cli(argv: Optional[List[str]] = None, platform_adapter: Optional[Platfor
         farm_name=farm_name,
         public_host=args.public_host,
         tls_mode=args.tls_mode,
+        dns_mode=args.dns_mode,
     )
 
     event_bus = EventBus()

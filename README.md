@@ -37,3 +37,21 @@ python packaging/installer/linux/build_package.py
 ```bash
 pytest -v
 ```
+
+## Chief DNS review branch
+
+The wizard offers **Quad9 Secure DoH** (default) and **System DNS**. The CLI
+accepts `--dns-mode quad9|system`. The choice is persisted as `dns_mode` in the
+Chief production instance through the deployment contract. This does not change
+host OS DNS. Covered Chief browsing/download paths stop on secure-DNS errors;
+there is no Google or System DNS automatic fallback. Device PWA browsers,
+provider SDKs, SMTP/push, local integrations, and installation dependencies retain
+their own transports; this is not complete host-wide DNS enforcement.
+
+The installer requires the agent capability `chief_scoped_dns`; an older agent
+must fail compatibility validation rather than silently ignore the selection.
+The accepted-release manifest remains unchanged. To review the new combination,
+use the separately pinned `review-dns-manifest.json` with `--manifest`; this file
+is a review candidate, not an accepted release or deployment authorization.
+See the agent's `docs/Chief-Scoped-DNS.md` for coverage, safety audit, and browser
+qualification limits. No real-host acceptance is claimed by CI.

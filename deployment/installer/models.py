@@ -61,7 +61,12 @@ class InstallOptions:
     farm_name: Optional[str] = None
     public_host: Optional[str] = None
     tls_mode: str = "LOCAL"  # LOCAL or PUBLIC
+    dns_mode: str = "quad9"
     allow_test_mock: bool = False
+
+    def __post_init__(self):
+        if self.dns_mode not in ('quad9', 'system'):
+            raise ValueError('Chief DNS must be quad9 or system.')
 
     def __repr__(self) -> str:
         return (

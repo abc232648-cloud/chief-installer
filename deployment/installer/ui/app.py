@@ -223,6 +223,13 @@ class InstallerApp(tk.Tk):
         user_entry.insert(0, self.controller.owner_username or "owner")
         user_entry.pack(anchor=tk.W, pady=(0, 24))
 
+        dns_choice = tk.StringVar(value=self.controller.dns_mode)
+        ttk.Label(parent, text='DNS for Chief browsing and managed downloads (host DNS unchanged):').pack(anchor=tk.W)
+        ttk.Radiobutton(parent, text='Quad9 Secure DoH (recommended)', variable=dns_choice, value='quad9').pack(anchor=tk.W)
+        ttk.Radiobutton(parent, text='System DNS', variable=dns_choice, value='system').pack(anchor=tk.W)
+        ttk.Label(parent, text='Secure DNS failures stop the connection; there is no automatic fallback.').pack(anchor=tk.W)
+
+
         btn_bar = ttk.Frame(parent)
         btn_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
@@ -231,6 +238,7 @@ class InstallerApp(tk.Tk):
 
         def on_next():
             try:
+                self.controller.dns_mode = dns_choice.get()
                 self.controller.validate_identity(name_entry.get(), user_entry.get())
             except ValueError as e:
                 messagebox.showerror("Invalid Input", str(e))

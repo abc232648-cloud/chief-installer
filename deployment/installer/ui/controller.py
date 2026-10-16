@@ -49,6 +49,7 @@ class InstallerUIController:
         self.screen_history: List[ScreenId] = []
 
         # Form state
+        self.dns_mode: str = "quad9"
         self.owner_name: str = ""
         self.owner_username: str = "owner"
         self.owner_password: str = ""
@@ -180,6 +181,7 @@ class InstallerUIController:
     def get_confirmation_summary(self) -> Dict[str, str]:
         return {
             "Release": self.manifest.release_id,
+            "Chief DNS": "Quad9 Secure DoH" if self.dns_mode == "quad9" else "System DNS",
             "Chief Owner": self.owner_name,
             "Owner Username": self.owner_username,
             "Farm Operations": "Enabled" if self.farm_operations == "ENABLED" else "Disabled",
@@ -192,6 +194,7 @@ class InstallerUIController:
 
         options = InstallOptions(
             owner_name=self.owner_name,
+            dns_mode=self.dns_mode,
             owner_username=self.owner_username,
             owner_password=self.owner_password,
             farm_operations=self.farm_operations,
