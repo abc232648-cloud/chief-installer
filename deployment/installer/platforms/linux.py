@@ -17,6 +17,8 @@ from ..errors import PrivilegeError, SystemDependencyError
 from ..models import PlatformInfo, PreflightCheck, PreflightReport
 from .base import PlatformAdapter
 
+_FROZEN_EXECUTABLE_ENV = "CHIEF_INSTALLER_FROZEN_EXECUTABLE"
+
 
 class LinuxPlatformAdapter(PlatformAdapter):
     """Unified Linux platform adapter for Debian-family distributions."""
@@ -29,14 +31,26 @@ class LinuxPlatformAdapter(PlatformAdapter):
             return list(self._helper_cmd)
 
         helper_module = "deployment.installer.privileged.linux"
-        python_exe = sys.executable or "python3"
+
+        # In a PyInstaller build sys.executable normally points at the frozen
+        # Chief Installer binary, which cannot be invoked as `python -m ...`.
+        # Re-enter the packaged executable through its constrained internal
+        # helper mode instead. Source/zipapp execution keeps the module path.
+        if getattr(sys, "frozen", False):
+            frozen_executable = os.environ.get(_FROZEN_EXECUTABLE_ENV)
+            if not frozen_executable:
+                frozen_executable = str(Path(sys.argv[0]).resolve())
+            helper_cmd = [frozen_executable, "--internal-privileged-helper"]
+        else:
+            python_exe = sys.executable or shutil.which("python3") or shutil.which("python") or "python3"
+            helper_cmd = [python_exe, "-m", helper_module]
 
         if shutil.which("pkexec"):
-            return ["pkexec", python_exe, "-m", helper_module]
+            return ["pkexec", *helper_cmd]
         elif shutil.which("sudo"):
-            return ["sudo", python_exe, "-m", helper_module]
+            return ["sudo", *helper_cmd]
         else:
-            return [python_exe, "-m", helper_module]
+            return helper_cmd
 
     def _run_privileged(self, args: List[str]) -> None:
         cmd = self._get_helper_prefix() + args
@@ -150,24 +164,52 @@ class LinuxPlatformAdapter(PlatformAdapter):
             required=True,
         ))
 
+        # 7. Bootstrap Python check. The native installer launches by itself,
+        # but the pinned Chief source contract and isolated venv require a real
+        # host Python interpreter; a frozen executable must never impersonate it.
+        bootstrap_python = shutil.which("python3") or shutil.which("python")
+        checks.append(PreflightCheck(
+            name="python_bootstrap",
+            passed=bool(bootstrap_python),
+            message=f"Bootstrap Python available at {bootstrap_python}" if bootstrap_python else "python3 is required to create Chief's isolated runtime",
+            required=True,
+        ))
+
         overall_passed = all(c.passed for c in checks if c.required)
         return PreflightReport(platform=info, checks=checks, passed=overall_passed)
 
-    def detect_existing_installation(self) -> Tuple[bool, List[str]]:
-        home = Path.home()
-        candidates = [
-            home / "chief-agent",
-            home / "chief-runtime",
+    def _installed_state_candidates(self, home: Path) -> List[Path]:
+        """Return authoritative Chief installation/profile state paths only.
+
+        Generic developer/source directories such as ~/chief-agent,
+        ~/chief-runtime and ~/chief-release* are intentionally excluded. They
+        are not proof of an installed Chief instance and must never be moved by
+        the production installer merely because they exist.
+        """
+        candidates: List[Path] = [
             home / ".local" / "share" / "chief",
             home / ".local" / "state" / "chief",
             home / ".config" / "chief",
         ]
-        # Wildcards for preview/staging/release
-        for prefix in ("chief-release", "chief-preview", "chief-staging", "chief-test"):
-            for p in home.glob(f"{prefix}*"):
-                candidates.append(p)
 
-        existing = [str(p) for p in candidates if p.exists()]
+        unit_dir = home / ".config" / "systemd" / "user"
+        if unit_dir.exists():
+            candidates.extend(unit_dir.glob("chief-*.service"))
+            candidates.extend(unit_dir.glob("chief-*.timer"))
+            candidates.extend(unit_dir.glob("chief-*.service.d"))
+            wants_dir = unit_dir / "default.target.wants"
+            if wants_dir.exists():
+                candidates.extend(wants_dir.glob("chief-*"))
+
+        return list(candidates)
+
+    def detect_existing_installation(self) -> Tuple[bool, List[str]]:
+        home = Path.home()
+        existing = [
+            str(p)
+            for p in self._installed_state_candidates(home)
+            if p.exists() or p.is_symlink()
+        ]
         return (len(existing) > 0, existing)
 
     def archive_existing_installation(
@@ -181,22 +223,29 @@ class LinuxPlatformAdapter(PlatformAdapter):
         for s in subdirs:
             (target_dir / s).mkdir(parents=True, exist_ok=True, mode=0o700)
 
-        # Stop user services first
-        self.control_services(
-            "stop",
-            ["chief-agent-dashboard.service", "chief-agent-worker.service", "chief-agent-scheduler.service", "chief-tls-proxy.service"],
-        )
+        service_names = [
+            "chief-agent-dashboard.service",
+            "chief-agent-worker.service",
+            "chief-agent-scheduler.service",
+            "chief-tls-proxy.service",
+            "chief-n8n-container.service",
+            "chief-n8n.service",
+        ]
+
+        # Stop and disable old user services before moving their definitions.
+        self.control_services("stop", service_names)
+        self.control_services("disable", service_names)
 
         moved_records: List[str] = []
         home = Path.home()
 
         def move_item(src: Path, bucket: str) -> None:
-            if not src.exists():
+            if not (src.exists() or src.is_symlink()):
                 return
             if archive_root in src.parents or src == archive_root:
                 return
             dest = target_dir / bucket / src.name
-            if dest.exists():
+            if dest.exists() or dest.is_symlink():
                 dest = target_dir / bucket / f"{src.name}__{stamp}"
             if progress_callback:
                 progress_callback(f"Archiving: {src}")
@@ -207,28 +256,33 @@ class LinuxPlatformAdapter(PlatformAdapter):
                 if progress_callback:
                     progress_callback(f"Warning: could not move {src}: {exc}")
 
-        # Archive home legacy paths
-        for name in ("chief-agent", "chief-runtime", "chief-release", "chief-preview", "chief-staging", "chief-test"):
-            for p in home.glob(f"{name}*"):
-                move_item(p, "home")
-
-        # Archive XDG paths
+        # Archive authoritative XDG installation/profile state only. Development
+        # source trees under ~/chief-* are deliberately preserved.
         move_item(home / ".local" / "share" / "chief", "share")
         move_item(home / ".local" / "state" / "chief", "state")
         move_item(home / ".config" / "chief", "config")
 
-        # Archive user systemd units
+        # Archive user systemd units, timers, drop-ins and activation links.
         unit_dir = home / ".config" / "systemd" / "user"
         if unit_dir.exists():
-            for unit in unit_dir.glob("chief-*.service"):
+            for unit in list(unit_dir.glob("chief-*.service")):
                 move_item(unit, "systemd")
-            for timer in unit_dir.glob("chief-*.timer"):
+            for timer in list(unit_dir.glob("chief-*.timer")):
                 move_item(timer, "systemd")
+            for dropin in list(unit_dir.glob("chief-*.service.d")):
+                move_item(dropin, "systemd")
+            wants_dir = unit_dir / "default.target.wants"
+            if wants_dir.exists():
+                for link in list(wants_dir.glob("chief-*")):
+                    move_item(link, "systemd")
+
+        self.reload_service_manager()
 
         # Write summary
         summary = (
             f"Archived at {datetime.now(timezone.utc).isoformat()}\n"
-            "Nothing was deleted; all items were moved into this directory.\n\n"
+            "Nothing was deleted; all items were moved into this directory.\n"
+            "Development/source directories outside authoritative Chief install state were left untouched.\n\n"
             + "\n".join(moved_records)
             + "\n"
         )
@@ -337,7 +391,7 @@ class LinuxPlatformAdapter(PlatformAdapter):
 
     def open_url_in_browser(self, url: str) -> bool:
         if shutil.which("xdg-open"):
-            proc = subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return True
         import webbrowser
         return webbrowser.open(url)
