@@ -2,7 +2,7 @@
 
 Validates the self-contained native executable package built for Linux (Xubuntu reference platform).
 Verifies package integrity, command-line interface contracts, fail-closed parameter validation,
-and end-to-end execution without external Python module dependencies.
+and packaged helper routing without relying only on source-level tests.
 """
 import importlib.util
 import json
@@ -52,7 +52,6 @@ def test_packaged_artifact_integrity():
     assert meta["release_id"] == "chief-2026-10-16-accepted"
     assert len(meta["sha256"]) == 64
 
-    # Calculate actual SHA-256
     import hashlib
     actual_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
     assert actual_sha == meta["sha256"], f"SHA-256 mismatch: {actual_sha} vs {meta['sha256']}"
@@ -69,6 +68,19 @@ def test_packaged_artifact_help_interface():
     assert "--farm-operations" in proc.stdout
     assert "--tls-mode" in proc.stdout
     assert "--non-interactive" in proc.stdout
+
+
+def test_packaged_artifact_internal_helper_is_routed_before_cli():
+    """Regression for the physical Folio failure: frozen helper re-entry must not hit argparse."""
+    artifact = _ensure_package()
+    proc = _run_artifact(
+        artifact,
+        "--internal-privileged-helper",
+        "definitely-forbidden-test-command",
+    )
+    assert proc.returncode == 2
+    assert "Unknown or forbidden privileged command" in proc.stderr
+    assert "unrecognized arguments" not in proc.stderr
 
 
 def test_packaged_artifact_fail_closed_validation():
@@ -95,4 +107,5 @@ def test_packaged_desktop_integration():
     assert "Type=Application" in content
     assert "Name=Chief Installer" in content
     assert "Exec=chief-installer" in content
+    assert "Terminal=false" in content
     assert "Categories=System;Setup;" in content
