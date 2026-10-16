@@ -134,6 +134,10 @@ class AcceptancePlatformAdapter(PlatformAdapter):
         self.calls.append(f"open_url:{url}")
         return True
 
+    def probe_health_endpoint(self, url: str, timeout: float = 2.0) -> bool:
+        self.calls.append(f"probe_health_endpoint:{url}")
+        return True
+
 
 def _find_chief_agent_repo() -> Optional[Path]:
     if os.environ.get("CHIEF_AGENT_ROOT"):
@@ -152,19 +156,22 @@ def _find_chief_agent_repo() -> Optional[Path]:
 
 
 def test_clean_host_acceptance_with_real_chief_deployment_contract(tmp_path):
-    """End-to-end acceptance test executing real Chief Agent contract without mock fallback."""
+    """Real Chief Agent deployment contract integration acceptance test (allow_test_mock=False)."""
     if sys.version_info < (3, 11):
         pytest.skip("chief-agent requires Python 3.11+ (hashlib.file_digest); skipping acceptance test on Python 3.10")
 
     chief_agent_repo = _find_chief_agent_repo()
     if not chief_agent_repo:
-        pytest.skip("chief-agent peer repo not present; skipping end-to-end acceptance test")
+        pytest.fail("Mandatory acceptance test failed: chief-agent peer repository not found.")
+
+    if not (chief_agent_repo / "deployment" / "contract.py").exists():
+        pytest.fail(f"Mandatory acceptance test failed: deployment/contract.py not found in {chief_agent_repo}")
 
     try:
         import argon2  # noqa: F401
         import cryptography  # noqa: F401
     except ImportError as exc:
-        pytest.skip(f"Chief Agent dependencies missing ({exc}); skipping end-to-end acceptance test")
+        pytest.fail(f"Mandatory acceptance test failed: Chief Agent dependencies missing ({exc})")
 
     # Setup isolated test filesystem layout (resolving symlinks for strict _plain checks)
     custom_root = (tmp_path / "chief_share").resolve()

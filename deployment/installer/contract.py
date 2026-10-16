@@ -49,12 +49,14 @@ class ChiefAgentDeploymentClient:
         self,
         agent_root: Optional[Path] = None,
         *,
+        expected_commit: Optional[str] = None,
         allow_test_mock: bool = False,
     ) -> ContractHandshake:
         """Verify that target Chief Agent checkout satisfies the contract requirements.
         
         Fails closed by default. Mock compatibility is strictly rejected unless
-        explicitly requested via allow_test_mock=True.
+        explicitly requested via allow_test_mock=True. If expected_commit is provided,
+        enforces that the reported chief_agent_commit matches the manifest.
         """
         root = agent_root or self.agent_root
         if root is None:
@@ -121,10 +123,18 @@ class ChiefAgentDeploymentClient:
                 f"Chief Agent deployment contract is missing required capabilities: {missing_caps}"
             )
 
+        reported_commit = str(info.get("chief_agent_commit", "")).strip().lower()
+        if expected_commit and not allow_test_mock:
+            if reported_commit != expected_commit.strip().lower():
+                raise ContractCompatibilityError(
+                    f"Chief Agent commit mismatch: deployment contract reported '{reported_commit}', "
+                    f"expected pinned release commit '{expected_commit}'."
+                )
+
         handshake = ContractHandshake(
             agent_root=root,
             contract_version=agent_version,
-            chief_agent_commit=info.get("chief_agent_commit", ""),
+            chief_agent_commit=reported_commit,
             supported_capabilities=capabilities,
             is_compatible=True,
         )

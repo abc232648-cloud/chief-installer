@@ -405,7 +405,7 @@ class InstallerOrchestrator:
         sys_npm = shutil.which("npm")
         if sys_node and sys_npm:
             res = subprocess.run([sys_node, "--version"], capture_output=True, text=True)
-            if res.returncode == 0 and res.stdout.strip().startswith("v22."):
+            if res.returncode == 0 and res.stdout.strip() == f"v{self.manifest.node_version}":
                 return Path(sys_node), Path(sys_npm)
 
         node_ver = self.manifest.node_version
@@ -596,7 +596,16 @@ class InstallerOrchestrator:
                     component="chief_agent",
                 )
 
-        self.deployment_client.verify_compatibility(self.paths.tooling, allow_test_mock=self.options.allow_test_mock)
+        handshake = self.deployment_client.verify_compatibility(
+            self.paths.tooling,
+            expected_commit=self.manifest.chief_agent_commit,
+            allow_test_mock=self.options.allow_test_mock,
+        )
+        if not self.options.allow_test_mock and handshake.chief_agent_commit.lower() != self.manifest.chief_agent_commit.lower():
+            raise ReleaseMismatchError(
+                f"Release verification failure: chief_agent commit mismatch. "
+                f"Expected {self.manifest.chief_agent_commit}, but contract reported {handshake.chief_agent_commit}."
+            )
         self.state_machine.transition(StepId.RELEASE_VALIDATION, StepStatus.SUCCESS, message=f"Release {self.manifest.release_id} verified.")
 
     def _step_existing_install_detection(self) -> Tuple[bool, list]:
@@ -1025,6 +1034,10 @@ class InstallerOrchestrator:
 
         self.platform.control_services("restart", ["chief-tls-proxy.service"])
 
+        for s in ("chief-agent-dashboard.service", "chief-agent-worker.service", "chief-agent-scheduler.service", "chief-tls-proxy.service"):
+            if not self.platform.verify_service_active(s):
+                raise InstallerError(f"Service {s} failed to become active")
+
         port = 8765
         if self.paths.config.exists():
             try:
@@ -1034,17 +1047,20 @@ class InstallerOrchestrator:
                 pass
 
         health_url = f"http://127.0.0.1:{port}/api/health"
-        try:
-            req = urllib.request.Request(health_url)
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                if resp.status != 200:
-                    self.logger.warning(f"Health endpoint returned status {resp.status}")
-        except Exception as exc:
-            self.logger.info(f"Health probe check: {exc}")
+        max_attempts = 15
+        healthy = False
 
-        for s in ("chief-agent-dashboard.service", "chief-agent-worker.service", "chief-agent-scheduler.service", "chief-tls-proxy.service"):
-            if not self.platform.verify_service_active(s):
-                raise InstallerError(f"Service {s} failed to become active")
+        self.logger.info(f"Probing application health endpoint at {health_url}...")
+        for attempt in range(1, max_attempts + 1):
+            if self.platform.probe_health_endpoint(health_url, timeout=2.0):
+                healthy = True
+                break
+            time.sleep(1)
+
+        if not healthy:
+            raise InstallerError(
+                f"Chief health endpoint at {health_url} failed to respond with 200 OK after {max_attempts} seconds."
+            )
 
         self.state_machine.transition(StepId.HEALTH_CHECK, StepStatus.SUCCESS, message="All services active and healthy.")
 

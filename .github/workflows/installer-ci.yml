@@ -23,10 +23,10 @@ jobs:
       - name: Checkout chief-installer
         uses: actions/checkout@v4
 
-      - name: Checkout chief-agent peer repository
-        continue-on-error: true
+      - name: Checkout chief-agent peer repository at pinned manifest commit
         run: |
-          git clone --depth 1 --branch contract/deployment-v1 https://github.com/abc232648-cloud/chief-agent.git ../chief-agent
+          git clone https://github.com/abc232648-cloud/chief-agent.git ../chief-agent
+          git -C ../chief-agent checkout 6ab701097b774fb3ea14513b164cdf05f74b7bf9
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -84,3 +84,11 @@ jobs:
       - name: Run packaged executable help test
         run: |
           ./dist/installer/linux/chief-installer --help
+
+      - name: Run packaged artifact acceptance test suite
+        run: |
+          pytest tests/test_packaged_linux_acceptance.py -v
+
+      - name: Run Xubuntu packaged qualification acceptance script
+        run: |
+          bash packaging/installer/linux/run_xubuntu_acceptance.sh

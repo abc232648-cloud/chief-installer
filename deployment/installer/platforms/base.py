@@ -104,3 +104,13 @@ class PlatformAdapter(ABC):
     def open_url_in_browser(self, url: str) -> bool:
         """Launch URL in the user's default web browser."""
         raise NotImplementedError
+
+    def probe_health_endpoint(self, url: str, timeout: float = 2.0) -> bool:
+        """Check whether the application health endpoint responds with 200 OK."""
+        import urllib.request
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
