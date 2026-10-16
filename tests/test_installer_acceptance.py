@@ -13,7 +13,6 @@ from typing import Callable, Dict, List, Optional, Tuple
 import pytest
 
 from deployment.installer import (
-    ACCEPTED_FIRST_RELEASE_MANIFEST,
     EventBus,
     InstallOptions,
     PlatformInfo,
@@ -22,6 +21,7 @@ from deployment.installer import (
     ReleaseManifest,
     StepId,
     StepStatus,
+    parse_manifest,
 )
 from deployment.installer.contract import ChiefAgentDeploymentClient
 from deployment.installer.logging import InstallerLogger
@@ -144,15 +144,17 @@ def _find_chief_agent_repo() -> Optional[Path]:
         p = Path(os.environ["CHIEF_AGENT_ROOT"])
         if (p / "deployment" / "contract.py").exists():
             return p
-    # Sibling directory (normal repo layout)
     sibling = Path(__file__).resolve().parents[2] / "chief-agent"
     if (sibling / "deployment" / "contract.py").exists():
         return sibling
-    # Direct child or workspace directory
     child = Path(__file__).resolve().parents[1] / "chief-agent"
     if (child / "deployment" / "contract.py").exists():
         return child
     return None
+
+
+def _dns_review_manifest():
+    return parse_manifest(Path(__file__).resolve().parents[1] / "review-dns-manifest.json")
 
 
 def test_clean_host_acceptance_with_real_chief_deployment_contract(tmp_path):
@@ -173,17 +175,14 @@ def test_clean_host_acceptance_with_real_chief_deployment_contract(tmp_path):
     except ImportError as exc:
         pytest.fail(f"Mandatory acceptance test failed: Chief Agent dependencies missing ({exc})")
 
-    # Setup isolated test filesystem layout (resolving symlinks for strict _plain checks)
     custom_root = (tmp_path / "chief_share").resolve()
     custom_home = (tmp_path / "chief_home").resolve()
     paths = InstallerPaths.create(custom_root=custom_root, home=custom_home)
 
-    # Point tooling and release source to the local clean chief-agent repository
     paths.tooling = chief_agent_repo.resolve()
     paths.release_source = chief_agent_repo.resolve()
     paths.python = Path(sys.executable).resolve()
 
-    # Set up real regular browser binary (non-symlink) in advance
     browser_bin = (custom_root / "browser" / ("chrome.exe" if os.name == "nt" else "chrome")).resolve()
     browser_bin.parent.mkdir(parents=True, exist_ok=True)
     browser_bin.write_bytes(b"CHIEF-BROWSER-BINARY-REGULAR-FILE\x00\x01\x02\x03\x04\x05")
@@ -202,7 +201,6 @@ def test_clean_host_acceptance_with_real_chief_deployment_contract(tmp_path):
     paths.browser_config.parent.mkdir(parents=True, exist_ok=True)
     paths.browser_config.write_text(json.dumps(browser_data), encoding="utf-8")
 
-    # Real deployment client wired to target tooling
     deployment_client = ChiefAgentDeploymentClient(
         agent_root=paths.tooling,
         python_bin=paths.python,
@@ -214,33 +212,31 @@ def test_clean_host_acceptance_with_real_chief_deployment_contract(tmp_path):
     events = []
     event_bus.subscribe(events.append)
 
-    # Explicit allow_test_mock=False to force real contract execution
     options = InstallOptions(
         owner_name="Acceptance Farm Ltd",
         owner_username="testowner",
         owner_password="StrongPassword2026!#",
         farm_operations="DISABLED",
         tls_mode="LOCAL",
+        dns_mode="quad9",
         allow_test_mock=False,
     )
 
     orchestrator = InstallerOrchestrator(
         platform=platform,
         options=options,
-        manifest=ACCEPTED_FIRST_RELEASE_MANIFEST,
+        manifest=_dns_review_manifest(),
         paths=paths,
         event_bus=event_bus,
         logger=logger,
         deployment_client=deployment_client,
     )
 
-    # Pre-stage PWA builds so npm build is not required over network during test
     for app in ("owner", "staff", "jobs"):
         dist_dir = paths.pwa_root / app / "dist"
         dist_dir.mkdir(parents=True, exist_ok=True)
         (dist_dir / "index.html").write_text(f"<!DOCTYPE html><html><body>Chief {app}</body></html>", encoding="utf-8")
 
-    # Pre-stage mock caddy binary to validate caddyfile handling without downloading external binary
     (paths.caddy_root / "bin").mkdir(parents=True, exist_ok=True)
     caddy_file = paths.caddy_root / "bin" / "caddy"
     caddy_file.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -249,50 +245,43 @@ def test_clean_host_acceptance_with_real_chief_deployment_contract(tmp_path):
     except Exception:
         pass
 
-    # Pre-stage mock caddy CA root certificate
     ca_dir = paths.caddy_root / "data" / "caddy" / "pki" / "authorities" / "local"
     ca_dir.mkdir(parents=True, exist_ok=True)
     (ca_dir / "root.crt").write_text("-----BEGIN CERTIFICATE-----\nACCEPTANCE-CA\n-----END CERTIFICATE-----\n", encoding="utf-8")
 
-    # Execute full installation state machine
     result = orchestrator.execute_all()
 
-    # 1. State machine completion
     assert result.status == "SUCCESS", f"Installation failed with: {result.error}"
     assert orchestrator.current_step == StepId.COMPLETE
     assert result.public_host == "chief-acceptance-farm-ltd.local"
 
-    # 2. Real SOURCE_MANIFEST generated by contract
     assert paths.source_manifest.exists()
     source_manifest_data = json.loads(paths.source_manifest.read_text(encoding="utf-8"))
     assert "source_tree_sha256" in source_manifest_data
     assert "files" in source_manifest_data
     assert len(source_manifest_data["source_tree_sha256"]) == 64
 
-    # 3. Real production database & instance config generated by prepare_production
     assert paths.config.exists()
     instance_config = json.loads(paths.config.read_text(encoding="utf-8"))
     assert "schema_sha256" in instance_config
     assert instance_config["dashboard_port"] == 8765
     assert instance_config["mode"] == "PRODUCTION"
+    assert instance_config["dns_mode"] == "quad9"
 
     assert paths.identity_config.exists()
     identity_data = json.loads(paths.identity_config.read_text(encoding="utf-8"))
     assert identity_data["owner_username"] == "testowner"
 
-    # 4. Real initial backup generated by create_install_backup
     assert paths.backup.exists()
     complete_file = paths.backup / "COMPLETE"
     assert complete_file.exists()
     assert len(complete_file.read_text(encoding="utf-8").strip()) == 64
 
-    # 5. Real managed installation provisioned by bootstrap_installation
     assert paths.managed.exists()
     assert (paths.managed / "active.json").exists()
     assert (paths.managed / "installation.json").exists()
     assert (paths.managed / "releases" / source_manifest_data["source_tree_sha256"] / "SOURCE_MANIFEST.json").exists()
 
-    # 6. Real systemd service definitions generated by write_service_definitions
     assert (paths.unit_stage / "chief-agent-dashboard.service").exists()
     assert (paths.unit_stage / "chief-agent-worker.service").exists()
     assert (paths.unit_stage / "chief-agent-scheduler.service").exists()
@@ -300,14 +289,12 @@ def test_clean_host_acceptance_with_real_chief_deployment_contract(tmp_path):
     assert "ConditionUser=testowner" in dashboard_content
     assert "Description=Chief Agent dashboard" in dashboard_content
 
-    # 7. Caddyfile and TLS service unit generated
     assert paths.caddyfile.exists()
     caddyfile_text = paths.caddyfile.read_text(encoding="utf-8")
     assert "chief-acceptance-farm-ltd.local" in caddyfile_text
     assert "reverse_proxy 127.0.0.1:8765" in caddyfile_text
     assert (paths.unit_dest / "chief-tls-proxy.service").exists()
 
-    # 8. Security verification: password must NEVER be logged anywhere
     log_content = logger.log_file.read_text(encoding="utf-8")
     assert "StrongPassword2026!#" not in log_content
     assert "[REDACTED]" in log_content
