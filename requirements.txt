@@ -1,0 +1,4 @@
+# Chief Unified Installer requirements
+# Core installer engine relies entirely on Python 3.10+ standard library (including tkinter).
+pytest>=8.0
+pyinstaller>=6.0.0

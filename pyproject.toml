@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chief-installer"
+version = "1.0.0"
+description = "Chief Unified Installer — Shared cross-platform installer engine, GUI and platform adapters for Chief."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [
+    { name = "Chief Development Team", email = "abc232648-cloud@users.noreply.github.com" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+]
+
+[project.scripts]
+chief-installer = "deployment.installer.cli:main"
+chief-installer-helper = "deployment.installer.privileged.linux:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

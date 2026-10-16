@@ -1,0 +1,46 @@
+# Private configuration and state
+.env
+.env.*
+!.env.example
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db-*
+*.key
+*.pem
+*.p12
+*.pfx
+*.cred
+*.dpapi
+*.log
+/state/
+/private/
+/model-credentials/
+/integration-secrets/
+/backups/
+/restores/
+/browser-profiles/
+# Candidate documents are private; retain source code and directory placeholders.
+/candidate/cv/*
+!/candidate/cv/.gitkeep
+/candidate/cv_variants/*
+!/candidate/cv_variants/.gitkeep
+/candidate/application_history/*
+!/candidate/application_history/.gitkeep
+/candidate/profile_links/*
+!/candidate/profile_links/.gitkeep
+# Local dependencies and generated test artifacts
+.venv/
+venv/
+node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+/test-results/
+/playwright-report/
+/outputs/
+/dist/
+/build/
