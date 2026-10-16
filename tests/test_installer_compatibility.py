@@ -2,6 +2,7 @@
 from pathlib import Path
 import pytest
 
+from deployment.installer import parse_manifest
 from deployment.installer.contract import (
     ChiefAgentDeploymentClient,
     ContractCompatibilityError,
@@ -64,8 +65,8 @@ def test_actual_chief_agent_handshake():
         client = ChiefAgentDeploymentClient(agent_root=agent_root)
         handshake = client.verify_compatibility()
         assert handshake.is_compatible is True
-        from deployment.installer import ACCEPTED_FIRST_RELEASE_MANIFEST
-        assert handshake.chief_agent_commit == ACCEPTED_FIRST_RELEASE_MANIFEST.chief_agent_commit
+        review_manifest = parse_manifest(Path(__file__).resolve().parents[1] / "review-dns-manifest.json")
+        assert handshake.chief_agent_commit == review_manifest.chief_agent_commit
 
 
 def test_incompatible_version_raises(tmp_path):
