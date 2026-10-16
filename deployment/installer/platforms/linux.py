@@ -179,18 +179,48 @@ class LinuxPlatformAdapter(PlatformAdapter):
         return PreflightReport(platform=info, checks=checks, passed=overall_passed)
 
     def _installed_state_candidates(self, home: Path) -> List[Path]:
-        """Return authoritative Chief installation/profile state paths only.
+        """Return paths that prove a previous or partial Chief installation exists.
 
-        Generic developer/source directories such as ~/chief-agent,
-        ~/chief-runtime and ~/chief-release* are intentionally excluded. They
-        are not proof of an installed Chief instance and must never be moved by
-        the production installer merely because they exist.
+        The current install creates source staging under
+        ~/.local/share/chief/{tooling,release-source} and diagnostics under
+        ~/.local/state/chief/installer before the existing-install scan. Those
+        paths are deliberately *not* installation evidence. Runtime/profile
+        markers, databases, release metadata and service definitions are.
         """
-        candidates: List[Path] = [
-            home / ".local" / "share" / "chief",
-            home / ".local" / "state" / "chief",
-            home / ".config" / "chief",
+        candidates: List[Path] = []
+
+        share_root = home / ".local" / "share" / "chief"
+        share_markers = [
+            share_root / "runtime" / "bin" / "python",
+            share_root / "runtime" / "Scripts" / "python.exe",
+            share_root / "managed",
+            share_root / "production",
+            share_root / "pwas",
+            share_root / "caddy",
+            share_root / "node",
         ]
+        if any(p.exists() or p.is_symlink() for p in share_markers):
+            candidates.append(share_root)
+
+        state_root = home / ".local" / "state" / "chief"
+        state_markers = [
+            state_root / "release-metadata",
+            state_root / "backups",
+            state_root / "service-units",
+        ]
+        state_db_markers = list(state_root.glob("*.sqlite*")) + list(state_root.glob("*.db")) if state_root.exists() else []
+        if any(p.exists() or p.is_symlink() for p in state_markers + state_db_markers):
+            candidates.append(state_root)
+
+        config_root = home / ".config" / "chief"
+        config_markers = [
+            config_root / "production-instance.json",
+            config_root / "installation-identity.json",
+            config_root / "browser-runtime.json",
+            config_root / "Caddyfile",
+        ]
+        if any(p.exists() or p.is_symlink() for p in config_markers):
+            candidates.append(config_root)
 
         unit_dir = home / ".config" / "systemd" / "user"
         if unit_dir.exists():
@@ -256,11 +286,28 @@ class LinuxPlatformAdapter(PlatformAdapter):
                 if progress_callback:
                     progress_callback(f"Warning: could not move {src}: {exc}")
 
-        # Archive authoritative XDG installation/profile state only. Development
-        # source trees under ~/chief-* are deliberately preserved.
-        move_item(home / ".local" / "share" / "chief", "share")
-        move_item(home / ".local" / "state" / "chief", "state")
-        move_item(home / ".config" / "chief", "config")
+        # Archive only installed/runtime payloads. `tooling` and
+        # `release-source` may have been freshly verified by this very run and
+        # must stay in place for requirements installation and source manifest
+        # generation.
+        share_root = home / ".local" / "share" / "chief"
+        for name in ("runtime", "managed", "production", "pwas", "caddy", "node", "browsers"):
+            move_item(share_root / name, "share")
+
+        # Preserve current installer diagnostics while moving previous release
+        # metadata, backups, generated service units and database/state files.
+        state_root = home / ".local" / "state" / "chief"
+        for name in ("release-metadata", "backups", "service-units", "node-download", "caddy-download"):
+            move_item(state_root / name, "state")
+        if state_root.exists():
+            for db_path in list(state_root.glob("*.sqlite*")) + list(state_root.glob("*.db")):
+                move_item(db_path, "state")
+
+        # Config is not populated by release validation, so any authoritative
+        # config present at this point belongs to a previous/partial install.
+        config_root = home / ".config" / "chief"
+        if config_root.exists() or config_root.is_symlink():
+            move_item(config_root, "config")
 
         # Archive user systemd units, timers, drop-ins and activation links.
         unit_dir = home / ".config" / "systemd" / "user"
@@ -281,7 +328,8 @@ class LinuxPlatformAdapter(PlatformAdapter):
         # Write summary
         summary = (
             f"Archived at {datetime.now(timezone.utc).isoformat()}\n"
-            "Nothing was deleted; all items were moved into this directory.\n"
+            "Nothing was deleted; previous/partial installed state was moved into this directory.\n"
+            "Current-run verified source staging and installer diagnostics were left in place.\n"
             "Development/source directories outside authoritative Chief install state were left untouched.\n\n"
             + "\n".join(moved_records)
             + "\n"
