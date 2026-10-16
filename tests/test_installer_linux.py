@@ -8,6 +8,7 @@ import pytest
 from deployment.installer.errors import PrivilegeError
 from deployment.installer.platforms.linux import LinuxPlatformAdapter
 from deployment.installer.privileged import linux as priv_linux
+import deployment.installer.platforms.linux as linux_platform
 
 
 def test_privileged_helper_rejects_unauthorized_packages():
@@ -45,30 +46,78 @@ def test_privileged_helper_cli_rejections():
     assert priv_linux.main(["helper", "enable-linger"]) == 2  # missing arg
 
 
-def test_linux_adapter_detects_existing_installations(tmp_path, monkeypatch):
+def test_frozen_helper_reenters_packaged_executable(tmp_path, monkeypatch):
+    """A PyInstaller build must never invoke itself as `python -m ...`."""
+    frozen_executable = tmp_path / "chief-installer"
+    frozen_executable.write_text("binary-placeholder", encoding="utf-8")
+
+    monkeypatch.setattr(linux_platform.sys, "frozen", True, raising=False)
+    monkeypatch.setenv("CHIEF_INSTALLER_FROZEN_EXECUTABLE", str(frozen_executable))
+
+    def fake_which(name):
+        if name == "pkexec":
+            return "/usr/bin/pkexec"
+        return None
+
+    monkeypatch.setattr(linux_platform.shutil, "which", fake_which)
+
+    adapter = LinuxPlatformAdapter()
+    assert adapter._get_helper_prefix() == [
+        "pkexec",
+        str(frozen_executable),
+        "--internal-privileged-helper",
+    ]
+
+
+def test_linux_adapter_ignores_developer_trees_as_installs(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     adapter = LinuxPlatformAdapter()
+
+    # Developer/source/runtime trees alone are not installed Chief state.
+    (tmp_path / "chief-agent" / ".git").mkdir(parents=True)
+    (tmp_path / "chief-runtime").mkdir(parents=True)
+    (tmp_path / "chief-release-review").mkdir(parents=True)
 
     has_existing, paths = adapter.detect_existing_installation()
     assert not has_existing
-    assert len(paths) == 0
-
-    # Create fake existing directory
-    (tmp_path / "chief-agent").mkdir(parents=True)
-    has_existing2, paths2 = adapter.detect_existing_installation()
-    assert has_existing2
-    assert str(tmp_path / "chief-agent") in paths2
+    assert paths == []
 
 
-def test_linux_adapter_archive_moves_paths_without_deletion(tmp_path, monkeypatch):
+def test_linux_adapter_detects_authoritative_existing_installation(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     adapter = LinuxPlatformAdapter()
 
-    # Create dummy previous directories
+    old_state = tmp_path / ".local" / "state" / "chief"
+    old_state.mkdir(parents=True)
+
+    has_existing, paths = adapter.detect_existing_installation()
+    assert has_existing
+    assert str(old_state) in paths
+
+
+def test_linux_adapter_detects_old_service_definition(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    adapter = LinuxPlatformAdapter()
+
+    unit = tmp_path / ".config" / "systemd" / "user" / "chief-agent-worker.service"
+    unit.parent.mkdir(parents=True)
+    unit.write_text("[Service]\nExecStart=/old/chief\n", encoding="utf-8")
+
+    has_existing, paths = adapter.detect_existing_installation()
+    assert has_existing
+    assert str(unit) in paths
+
+
+def test_linux_adapter_archive_moves_installed_state_but_preserves_source(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    adapter = LinuxPlatformAdapter()
+
+    # Development source must survive a production install/archive operation.
     old_agent = tmp_path / "chief-agent"
     old_agent.mkdir(parents=True)
-    (old_agent / "file.txt").write_text("important old data", encoding="utf-8")
+    (old_agent / "file.txt").write_text("important source data", encoding="utf-8")
 
+    # Authoritative installed state must be archived, never deleted.
     old_state = tmp_path / ".local" / "state" / "chief"
     old_state.mkdir(parents=True)
     (old_state / "state.sqlite3").write_text("old db", encoding="utf-8")
@@ -77,13 +126,9 @@ def test_linux_adapter_archive_moves_paths_without_deletion(tmp_path, monkeypatc
     arch_dir = adapter.archive_existing_installation(archive_root)
 
     assert arch_dir.exists()
-    assert not old_agent.exists()  # Moved, not deleted
+    assert old_agent.exists()
+    assert (old_agent / "file.txt").read_text(encoding="utf-8") == "important source data"
     assert not old_state.exists()
-
-    # Verify moved files exist in archive
-    archived_file = arch_dir / "home" / "chief-agent" / "file.txt"
-    assert archived_file.exists()
-    assert archived_file.read_text(encoding="utf-8") == "important old data"
 
     archived_state = arch_dir / "state" / "chief" / "state.sqlite3"
     assert archived_state.exists()
@@ -91,7 +136,9 @@ def test_linux_adapter_archive_moves_paths_without_deletion(tmp_path, monkeypatc
 
     summary_file = arch_dir / "ARCHIVE_SUMMARY.txt"
     assert summary_file.exists()
-    assert "Nothing was deleted" in summary_file.read_text(encoding="utf-8")
+    summary = summary_file.read_text(encoding="utf-8")
+    assert "Nothing was deleted" in summary
+    assert "Development/source directories" in summary
 
 
 def test_linux_adapter_device_setup_export(tmp_path):
