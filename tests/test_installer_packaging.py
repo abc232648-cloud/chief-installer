@@ -1,8 +1,11 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+
+import deployment.installer.__main__ as installer_main
 
 _BUILD_SCRIPT = Path(__file__).resolve().parents[1] / "packaging" / "installer" / "linux" / "build_package.py"
 _spec = importlib.util.spec_from_file_location("linux_build_package", str(_BUILD_SCRIPT))
@@ -38,6 +41,46 @@ def _run_artifact(artifact: Path, *args: str) -> subprocess.CompletedProcess:
     is_native = header.startswith(b"\x7fELF") or header.startswith(b"MZ")
     cmd = [str(artifact), *args] if is_native else [sys.executable, str(artifact), *args]
     return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def test_frozen_entrypoint_uses_host_python_for_child_modules(tmp_path, monkeypatch):
+    """Regression: the PyInstaller binary itself must never become `python -m`."""
+    fake_installer = tmp_path / "chief-installer"
+    fake_python = tmp_path / "python3"
+    fake_installer.write_text("installer", encoding="utf-8")
+    fake_python.write_text("python", encoding="utf-8")
+
+    monkeypatch.setattr(installer_main.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(installer_main.sys, "executable", str(fake_installer))
+    monkeypatch.delenv("CHIEF_INSTALLER_FROZEN_EXECUTABLE", raising=False)
+
+    def fake_which(name):
+        return str(fake_python) if name == "python3" else None
+
+    monkeypatch.setattr(installer_main.shutil, "which", fake_which)
+
+    installer_main._configure_packaged_python()
+
+    assert os.environ["CHIEF_INSTALLER_FROZEN_EXECUTABLE"] == str(fake_installer)
+    assert installer_main.sys.executable == str(fake_python)
+
+
+def test_frozen_entrypoint_routes_internal_privileged_helper(monkeypatch):
+    captured = {}
+
+    def fake_helper(args):
+        captured["args"] = list(args)
+        return 23
+
+    monkeypatch.setattr(installer_main, "_run_internal_privileged_helper", fake_helper)
+    monkeypatch.setattr(
+        installer_main.sys,
+        "argv",
+        ["chief-installer", "--internal-privileged-helper", "enable-linger", "ape-xubuntu"],
+    )
+
+    assert installer_main.main() == 23
+    assert captured["args"] == ["enable-linger", "ape-xubuntu"]
 
 
 def test_packaged_executable_runs_help(tmp_path):
