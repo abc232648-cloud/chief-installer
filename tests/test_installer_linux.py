@@ -83,16 +83,53 @@ def test_linux_adapter_ignores_developer_trees_as_installs(tmp_path, monkeypatch
     assert paths == []
 
 
+def test_linux_adapter_ignores_current_run_staging_and_logs(tmp_path, monkeypatch):
+    """Verified source staging and current diagnostics must not self-trigger archive."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    adapter = LinuxPlatformAdapter()
+
+    share_root = tmp_path / ".local" / "share" / "chief"
+    tooling = share_root / "tooling"
+    release_source = share_root / "release-source"
+    tooling.mkdir(parents=True)
+    release_source.mkdir(parents=True)
+    (tooling / "requirements.txt").write_text("playwright==1.50.0\n", encoding="utf-8")
+    (release_source / "README.md").write_text("verified source", encoding="utf-8")
+
+    log_dir = tmp_path / ".local" / "state" / "chief" / "installer" / "logs"
+    log_dir.mkdir(parents=True)
+    (log_dir / "installer_current.log").write_text("current run", encoding="utf-8")
+
+    has_existing, paths = adapter.detect_existing_installation()
+    assert not has_existing
+    assert paths == []
+
+
+def test_linux_adapter_detects_partial_runtime_from_failed_install(tmp_path, monkeypatch):
+    """A venv left by a failed run is installed state and must be recycled."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    adapter = LinuxPlatformAdapter()
+
+    runtime_python = tmp_path / ".local" / "share" / "chief" / "runtime" / "bin" / "python"
+    runtime_python.parent.mkdir(parents=True)
+    runtime_python.write_text("partial runtime", encoding="utf-8")
+
+    has_existing, paths = adapter.detect_existing_installation()
+    assert has_existing
+    assert str(tmp_path / ".local" / "share" / "chief") in paths
+
+
 def test_linux_adapter_detects_authoritative_existing_installation(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     adapter = LinuxPlatformAdapter()
 
-    old_state = tmp_path / ".local" / "state" / "chief"
-    old_state.mkdir(parents=True)
+    source_manifest = tmp_path / ".local" / "state" / "chief" / "release-metadata" / "SOURCE_MANIFEST.json"
+    source_manifest.parent.mkdir(parents=True)
+    source_manifest.write_text("{}", encoding="utf-8")
 
     has_existing, paths = adapter.detect_existing_installation()
     assert has_existing
-    assert str(old_state) in paths
+    assert str(tmp_path / ".local" / "state" / "chief") in paths
 
 
 def test_linux_adapter_detects_old_service_definition(tmp_path, monkeypatch):
@@ -117,10 +154,30 @@ def test_linux_adapter_archive_moves_installed_state_but_preserves_source(tmp_pa
     old_agent.mkdir(parents=True)
     (old_agent / "file.txt").write_text("important source data", encoding="utf-8")
 
-    # Authoritative installed state must be archived, never deleted.
-    old_state = tmp_path / ".local" / "state" / "chief"
-    old_state.mkdir(parents=True)
-    (old_state / "state.sqlite3").write_text("old db", encoding="utf-8")
+    share_root = tmp_path / ".local" / "share" / "chief"
+    tooling = share_root / "tooling"
+    release_source = share_root / "release-source"
+    runtime = share_root / "runtime"
+    tooling.mkdir(parents=True)
+    release_source.mkdir(parents=True)
+    runtime.mkdir(parents=True)
+    (tooling / "requirements.txt").write_text("playwright==1.50.0\n", encoding="utf-8")
+    (release_source / "README.md").write_text("new verified source", encoding="utf-8")
+    (runtime / "partial.txt").write_text("old partial runtime", encoding="utf-8")
+
+    state_root = tmp_path / ".local" / "state" / "chief"
+    release_meta = state_root / "release-metadata"
+    release_meta.mkdir(parents=True)
+    (release_meta / "SOURCE_MANIFEST.json").write_text("old manifest", encoding="utf-8")
+    current_logs = state_root / "installer" / "logs"
+    current_logs.mkdir(parents=True)
+    (current_logs / "current.log").write_text("keep current diagnostic", encoding="utf-8")
+    old_db = state_root / "state.sqlite3"
+    old_db.write_text("old db", encoding="utf-8")
+
+    config_root = tmp_path / ".config" / "chief"
+    config_root.mkdir(parents=True)
+    (config_root / "production-instance.json").write_text("{}", encoding="utf-8")
 
     archive_root = tmp_path / "Chief_Previous_Installations"
     arch_dir = adapter.archive_existing_installation(archive_root)
@@ -128,16 +185,29 @@ def test_linux_adapter_archive_moves_installed_state_but_preserves_source(tmp_pa
     assert arch_dir.exists()
     assert old_agent.exists()
     assert (old_agent / "file.txt").read_text(encoding="utf-8") == "important source data"
-    assert not old_state.exists()
 
-    archived_state = arch_dir / "state" / "chief" / "state.sqlite3"
-    assert archived_state.exists()
-    assert archived_state.read_text(encoding="utf-8") == "old db"
+    # Fresh verified source and the active diagnostic log survive the archive.
+    assert tooling.exists()
+    assert release_source.exists()
+    assert (tooling / "requirements.txt").exists()
+    assert (release_source / "README.md").exists()
+    assert (current_logs / "current.log").read_text(encoding="utf-8") == "keep current diagnostic"
+
+    # Prior/partial installed state is archived.
+    assert not runtime.exists()
+    assert not release_meta.exists()
+    assert not old_db.exists()
+    assert not config_root.exists()
+    assert (arch_dir / "share" / "runtime" / "partial.txt").read_text(encoding="utf-8") == "old partial runtime"
+    assert (arch_dir / "state" / "release-metadata" / "SOURCE_MANIFEST.json").read_text(encoding="utf-8") == "old manifest"
+    assert (arch_dir / "state" / "state.sqlite3").read_text(encoding="utf-8") == "old db"
+    assert (arch_dir / "config" / "chief" / "production-instance.json").exists()
 
     summary_file = arch_dir / "ARCHIVE_SUMMARY.txt"
     assert summary_file.exists()
     summary = summary_file.read_text(encoding="utf-8")
     assert "Nothing was deleted" in summary
+    assert "Current-run verified source staging" in summary
     assert "Development/source directories" in summary
 
 
