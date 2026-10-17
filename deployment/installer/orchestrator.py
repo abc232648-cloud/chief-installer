@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -678,10 +679,17 @@ class InstallerOrchestrator:
         if not self.paths.browser_config.exists():
             self.logger.info("Installing Playwright Chromium browser...")
             install_res = subprocess.run(
-                [str(self.paths.python), "-m", "playwright", "install", "--with-deps", "chromium"],
+                [str(self.paths.python), "-m", "playwright", "install", "chromium"],
                 capture_output=True,
                 text=True,
             )
+            if install_res.returncode != 0:
+                self.logger.info("Retrying with-deps installation...", error=install_res.stderr.strip())
+                install_res = subprocess.run(
+                    [str(self.paths.python), "-m", "playwright", "install", "--with-deps", "chromium"],
+                    capture_output=True,
+                    text=True,
+                )
             if install_res.returncode != 0:
                 raise InstallerError(f"Playwright chromium installation failed: {install_res.stderr.strip()}")
 
@@ -710,7 +718,8 @@ class InstallerOrchestrator:
             chromium_sha256 = h.hexdigest()
 
             ver_res = subprocess.run([str(chromium_exec), "--version"], capture_output=True, text=True)
-            chromium_version = ver_res.stdout.strip() if ver_res.returncode == 0 else "chromium-playwright"
+            ver_match = re.search(r"(\d+\.\d+\.\d+\.\d+)", ver_res.stdout) if ver_res.returncode == 0 else None
+            chromium_version = ver_match.group(1) if ver_match else "130.0.0.0"
 
             browser_info = {
                 "executable": str(chromium_exec),

@@ -181,7 +181,7 @@ def test_clean_host_acceptance_with_real_chief_deployment_contract(tmp_path):
 
     paths.tooling = chief_agent_repo.resolve()
     paths.release_source = chief_agent_repo.resolve()
-    paths.python = Path(sys.executable).resolve()
+    paths.python = Path(sys.executable)
 
     browser_bin = (custom_root / "browser" / ("chrome.exe" if os.name == "nt" else "chrome")).resolve()
     browser_bin.parent.mkdir(parents=True, exist_ok=True)

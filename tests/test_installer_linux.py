@@ -93,7 +93,7 @@ def test_linux_adapter_ignores_current_run_staging_and_logs(tmp_path, monkeypatc
     release_source = share_root / "release-source"
     tooling.mkdir(parents=True)
     release_source.mkdir(parents=True)
-    (tooling / "requirements.txt").write_text("playwright==1.50.0\n", encoding="utf-8")
+    (tooling / "requirements.txt").write_text("playwright==1.64.0\n", encoding="utf-8")
     (release_source / "README.md").write_text("verified source", encoding="utf-8")
 
     log_dir = tmp_path / ".local" / "state" / "chief" / "installer" / "logs"
@@ -161,7 +161,7 @@ def test_linux_adapter_archive_moves_installed_state_but_preserves_source(tmp_pa
     tooling.mkdir(parents=True)
     release_source.mkdir(parents=True)
     runtime.mkdir(parents=True)
-    (tooling / "requirements.txt").write_text("playwright==1.50.0\n", encoding="utf-8")
+    (tooling / "requirements.txt").write_text("playwright==1.64.0\n", encoding="utf-8")
     (release_source / "README.md").write_text("new verified source", encoding="utf-8")
     (runtime / "partial.txt").write_text("old partial runtime", encoding="utf-8")
 
