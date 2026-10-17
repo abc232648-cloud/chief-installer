@@ -8,9 +8,12 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import pytest
+
+pytestmark = pytest.mark.skipif(os.name != "nt", reason="Windows executable acceptance tests run only on Windows")
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _BUILD_SCRIPT = _PROJECT_ROOT / "packaging" / "installer" / "windows" / "build_package.py"
@@ -23,6 +26,13 @@ def _ensure_package() -> Path:
     """Return existing packaged Windows executable or build it."""
     if _DIST_EXE.exists() and _DIST_META.exists():
         return _DIST_EXE
+
+    has_pyinstaller = bool(
+        shutil.which("pyinstaller")
+        or (Path(sys.executable).parent / ("pyinstaller.exe" if os.name == "nt" else "pyinstaller")).exists()
+    )
+    if not has_pyinstaller:
+        pytest.skip("Packaged Windows executable not yet built and PyInstaller not installed; skipping")
 
     spec = importlib.util.spec_from_file_location("win_build_package", str(_BUILD_SCRIPT))
     mod = importlib.util.module_from_spec(spec)
