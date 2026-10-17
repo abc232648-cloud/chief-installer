@@ -44,8 +44,16 @@ def build_package(output_dir: Optional[Path] = None) -> Path:
         # Check current python environment
         pyinstaller_cmd = [sys.executable, "-m", "PyInstaller"]
 
+    env = dict(os.environ)
+    if "PYTHONPATH" in env:
+        cleaned = [p for p in env["PYTHONPATH"].split(os.pathsep) if Path(p).resolve() != _PROJECT_ROOT.resolve()]
+        if cleaned:
+            env["PYTHONPATH"] = os.pathsep.join(cleaned)
+        else:
+            env.pop("PYTHONPATH", None)
+
     cmd = [*pyinstaller_cmd, "--clean", "--distpath", str(out), str(spec_path)]
-    res = subprocess.run(cmd, cwd=str(_PROJECT_ROOT))
+    res = subprocess.run(cmd, cwd=str(out), env=env)
     if res.returncode != 0:
         raise RuntimeError(f"PyInstaller build failed with exit code {res.returncode}")
 
