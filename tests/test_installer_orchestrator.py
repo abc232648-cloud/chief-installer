@@ -263,3 +263,88 @@ def test_orchestrator_diagnostic_report_no_secrets(tmp_path):
 
     assert "SuperSecretPassword123" not in report
     assert "[REDACTED]" in report
+
+
+def test_step_browser_fails_closed_when_version_check_fails(tmp_path, monkeypatch):
+    """Test that _step_browser fails closed instead of falling back to a synthesized version."""
+    import subprocess
+    from deployment.installer.errors import InstallerError
+
+    class BrowserTestPlatform(FakePlatformAdapter):
+        pass
+
+    paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path / "home")
+    logger = InstallerLogger(log_dir=tmp_path / "logs", session_id="test_browser_fail")
+    platform = BrowserTestPlatform()
+    options = InstallOptions(owner_name="Test Owner", owner_password="SecretPassword123", allow_test_mock=False)
+
+    orchestrator = InstallerOrchestrator(
+        platform=platform,
+        options=options,
+        paths=paths,
+        logger=logger,
+    )
+    orchestrator.state_machine.current_step = StepId.RUNTIME
+
+    # Mock subprocess.run
+    def fake_subprocess_run(cmd, *args, **kwargs):
+        cmd_str = " ".join(str(c) for c in cmd)
+        if "playwright install" in cmd_str:
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+        elif "-c" in cmd and "executable_path" in kwargs.get("input", "") or "-c" in cmd and "executable_path" in str(cmd):
+            fake_bin = tmp_path / "fake_chromium"
+            fake_bin.write_bytes(b"mock")
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout=str(fake_bin), stderr="")
+        elif "--version" in cmd_str:
+            return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="command failed")
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr("os.access", lambda path, mode: True)
+
+    with pytest.raises(InstallerError, match="Chromium --version failed"):
+        orchestrator._step_browser()
+
+
+def test_step_browser_fails_closed_when_smoke_test_fails(tmp_path, monkeypatch):
+    """Test that _step_browser fails closed when the Playwright smoke launch test fails."""
+    import subprocess
+    from deployment.installer.errors import InstallerError
+
+    class BrowserTestPlatform(FakePlatformAdapter):
+        pass
+
+    paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path / "home")
+    logger = InstallerLogger(log_dir=tmp_path / "logs", session_id="test_smoke_fail")
+    platform = BrowserTestPlatform()
+    options = InstallOptions(owner_name="Test Owner", owner_password="SecretPassword123", allow_test_mock=False)
+
+    orchestrator = InstallerOrchestrator(
+        platform=platform,
+        options=options,
+        paths=paths,
+        logger=logger,
+    )
+    orchestrator.state_machine.current_step = StepId.RUNTIME
+
+    fake_bin = tmp_path / "fake_chromium"
+    fake_bin.write_bytes(b"mock")
+
+    def fake_subprocess_run(cmd, *args, **kwargs):
+        cmd_str = " ".join(str(c) for c in cmd)
+        if "playwright install" in cmd_str:
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+        elif "-c" in cmd and "executable_path" in str(cmd):
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout=str(fake_bin), stderr="")
+        elif "--version" in cmd_str:
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout="Chromium 154.0.8037.57", stderr="")
+        elif "-c" in cmd and "CHIEF_PLAYWRIGHT_BROWSER_OK" in str(cmd):
+            return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="Browser launch failed: missing shared library")
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr("os.access", lambda path, mode: True)
+
+    with pytest.raises(InstallerError, match="Chromium browser launch smoke test failed"):
+        orchestrator._step_browser()
+

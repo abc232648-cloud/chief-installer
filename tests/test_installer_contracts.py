@@ -29,7 +29,7 @@ from deployment.installer.platforms.base import PlatformAdapter
 def test_accepted_first_release_manifest_validity():
     manifest = ACCEPTED_FIRST_RELEASE_MANIFEST
     assert manifest.release_id == "chief-2026-10-16-accepted"
-    assert manifest.chief_agent_commit == ACCEPTED_FIRST_RELEASE_MANIFEST.chief_agent_commit
+    assert manifest.chief_agent_commit == "6ab701097b774fb3ea14513b164cdf05f74b7bf9"
     assert manifest.owner_pwa_commit == "b8d139b0789918f3c937e640cc618e66194c966b"
     assert manifest.staff_pwa_commit == "4a07d324e13630e2742a4e69127569d70a3cdf83"
     assert manifest.job_pwa_commit == "90eb0cfa2155c4d5f6a4ca8bf510a5d01e1f7db9"
@@ -37,6 +37,18 @@ def test_accepted_first_release_manifest_validity():
     assert manifest.caddy_version == "2.11.7"
     assert manifest.caddy_checksum == "5d27b76b95f496638d79208c55250317b8755fd9e90005f7466aa32956944a90"
     assert manifest.supported_installer_schema == 1
+
+
+def test_accepted_first_release_manifest_is_immutable():
+    """Ensure the historical accepted baseline is never silently mutated by review candidates."""
+    historical = ACCEPTED_FIRST_RELEASE_MANIFEST
+    assert historical.chief_agent_commit == "6ab701097b774fb3ea14513b164cdf05f74b7bf9"
+    review_manifest_path = Path(__file__).resolve().parents[1] / "review-dns-manifest.json"
+    if review_manifest_path.exists():
+        review_manifest = parse_manifest(review_manifest_path)
+        assert review_manifest.chief_agent_commit != historical.chief_agent_commit, (
+            "review-dns-manifest.json must not silently mutate the historical accepted manifest"
+        )
 
 
 def test_manifest_component_verification():
