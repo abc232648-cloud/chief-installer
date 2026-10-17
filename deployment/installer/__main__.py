@@ -16,14 +16,42 @@ except ImportError:
 _FROZEN_EXECUTABLE_ENV = "CHIEF_INSTALLER_FROZEN_EXECUTABLE"
 
 
+def _restore_external_loader_environment() -> None:
+    """Undo PyInstaller's Linux loader-path override for child processes.
+
+    PyInstaller temporarily prepends its extraction directory to
+    ``LD_LIBRARY_PATH`` so the frozen installer can load its bundled native
+    libraries. The dynamic loader has already consumed that setting for this
+    process by the time Python code runs, but subprocesses inherit the modified
+    environment. System Python, the Chief venv, pip, Playwright, git, Node and
+    Caddy must resolve against the host/runtime libraries instead of the
+    installer's private bundle.
+
+    PyInstaller preserves the pre-launch value as ``LD_LIBRARY_PATH_ORIG`` when
+    one existed. Restore that value, otherwise remove the injected path.
+    """
+    if os.name == "nt":
+        return
+
+    if "LD_LIBRARY_PATH_ORIG" in os.environ:
+        original = os.environ.get("LD_LIBRARY_PATH_ORIG", "")
+        if original:
+            os.environ["LD_LIBRARY_PATH"] = original
+        else:
+            os.environ.pop("LD_LIBRARY_PATH", None)
+    else:
+        os.environ.pop("LD_LIBRARY_PATH", None)
+
+
 def _configure_packaged_python() -> None:
-    """Use a real host Python for child `python -m ...` operations in frozen builds.
+    """Prepare frozen builds to invoke real host/runtime child processes safely.
 
     PyInstaller sets ``sys.executable`` to the packaged Chief Installer binary.
     Reusing that path with ``-m`` causes the installer to invoke itself as though
     it were Python. Preserve the frozen executable path for privileged helper
-    re-entry, then point ``sys.executable`` at the host Python interpreter that
-    supported Linux installations are required to provide.
+    re-entry, point ``sys.executable`` at the host Python interpreter required by
+    supported Linux installations, and remove PyInstaller's private loader path
+    from the environment inherited by external child processes.
     """
     if not getattr(sys, "frozen", False):
         return
@@ -34,6 +62,8 @@ def _configure_packaged_python() -> None:
     host_python = shutil.which("python3") or shutil.which("python")
     if host_python:
         sys.executable = host_python
+
+    _restore_external_loader_environment()
 
 
 def _run_internal_privileged_helper(argv) -> int:
