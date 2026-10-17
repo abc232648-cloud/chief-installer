@@ -126,7 +126,7 @@ def parse_manifest(data: Union[str, bytes, dict, Path]) -> ReleaseManifest:
 # Accepted first release manifest pinning verified baseline commits
 ACCEPTED_FIRST_RELEASE_MANIFEST = ReleaseManifest(
     release_id="chief-2026-10-16-accepted",
-    chief_agent_commit="a860ab0f92757adf98ae9abbbbcb642130e1a398",
+    chief_agent_commit="96aacadf8e111fb2c108c49d0d49fac40aea47e3",
     owner_pwa_commit="b8d139b0789918f3c937e640cc618e66194c966b",
     staff_pwa_commit="4a07d324e13630e2742a4e69127569d70a3cdf83",
     job_pwa_commit="90eb0cfa2155c4d5f6a4ca8bf510a5d01e1f7db9",

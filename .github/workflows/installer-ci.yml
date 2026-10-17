@@ -27,8 +27,8 @@ jobs:
       - name: Checkout chief-agent peer repository at pinned manifest commit
         run: |
           git clone https://github.com/abc232648-cloud/chief-agent.git ../chief-agent
-          git -C ../chief-agent checkout a860ab0f92757adf98ae9abbbbcb642130e1a398
-          test "$(git -C ../chief-agent rev-parse HEAD)" = "a860ab0f92757adf98ae9abbbbcb642130e1a398" || exit 1
+          git -C ../chief-agent checkout 96aacadf8e111fb2c108c49d0d49fac40aea47e3
+          test "$(git -C ../chief-agent rev-parse HEAD)" = "96aacadf8e111fb2c108c49d0d49fac40aea47e3" || exit 1
         shell: bash
 
       - name: Set up Python ${{ matrix.python-version }}
