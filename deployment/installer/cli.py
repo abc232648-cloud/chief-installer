@@ -25,8 +25,11 @@ def get_default_platform_adapter() -> PlatformAdapter:
     system = platform.system()
     if system == "Linux":
         return LinuxPlatformAdapter()
+    elif system == "Windows":
+        from .platforms.windows import WindowsPlatformAdapter
+        return WindowsPlatformAdapter()
     else:
-        # Fallback or future platform adapter (e.g. Windows/macOS)
+        # Fallback platform adapter
         return LinuxPlatformAdapter()
 
 
@@ -71,7 +74,11 @@ def run_cli(argv: Optional[List[str]] = None, platform_adapter: Optional[Platfor
 
     # Resolve manifest
     if args.manifest:
-        manifest = parse_manifest(Path(args.manifest))
+        try:
+            manifest = parse_manifest(Path(args.manifest))
+        except Exception as exc:
+            sys.stderr.write(f"ERROR: Failed to load manifest from '{args.manifest}': {exc}\n")
+            return 1
     else:
         manifest = ACCEPTED_FIRST_RELEASE_MANIFEST
 

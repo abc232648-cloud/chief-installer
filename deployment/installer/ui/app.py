@@ -35,8 +35,15 @@ class InstallerApp(tk.Tk):
         except Exception:
             pass
 
+        if platform_adapter is None:
+            if sys.platform == "win32" or os.name == "nt":
+                from ..platforms.windows import WindowsPlatformAdapter
+                platform_adapter = WindowsPlatformAdapter()
+            else:
+                platform_adapter = LinuxPlatformAdapter()
+
         self.controller = controller or InstallerUIController(
-            platform_adapter=platform_adapter or LinuxPlatformAdapter(),
+            platform_adapter=platform_adapter,
             manifest=manifest or ACCEPTED_FIRST_RELEASE_MANIFEST,
         )
 

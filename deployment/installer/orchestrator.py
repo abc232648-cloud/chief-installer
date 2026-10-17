@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform as py_platform
 import re
 import shutil
 import subprocess
@@ -16,6 +17,8 @@ import tarfile
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 import urllib.request
+import xml.etree.ElementTree as ET
+import zipfile
 
 from .contract import ChiefAgentDeploymentClient
 from .errors import (
@@ -68,11 +71,21 @@ class InstallerPaths:
     @classmethod
     def create(cls, custom_root: Optional[Path] = None, home: Optional[Path] = None) -> "InstallerPaths":
         home_dir = home or Path.home()
-        root = custom_root or (home_dir / ".local" / "share" / "chief")
-        config_root = home_dir / ".config" / "chief"
-        state_root = home_dir / ".local" / "state" / "chief"
-
         is_windows = os.name == "nt"
+
+        if is_windows and not custom_root:
+            local_app = Path(os.environ.get("LOCALAPPDATA") or (home_dir / "AppData" / "Local"))
+            roaming_app = Path(os.environ.get("APPDATA") or (home_dir / "AppData" / "Roaming"))
+            root = local_app / "chief"
+            config_root = roaming_app / "chief"
+            state_root = local_app / "chief" / "state"
+            unit_dest = local_app / "chief" / "tasks"
+        else:
+            root = custom_root or (home_dir / ".local" / "share" / "chief")
+            config_root = home_dir / ".config" / "chief"
+            state_root = home_dir / ".local" / "state" / "chief"
+            unit_dest = (home_dir / ".config" / "systemd" / "user") if not is_windows else (root / "tasks")
+
         python_bin = root / "runtime" / ("Scripts" if is_windows else "bin") / ("python.exe" if is_windows else "python")
 
         return cls(
@@ -96,7 +109,7 @@ class InstallerPaths:
             source_manifest=state_root / "release-metadata" / "SOURCE_MANIFEST.json",
             backup=state_root / "backups" / "initial",
             unit_stage=state_root / "service-units" / "initial",
-            unit_dest=home_dir / ".config" / "systemd" / "user",
+            unit_dest=unit_dest,
             archive_base=home_dir / "Chief_Previous_Installations",
         )
 
@@ -397,26 +410,38 @@ class InstallerOrchestrator:
 
     def _acquire_node_runtime(self) -> Tuple[Path, Path]:
         """Verify or acquire pinned Node.js runtime and npm binary."""
-        node_bin = self.paths.node_root / "bin" / "node"
-        npm_bin = self.paths.node_root / "bin" / "npm"
+        is_windows = os.name == "nt"
+        node_bin_name = "node.exe" if is_windows else "node"
+        npm_bin_name = "npm.cmd" if is_windows else "npm"
+
+        node_bin = self.paths.node_root / ("bin" if not is_windows else "") / node_bin_name
+        npm_bin = self.paths.node_root / ("bin" if not is_windows else "") / npm_bin_name
+        if not node_bin.exists() and (self.paths.node_root / "bin" / node_bin_name).exists():
+            node_bin = self.paths.node_root / "bin" / node_bin_name
+            npm_bin = self.paths.node_root / "bin" / npm_bin_name
+
         if node_bin.exists() and npm_bin.exists():
             return node_bin, npm_bin
 
         for cand in self.paths.node_root.glob("node-v*"):
-            if cand.is_dir() and (cand / "bin" / "node").exists() and (cand / "bin" / "npm").exists():
-                return cand / "bin" / "node", cand / "bin" / "npm"
+            if cand.is_dir():
+                for sub in ("", "bin"):
+                    n = (cand / sub / node_bin_name) if sub else (cand / node_bin_name)
+                    p = (cand / sub / npm_bin_name) if sub else (cand / npm_bin_name)
+                    if n.exists() and p.exists():
+                        return n, p
 
         sys_node = shutil.which("node")
-        sys_npm = shutil.which("npm")
+        sys_npm = shutil.which("npm.cmd") if is_windows else shutil.which("npm")
         if sys_node and sys_npm:
             res = subprocess.run([sys_node, "--version"], capture_output=True, text=True)
             if res.returncode == 0 and res.stdout.strip() == f"v{self.manifest.node_version}":
                 return Path(sys_node), Path(sys_npm)
 
         node_ver = self.manifest.node_version
-        machine = os.uname().machine.lower() if hasattr(os, "uname") else "x86_64"
+        machine = py_platform.machine().lower() if is_windows else (os.uname().machine.lower() if hasattr(os, "uname") else "x86_64")
         node_arch = "x64" if machine in ("x86_64", "amd64") else ("arm64" if machine in ("aarch64", "arm64") else "x64")
-        node_file = f"node-v{node_ver}-linux-{node_arch}.tar.xz"
+        node_file = f"node-v{node_ver}-win-{node_arch}.zip" if is_windows else f"node-v{node_ver}-linux-{node_arch}.tar.xz"
         node_tmp = self.paths.state_root / "node-download"
         node_tmp.mkdir(parents=True, exist_ok=True, mode=0o700)
 
@@ -434,43 +459,70 @@ class InstallerOrchestrator:
         if not expected_sha:
             raise InstallerError(f"Could not find checksum for {node_file} in SHASUMS256.txt")
 
-        tar_url = f"https://nodejs.org/dist/v{node_ver}/{node_file}"
-        tar_path = node_tmp / node_file
-        self.logger.info(f"Downloading Node.js archive from {tar_url}")
-        urllib.request.urlretrieve(tar_url, str(tar_path))
+        archive_url = f"https://nodejs.org/dist/v{node_ver}/{node_file}"
+        archive_path = node_tmp / node_file
+        self.logger.info(f"Downloading Node.js archive from {archive_url}")
+        urllib.request.urlretrieve(archive_url, str(archive_path))
 
-        actual_sha = hashlib.sha256(tar_path.read_bytes()).hexdigest()
+        actual_sha = hashlib.sha256(archive_path.read_bytes()).hexdigest()
         if actual_sha.lower() != expected_sha.lower():
             raise ReleaseMismatchError(f"Node.js archive checksum mismatch: expected {expected_sha}, got {actual_sha}")
 
         self.paths.node_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with tarfile.open(tar_path, "r:xz") as tar:
-            for member in tar.getmembers():
-                parts = Path(member.name).parts
-                if len(parts) > 1:
-                    member.name = str(Path(*parts[1:]))
-                    if hasattr(tarfile, "data_filter"):
-                        tar.extract(member, path=str(self.paths.node_root), filter="data")
+        if is_windows:
+            with zipfile.ZipFile(archive_path, "r") as zf:
+                prefix = f"node-v{node_ver}-win-{node_arch}/"
+                for member in zf.namelist():
+                    if member.startswith(prefix):
+                        rel_path = member[len(prefix):]
+                        if not rel_path:
+                            continue
+                        dest_file = self.paths.node_root / rel_path
+                        if member.endswith("/"):
+                            dest_file.mkdir(parents=True, exist_ok=True)
+                        else:
+                            dest_file.parent.mkdir(parents=True, exist_ok=True)
+                            with zf.open(member) as src, open(dest_file, "wb") as dst:
+                                shutil.copyfileobj(src, dst)
                     else:
-                        tar.extract(member, path=str(self.paths.node_root))
+                        zf.extract(member, path=str(self.paths.node_root))
+        else:
+            with tarfile.open(archive_path, "r:xz") as tar:
+                for member in tar.getmembers():
+                    parts = Path(member.name).parts
+                    if len(parts) > 1:
+                        member.name = str(Path(*parts[1:]))
+                        if hasattr(tarfile, "data_filter"):
+                            tar.extract(member, path=str(self.paths.node_root), filter="data")
+                        else:
+                            tar.extract(member, path=str(self.paths.node_root))
 
-        if not (node_bin.exists() and npm_bin.exists()):
-            for cand in self.paths.node_root.glob("node-v*"):
-                if cand.is_dir() and (cand / "bin" / "node").exists() and (cand / "bin" / "npm").exists():
-                    return cand / "bin" / "node", cand / "bin" / "npm"
+        if node_bin.exists() and npm_bin.exists():
+            return node_bin, npm_bin
+
+        for cand in self.paths.node_root.glob("node-v*"):
+            if cand.is_dir():
+                for sub in ("", "bin"):
+                    n = (cand / sub / node_bin_name) if sub else (cand / node_bin_name)
+                    p = (cand / sub / npm_bin_name) if sub else (cand / npm_bin_name)
+                    if n.exists() and p.exists():
+                        return n, p
 
         return node_bin, npm_bin
 
     def _download_and_verify_caddy(self) -> Path:
         """Download Caddy binary, verify checksums, and extract to caddy root."""
-        caddy_bin = self.paths.caddy_root / "bin" / "caddy"
+        is_windows = os.name == "nt"
+        caddy_bin = self.paths.caddy_root / "bin" / ("caddy.exe" if is_windows else "caddy")
+        if not caddy_bin.exists() and (self.paths.caddy_root / "bin" / "caddy").exists():
+            caddy_bin = self.paths.caddy_root / "bin" / "caddy"
         if caddy_bin.exists():
             return caddy_bin
 
-        machine = os.uname().machine.lower() if hasattr(os, "uname") else "x86_64"
+        machine = py_platform.machine().lower() if is_windows else (os.uname().machine.lower() if hasattr(os, "uname") else "x86_64")
         caddy_arch = "amd64" if machine in ("x86_64", "amd64") else ("arm64" if machine in ("aarch64", "arm64") else "amd64")
         caddy_ver = self.manifest.caddy_version
-        caddy_file = f"caddy_{caddy_ver}_linux_{caddy_arch}.tar.gz"
+        caddy_file = f"caddy_{caddy_ver}_windows_{caddy_arch}.zip" if is_windows else f"caddy_{caddy_ver}_linux_{caddy_arch}.tar.gz"
         download_tmp = self.paths.state_root / "caddy-download"
         download_tmp.mkdir(parents=True, exist_ok=True, mode=0o700)
 
@@ -485,41 +537,48 @@ class InstallerOrchestrator:
                 f"Caddy checksums file verification failed. Expected {self.manifest.caddy_checksum}, got {actual_checksums_sha256}"
             )
 
-        expected_file_sha256 = None
+        expected_file_hash = None
         for line in checksums_path.read_text(encoding="utf-8").splitlines():
             parts = line.strip().split()
             if len(parts) >= 2 and parts[1].endswith(caddy_file):
-                expected_file_sha256 = parts[0]
+                expected_file_hash = parts[0]
                 break
-        if not expected_file_sha256:
+        if not expected_file_hash:
             raise InstallerError(f"Could not find checksum for {caddy_file} in checksums.txt")
 
-        tar_url = f"https://github.com/caddyserver/caddy/releases/download/v{caddy_ver}/{caddy_file}"
-        tar_path = download_tmp / caddy_file
-        self.logger.info(f"Downloading Caddy binary archive from {tar_url}")
-        urllib.request.urlretrieve(tar_url, str(tar_path))
+        archive_url = f"https://github.com/caddyserver/caddy/releases/download/v{caddy_ver}/{caddy_file}"
+        archive_path = download_tmp / caddy_file
+        self.logger.info(f"Downloading Caddy binary archive from {archive_url}")
+        urllib.request.urlretrieve(archive_url, str(archive_path))
 
-        if len(expected_file_sha256) == 128:
-            actual_tar_hash = hashlib.sha512(tar_path.read_bytes()).hexdigest()
+        if len(expected_file_hash) == 128:
+            actual_hash = hashlib.sha512(archive_path.read_bytes()).hexdigest()
         else:
-            actual_tar_hash = hashlib.sha256(tar_path.read_bytes()).hexdigest()
+            actual_hash = hashlib.sha256(archive_path.read_bytes()).hexdigest()
 
-        if actual_tar_hash.lower() != expected_file_sha256.lower():
+        if actual_hash.lower() != expected_file_hash.lower():
             raise ReleaseMismatchError(
-                f"Caddy archive verification failed. Expected {expected_file_sha256}, got {actual_tar_hash}"
+                f"Caddy archive verification failed. Expected {expected_file_hash}, got {actual_hash}"
             )
 
         (self.paths.caddy_root / "bin").mkdir(parents=True, exist_ok=True, mode=0o700)
-        with tarfile.open(tar_path, "r:gz") as tar:
-            member = tar.getmember("caddy")
-            tar.extract(member, path=str(self.paths.caddy_root / "bin"))
+        if is_windows:
+            with zipfile.ZipFile(archive_path, "r") as zf:
+                zf.extract("caddy.exe", path=str(self.paths.caddy_root / "bin"))
+            caddy_bin = self.paths.caddy_root / "bin" / "caddy.exe"
+        else:
+            with tarfile.open(archive_path, "r:gz") as tar:
+                member = tar.getmember("caddy")
+                tar.extract(member, path=str(self.paths.caddy_root / "bin"))
+            caddy_bin = self.paths.caddy_root / "bin" / "caddy"
+            caddy_bin.chmod(0o700)
 
-        caddy_bin.chmod(0o700)
         return caddy_bin
 
     def generate_caddyfile(self, public_host: str, tls_mode: str) -> str:
         """Generate authoritative Caddy reverse proxy and PWA configuration."""
         tls_line = "    tls internal\n" if tls_mode == "LOCAL" else ""
+        pwa_root = str(self.paths.pwa_root).replace("\\", "/")
         return (
             f"{public_host} {{\n"
             f"{tls_line}"
@@ -538,17 +597,17 @@ class InstallerOrchestrator:
             f"        }}\n"
             f"    }}\n"
             f"    handle_path /owner/* {{\n"
-            f"        root * {self.paths.pwa_root}/owner/dist\n"
+            f'        root * "{pwa_root}/owner/dist"\n'
             f"        try_files {{path}} /index.html\n"
             f"        file_server\n"
             f"    }}\n"
             f"    handle_path /staff/* {{\n"
-            f"        root * {self.paths.pwa_root}/staff/dist\n"
+            f'        root * "{pwa_root}/staff/dist"\n'
             f"        try_files {{path}} /index.html\n"
             f"        file_server\n"
             f"    }}\n"
             f"    handle_path /jobs/* {{\n"
-            f"        root * {self.paths.pwa_root}/jobs/dist\n"
+            f'        root * "{pwa_root}/jobs/dist"\n'
             f"        try_files {{path}} /index.html\n"
             f"        file_server\n"
             f"    }}\n"
@@ -575,6 +634,53 @@ class InstallerOrchestrator:
             "[Install]\n"
             "WantedBy=default.target\n"
         )
+
+    def generate_caddy_task_xml(self, user: str) -> str:
+        """Generate Windows Task Scheduler XML definition for Caddy TLS proxy."""
+        caddy_bin = self.paths.caddy_root / "bin" / ("caddy.exe" if os.name == "nt" else "caddy")
+        args = f'run --config "{self.paths.caddyfile}" --adapter caddyfile'
+        work_dir = str(self.paths.caddy_root)
+
+        task = ET.Element("Task", {"version": "1.4", "xmlns": "http://schemas.microsoft.com/windows/2004/02/mit/task"})
+
+        def child(parent, tag, value=None):
+            node = ET.SubElement(parent, tag)
+            if value is not None:
+                node.text = value
+            return node
+
+        info = child(task, "RegistrationInfo")
+        child(info, "Description", "Chief HTTPS and PWA proxy")
+        triggers = child(task, "Triggers")
+        boot = child(triggers, "LogonTrigger")
+        child(boot, "Enabled", "true")
+        child(boot, "UserId", user)
+        child(boot, "Delay", "PT30S")
+        principal = child(child(task, "Principals"), "Principal")
+        principal.set("id", "Owner")
+        child(principal, "UserId", user)
+        child(principal, "LogonType", "InteractiveToken")
+        child(principal, "RunLevel", "LeastPrivilege")
+        settings = child(task, "Settings")
+        for tag, value in [
+            ("MultipleInstancesPolicy", "IgnoreNew"),
+            ("DisallowStartIfOnBatteries", "false"),
+            ("StopIfGoingOnBatteries", "false"),
+            ("StartWhenAvailable", "true"),
+            ("Enabled", "true"),
+            ("ExecutionTimeLimit", "PT0S"),
+        ]:
+            child(settings, tag, value)
+        restart = child(settings, "RestartOnFailure")
+        child(restart, "Interval", "PT1M")
+        child(restart, "Count", "3")
+        actions = child(task, "Actions")
+        actions.set("Context", "Owner")
+        execute = child(actions, "Exec")
+        child(execute, "Command", str(caddy_bin))
+        child(execute, "Arguments", args)
+        child(execute, "WorkingDirectory", work_dir)
+        return ET.tostring(task, encoding="utf-16", xml_declaration=True).decode("utf-16")
 
     # Step Implementations
     def _step_preflight(self) -> None:
@@ -694,13 +800,14 @@ class InstallerOrchestrator:
                 text=True,
             )
             if install_res.returncode != 0:
-                self.logger.info("Retrying with --with-deps...", error=install_res.stderr.strip())
-                install_cmd = [str(self.paths.python), "-m", "playwright", "install", "--with-deps", "chromium"]
-                install_res = subprocess.run(
-                    install_cmd,
-                    capture_output=True,
-                    text=True,
-                )
+                if os.name != "nt":
+                    self.logger.info("Retrying with --with-deps...", error=install_res.stderr.strip())
+                    install_cmd = [str(self.paths.python), "-m", "playwright", "install", "--with-deps", "chromium"]
+                    install_res = subprocess.run(
+                        install_cmd,
+                        capture_output=True,
+                        text=True,
+                    )
             if install_res.returncode != 0:
                 raise InstallerError(
                     f"Playwright chromium installation failed with exit code {install_res.returncode}: {install_res.stderr.strip()}"
@@ -783,10 +890,7 @@ class InstallerOrchestrator:
             self.state_machine.transition(StepId.PWA_RUNTIME, StepStatus.SUCCESS, message="Node.js builder ready (mock).")
             return
 
-        node_bin = self.paths.node_root / "bin" / "node"
-        npm_bin = self.paths.node_root / "bin" / "npm"
-        if not (node_bin.exists() and npm_bin.exists()):
-            self._acquire_node_runtime()
+        self._acquire_node_runtime()
         self.state_machine.transition(StepId.PWA_RUNTIME, StepStatus.SUCCESS, message=f"Node.js {self.manifest.node_version} builder ready.")
 
     def _step_pwa_builds(self) -> None:
@@ -818,7 +922,7 @@ class InstallerOrchestrator:
 
                 self.logger.info(f"Building {name} PWA with npm...")
                 npm_env = os.environ.copy()
-                npm_env["PATH"] = f"{node_bin.parent}:{npm_env.get('PATH', '')}"
+                npm_env["PATH"] = f"{node_bin.parent}{os.pathsep}{npm_env.get('PATH', '')}"
                 ci_res = subprocess.run([str(npm_bin), "ci"], cwd=str(app_dir), capture_output=True, text=True, env=npm_env)
                 if ci_res.returncode != 0:
                     raise InstallerError(f"npm ci failed for {name} PWA: {ci_res.stderr.strip()}")
@@ -975,6 +1079,7 @@ class InstallerOrchestrator:
 
         self.logger.info("Executing installation readiness validation via Chief deployment contract...")
         user = self.platform.get_current_username()
+        target_platform = getattr(self.platform, "os_name", "windows" if os.name == "nt" else "linux")
         readiness_res = self.deployment_client.installation_readiness(
             config=self.paths.config,
             source_root=self.paths.release_source,
@@ -983,7 +1088,7 @@ class InstallerOrchestrator:
             manifest_sha256=self._backup_manifest_sha,
             expected_source=self._expected_source_sha256,
             expected_schema=self._expected_schema_sha256,
-            platform="linux",
+            platform=target_platform,
             project=str(self.paths.tooling),
             user=user,
             python=self.paths.python,
@@ -1006,9 +1111,10 @@ class InstallerOrchestrator:
 
         self.logger.info("Generating service definitions via Chief deployment contract...")
         user = self.platform.get_current_username()
+        target_platform = getattr(self.platform, "os_name", "windows" if os.name == "nt" else "linux")
         self.deployment_client.write_service_definitions(
             target_dir=self.paths.unit_stage,
-            platform="linux",
+            platform=target_platform,
             project=str(self.paths.tooling),
             user=user,
             instance_config=str(self.paths.config),
@@ -1021,7 +1127,9 @@ class InstallerOrchestrator:
     def _step_tls(self) -> None:
         self.state_machine.transition(StepId.TLS, StepStatus.RUNNING, message="Configuring HTTPS and reverse proxy...")
         self.paths.caddy_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        caddy_bin = self.paths.caddy_root / "bin" / "caddy"
+        caddy_bin = self.paths.caddy_root / "bin" / ("caddy.exe" if os.name == "nt" else "caddy")
+        if not caddy_bin.exists() and (self.paths.caddy_root / "bin" / "caddy").exists():
+            caddy_bin = self.paths.caddy_root / "bin" / "caddy"
         caddy_bin.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 
         if self._is_test_fixture():
@@ -1039,7 +1147,8 @@ class InstallerOrchestrator:
         self.paths.caddyfile.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.paths.caddyfile.write_text(caddyfile_content, encoding="utf-8")
 
-        if os.name != "nt" and getattr(self.platform, "os_name", "") == "linux" and shutil.which(str(caddy_bin)):
+        target_platform = getattr(self.platform, "os_name", "windows" if os.name == "nt" else "linux")
+        if target_platform == "linux" and shutil.which(str(caddy_bin)):
             val_res = subprocess.run(
                 [str(caddy_bin), "validate", "--config", str(self.paths.caddyfile), "--adapter", "caddyfile"],
                 capture_output=True,
@@ -1048,14 +1157,23 @@ class InstallerOrchestrator:
             if val_res.returncode != 0:
                 raise InstallerError(f"Caddyfile validation failed: {val_res.stderr.strip()}")
 
-        service_content = self.generate_caddy_service_unit()
-        service_file = self.paths.unit_dest / "chief-tls-proxy.service"
-        service_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        service_file.write_text(service_content, encoding="utf-8")
-        try:
-            service_file.chmod(0o600)
-        except Exception:
-            pass
+        if target_platform == "windows":
+            user = self.platform.get_current_username()
+            task_xml = self.generate_caddy_task_xml(user)
+            task_file = self.paths.unit_dest / "chief-tls-proxy.xml"
+            task_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            task_file.write_text(task_xml, encoding="utf-16")
+            if shutil.which("schtasks"):
+                subprocess.run(["schtasks", "/create", "/tn", "chief-tls-proxy", "/xml", str(task_file), "/f"], capture_output=True, text=True)
+        else:
+            service_content = self.generate_caddy_service_unit()
+            service_file = self.paths.unit_dest / "chief-tls-proxy.service"
+            service_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            service_file.write_text(service_content, encoding="utf-8")
+            try:
+                service_file.chmod(0o600)
+            except Exception:
+                pass
 
         self.state_machine.transition(StepId.TLS, StepStatus.SUCCESS, message="HTTPS and reverse proxy configured.")
 
@@ -1079,14 +1197,21 @@ class InstallerOrchestrator:
             self.state_machine.transition(StepId.HEALTH_CHECK, StepStatus.SUCCESS, message="All services active and healthy (mock).")
             return
 
-        self.logger.info("Starting managed Chief services...")
-        try:
-            self.deployment_client.start_linux_services(self.paths.config)
-        except Exception as exc:
-            self.logger.warning(f"Native linux service start not available: {exc}. Delegating to platform adapter.")
+        target_platform = getattr(self.platform, "os_name", "windows" if os.name == "nt" else "linux")
+        if target_platform == "windows":
+            self.logger.info("Starting managed Chief services via Task Scheduler...")
             self.platform.control_services("start", [
                 "chief-agent-dashboard.service", "chief-agent-worker.service", "chief-agent-scheduler.service"
             ])
+        else:
+            self.logger.info("Starting managed Chief services...")
+            try:
+                self.deployment_client.start_linux_services(self.paths.config)
+            except Exception as exc:
+                self.logger.warning(f"Native linux service start not available: {exc}. Delegating to platform adapter.")
+                self.platform.control_services("start", [
+                    "chief-agent-dashboard.service", "chief-agent-worker.service", "chief-agent-scheduler.service"
+                ])
 
         self.platform.control_services("restart", ["chief-tls-proxy.service"])
 
