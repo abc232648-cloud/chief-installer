@@ -402,6 +402,10 @@ class InstallerOrchestrator:
         if node_bin.exists() and npm_bin.exists():
             return node_bin, npm_bin
 
+        for cand in self.paths.node_root.glob("node-v*"):
+            if cand.is_dir() and (cand / "bin" / "node").exists() and (cand / "bin" / "npm").exists():
+                return cand / "bin" / "node", cand / "bin" / "npm"
+
         sys_node = shutil.which("node")
         sys_npm = shutil.which("npm")
         if sys_node and sys_npm:
@@ -444,10 +448,16 @@ class InstallerOrchestrator:
             for member in tar.getmembers():
                 parts = Path(member.name).parts
                 if len(parts) > 1:
+                    member.name = str(Path(*parts[1:]))
                     if hasattr(tarfile, "data_filter"):
                         tar.extract(member, path=str(self.paths.node_root), filter="data")
                     else:
                         tar.extract(member, path=str(self.paths.node_root))
+
+        if not (node_bin.exists() and npm_bin.exists()):
+            for cand in self.paths.node_root.glob("node-v*"):
+                if cand.is_dir() and (cand / "bin" / "node").exists() and (cand / "bin" / "npm").exists():
+                    return cand / "bin" / "node", cand / "bin" / "npm"
 
         return node_bin, npm_bin
 
@@ -559,7 +569,6 @@ class InstallerOrchestrator:
             f"ExecReload={self.paths.caddy_root}/bin/caddy reload --config {self.paths.caddyfile} --adapter caddyfile\n"
             "Restart=on-failure\n"
             "RestartSec=10\n"
-            "NoNewPrivileges=yes\n"
             "UMask=0077\n"
             f"Environment=XDG_DATA_HOME={self.paths.caddy_root}/data\n"
             f"Environment=XDG_CONFIG_HOME={self.paths.caddy_root}/config\n\n"
@@ -677,13 +686,21 @@ class InstallerOrchestrator:
             return
 
         if not self.paths.browser_config.exists():
-            self.logger.info("Installing Playwright Chromium browser with dependencies...")
-            install_cmd = [str(self.paths.python), "-m", "playwright", "install", "--with-deps", "chromium"]
+            self.logger.info("Installing Playwright Chromium browser...")
+            install_cmd = [str(self.paths.python), "-m", "playwright", "install", "chromium"]
             install_res = subprocess.run(
                 install_cmd,
                 capture_output=True,
                 text=True,
             )
+            if install_res.returncode != 0:
+                self.logger.info("Retrying with --with-deps...", error=install_res.stderr.strip())
+                install_cmd = [str(self.paths.python), "-m", "playwright", "install", "--with-deps", "chromium"]
+                install_res = subprocess.run(
+                    install_cmd,
+                    capture_output=True,
+                    text=True,
+                )
             if install_res.returncode != 0:
                 raise InstallerError(
                     f"Playwright chromium installation failed with exit code {install_res.returncode}: {install_res.stderr.strip()}"
@@ -800,11 +817,13 @@ class InstallerOrchestrator:
                 self._acquire_repository(target_dir=app_dir, repo_url=repo_url, commit=commit, component=comp)
 
                 self.logger.info(f"Building {name} PWA with npm...")
-                ci_res = subprocess.run([str(npm_bin), "ci"], cwd=str(app_dir), capture_output=True, text=True)
+                npm_env = os.environ.copy()
+                npm_env["PATH"] = f"{node_bin.parent}:{npm_env.get('PATH', '')}"
+                ci_res = subprocess.run([str(npm_bin), "ci"], cwd=str(app_dir), capture_output=True, text=True, env=npm_env)
                 if ci_res.returncode != 0:
                     raise InstallerError(f"npm ci failed for {name} PWA: {ci_res.stderr.strip()}")
 
-                build_res = subprocess.run([str(npm_bin), "run", "build"], cwd=str(app_dir), capture_output=True, text=True)
+                build_res = subprocess.run([str(npm_bin), "run", "build"], cwd=str(app_dir), capture_output=True, text=True, env=npm_env)
                 if build_res.returncode != 0:
                     raise InstallerError(f"npm run build failed for {name} PWA: {build_res.stderr.strip()}")
 
@@ -1101,6 +1120,18 @@ class InstallerOrchestrator:
             if self.platform.probe_health_endpoint(health_url, timeout=probe_timeout):
                 healthy = True
                 break
+
+            # In production mode, Chief backend requires trusted host and TLS forwarding headers.
+            prod_headers = {
+                "Host": self._public_host or "chief.local",
+                "X-Forwarded-Proto": "https",
+            }
+            try:
+                if self.platform.probe_health_endpoint(f"http://127.0.0.1:{port}/login", timeout=probe_timeout, headers=prod_headers):
+                    healthy = True
+                    break
+            except TypeError:
+                pass
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:

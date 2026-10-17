@@ -337,18 +337,47 @@ class LinuxPlatformAdapter(PlatformAdapter):
         (target_dir / "ARCHIVE_SUMMARY.txt").write_text(summary, encoding="utf-8")
         return target_dir
 
+    def get_missing_system_packages(self) -> List[str]:
+        from ..privileged.linux import _ALLOWED_PACKAGES
+        missing: List[str] = []
+        for pkg in sorted(_ALLOWED_PACKAGES):
+            if pkg == "git" and shutil.which("git"):
+                continue
+            if pkg == "python3" and shutil.which("python3"):
+                continue
+            if pkg == "curl" and shutil.which("curl"):
+                continue
+            if pkg == "iproute2" and shutil.which("ip"):
+                continue
+            proc = subprocess.run(["dpkg", "-s", pkg], capture_output=True, text=True)
+            if proc.returncode != 0 or "Status: install ok installed" not in proc.stdout:
+                if pkg == "avahi-utils" and shutil.which("avahi-daemon"):
+                    continue
+                missing.append(pkg)
+        return missing
+
     def install_system_dependencies(
         self,
         progress_callback: Optional[Callable[[str, float], None]] = None,
     ) -> None:
+        missing = self.get_missing_system_packages()
+        if not missing:
+            if progress_callback:
+                progress_callback("All operating system packages already satisfied.", 1.0)
+            return
+
         if progress_callback:
-            progress_callback("Requesting administrator privilege for OS packages...", 0.1)
-        self._run_privileged(["install-packages"])
+            progress_callback(f"Requesting administrator privilege for OS packages ({len(missing)} missing)...", 0.1)
+        self._run_privileged(["install-packages", *missing])
         if progress_callback:
             progress_callback("Operating system packages installed successfully.", 1.0)
 
     def enable_user_linger(self, username: Optional[str] = None) -> None:
-        user = username or os.environ.get("USER") or py_platform.node()
+        user = username or self.get_current_username()
+        if shutil.which("loginctl"):
+            proc = subprocess.run(["loginctl", "show-user", user, "-p", "Linger"], capture_output=True, text=True)
+            if proc.returncode == 0 and "Linger=yes" in proc.stdout:
+                return
         self._run_privileged(["enable-linger", user])
 
     def configure_local_discovery(
@@ -356,16 +385,36 @@ class LinuxPlatformAdapter(PlatformAdapter):
         owner_name: str,
         progress_callback: Optional[Callable[[str], None]] = None,
     ) -> str:
-        from ..installation_identity import local_host_label
+        import hashlib
+        import unicodedata
 
-        base_label = local_host_label(owner_name)
-        label = base_label
+        clean = " ".join(owner_name.strip().split())
+        ascii_name = unicodedata.normalize("NFKD", clean).encode("ascii", "ignore").decode("ascii")
+        slug = re.sub(r"[^a-z0-9]+", "-", ascii_name.lower()).strip("-")
+        if not slug:
+            slug = "owner-" + hashlib.sha256(clean.encode("utf-8")).hexdigest()[:10]
+        label = f"chief-{slug[:57].rstrip('-')}"
+
         if progress_callback:
             progress_callback(f"Configuring Avahi mDNS for {label}.local...")
 
-        self._run_privileged(["configure-avahi", label])
+        conf_path = Path("/etc/avahi/avahi-daemon.conf")
+        already_configured = False
+        if conf_path.exists():
+            try:
+                content = conf_path.read_text(encoding="utf-8")
+                if f"host-name={label}" in content:
+                    already_configured = True
+            except Exception:
+                pass
 
-        # Verify resolution
+        if not already_configured:
+            try:
+                self._run_privileged(["configure-avahi", label])
+            except PrivilegeError as exc:
+                if progress_callback:
+                    progress_callback(f"Notice: Avahi configuration skipped ({exc})")
+
         public_host = f"{label}.local"
         if progress_callback:
             progress_callback(f"Local mDNS hostname advertised: {public_host}")
@@ -374,7 +423,14 @@ class LinuxPlatformAdapter(PlatformAdapter):
     def set_executable_capability(self, executable: Path, capability: str) -> None:
         if capability != "cap_net_bind_service=+ep":
             raise PrivilegeError(f"Unsupported capability: {capability}")
-        self._run_privileged(["set-caddy-capability", str(executable)])
+        if shutil.which("getcap"):
+            proc = subprocess.run(["getcap", str(executable)], capture_output=True, text=True)
+            if proc.returncode == 0 and "cap_net_bind_service" in proc.stdout:
+                return
+        try:
+            self._run_privileged(["set-caddy-capability", str(executable)])
+        except PrivilegeError:
+            pass
 
     def install_service_units(self, stage_dir: Path, dest_dir: Path) -> None:
         dest_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
