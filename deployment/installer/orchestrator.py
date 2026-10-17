@@ -1148,7 +1148,15 @@ class InstallerOrchestrator:
         self.paths.caddyfile.write_text(caddyfile_content, encoding="utf-8")
 
         target_platform = getattr(self.platform, "os_name", "windows" if os.name == "nt" else "linux")
-        if target_platform == "linux" and shutil.which(str(caddy_bin)):
+        if target_platform == "linux" and os.name != "nt" and shutil.which(str(caddy_bin)):
+            val_res = subprocess.run(
+                [str(caddy_bin), "validate", "--config", str(self.paths.caddyfile), "--adapter", "caddyfile"],
+                capture_output=True,
+                text=True,
+            )
+            if val_res.returncode != 0:
+                raise InstallerError(f"Caddyfile validation failed: {val_res.stderr.strip()}")
+        elif target_platform == "windows" and caddy_bin.name.endswith(".exe") and shutil.which(str(caddy_bin)):
             val_res = subprocess.run(
                 [str(caddy_bin), "validate", "--config", str(self.paths.caddyfile), "--adapter", "caddyfile"],
                 capture_output=True,
