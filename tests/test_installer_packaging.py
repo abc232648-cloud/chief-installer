@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 import deployment.installer.__main__ as installer_main
 
 _BUILD_SCRIPT = Path(__file__).resolve().parents[1] / "packaging" / "installer" / "linux" / "build_package.py"
@@ -65,9 +67,14 @@ def test_frozen_entrypoint_uses_host_python_for_child_modules(tmp_path, monkeypa
 
     assert os.environ["CHIEF_INSTALLER_FROZEN_EXECUTABLE"] == str(fake_installer)
     assert installer_main.sys.executable == str(fake_python)
-    assert "LD_LIBRARY_PATH" not in os.environ
+    if os.name != "nt":
+        assert "LD_LIBRARY_PATH" not in os.environ
+    else:
+        # Windows does not use the ELF loader path and must leave it untouched.
+        assert os.environ["LD_LIBRARY_PATH"] == "/tmp/_MEI-chief-installer"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="LD_LIBRARY_PATH is a POSIX/Linux loader setting")
 def test_frozen_entrypoint_restores_original_loader_path_for_children(tmp_path, monkeypatch):
     """External children must not inherit PyInstaller's private native libraries."""
     fake_installer = tmp_path / "chief-installer"
