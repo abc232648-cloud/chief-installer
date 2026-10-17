@@ -53,6 +53,8 @@ def test_frozen_entrypoint_uses_host_python_for_child_modules(tmp_path, monkeypa
     monkeypatch.setattr(installer_main.sys, "frozen", True, raising=False)
     monkeypatch.setattr(installer_main.sys, "executable", str(fake_installer))
     monkeypatch.delenv("CHIEF_INSTALLER_FROZEN_EXECUTABLE", raising=False)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/_MEI-chief-installer")
+    monkeypatch.delenv("LD_LIBRARY_PATH_ORIG", raising=False)
 
     def fake_which(name):
         return str(fake_python) if name == "python3" else None
@@ -63,6 +65,41 @@ def test_frozen_entrypoint_uses_host_python_for_child_modules(tmp_path, monkeypa
 
     assert os.environ["CHIEF_INSTALLER_FROZEN_EXECUTABLE"] == str(fake_installer)
     assert installer_main.sys.executable == str(fake_python)
+    assert "LD_LIBRARY_PATH" not in os.environ
+
+
+def test_frozen_entrypoint_restores_original_loader_path_for_children(tmp_path, monkeypatch):
+    """External children must not inherit PyInstaller's private native libraries."""
+    fake_installer = tmp_path / "chief-installer"
+    fake_python = tmp_path / "python3"
+    fake_installer.write_text("installer", encoding="utf-8")
+    fake_python.write_text("python", encoding="utf-8")
+
+    monkeypatch.setattr(installer_main.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(installer_main.sys, "executable", str(fake_installer))
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/_MEI-chief-installer:/usr/local/lib")
+    monkeypatch.setenv("LD_LIBRARY_PATH_ORIG", "/usr/local/lib:/opt/chief-host-lib")
+
+    def fake_which(name):
+        return str(fake_python) if name == "python3" else None
+
+    monkeypatch.setattr(installer_main.shutil, "which", fake_which)
+
+    installer_main._configure_packaged_python()
+
+    assert os.environ["LD_LIBRARY_PATH"] == "/usr/local/lib:/opt/chief-host-lib"
+    assert installer_main.sys.executable == str(fake_python)
+
+
+def test_source_entrypoint_does_not_modify_loader_path(monkeypatch):
+    """Source execution must preserve the user's normal process environment."""
+    monkeypatch.delattr(installer_main.sys, "frozen", raising=False)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/custom/user/lib")
+    monkeypatch.delenv("LD_LIBRARY_PATH_ORIG", raising=False)
+
+    installer_main._configure_packaged_python()
+
+    assert os.environ["LD_LIBRARY_PATH"] == "/custom/user/lib"
 
 
 def test_frozen_entrypoint_routes_internal_privileged_helper(monkeypatch):
