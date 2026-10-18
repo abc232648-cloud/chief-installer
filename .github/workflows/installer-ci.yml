@@ -73,6 +73,9 @@ jobs:
         run: |
           test -f dist/installer/linux/chief-installer
           test -x dist/installer/linux/chief-installer
+          test -f dist/installer/linux/Chief-Installer-Linux-amd64.deb
+          dpkg-deb --info dist/installer/linux/Chief-Installer-Linux-amd64.deb
+          (cd dist/installer/linux && sha256sum --check Chief-Installer-Linux-amd64.deb.sha256)
           test -f dist/installer/linux/INSTALLER_SHA256.json
           python -c "
           import json, hashlib

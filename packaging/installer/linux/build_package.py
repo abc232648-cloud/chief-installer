@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 from typing import Optional
 import zipapp
 
@@ -21,6 +22,40 @@ def sha256_file(path: Path) -> str:
         while chunk := f.read(65536):
             h.update(chunk)
     return h.hexdigest()
+
+
+def build_desktop_package(executable: Path) -> Path:
+    """Wrap the native amd64 installer in a standard desktop-installable package.
+
+    Installing this package only adds the setup application; no Chief deployment
+    or privileged helper runs during package installation.
+    """
+    header=executable.read_bytes()[:20]
+    if len(header)<20 or header[:6]!=b"\x7fELF\x02\x01" or header[18:20]!=b"\x3e\x00":
+        raise ValueError("Desktop package requires a native Linux x86-64 executable.")
+    if not shutil.which("dpkg-deb"):
+        raise RuntimeError("dpkg-deb is required to build the Linux desktop package.")
+    target=executable.parent / "Chief-Installer-Linux-amd64.deb"
+    with tempfile.TemporaryDirectory(prefix="chief-desktop-package-") as directory:
+        root=Path(directory)
+        binary=root / "opt/chief-installer/chief-installer"
+        binary.parent.mkdir(parents=True)
+        shutil.copy2(executable,binary);binary.chmod(0o755)
+        applications=root / "usr/share/applications"
+        applications.mkdir(parents=True)
+        shutil.copy2(_PROJECT_ROOT / "packaging/installer/linux/chief-installer.desktop",applications)
+        control=root / "DEBIAN/control"
+        control.parent.mkdir()
+        control.write_text(
+            "Package: chief-installer\nVersion: 0.1.0\nArchitecture: amd64\n"
+            "Maintainer: Chief Installer maintainers\nSection: admin\nPriority: optional\n"
+            "Depends: libc6 (>= 2.35), libx11-6, libxext6, libxrender1, libxft2, libfontconfig1\n"
+            "Description: Chief graphical setup application\n"
+            " Opens the Chief setup wizard. Installing this package does not deploy Chief.\n",
+            encoding="utf-8")
+        subprocess.run(["dpkg-deb","--root-owner-group","--build",str(root),str(target)],check=True)
+    target.with_suffix(".deb.sha256").write_text(sha256_file(target)+"  "+target.name+"\n",encoding="utf-8")
+    return target
 
 
 def build_package(output_dir: Optional[Path] = None) -> Path:
@@ -70,6 +105,9 @@ def build_package(output_dir: Optional[Path] = None) -> Path:
 
     # Set executable permissions
     target_executable.chmod(0o755)
+
+    if target_executable.read_bytes()[:4] == b"\x7fELF":
+        build_desktop_package(target_executable)
 
     digest = sha256_file(target_executable)
     meta = {

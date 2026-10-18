@@ -32,6 +32,20 @@ Build self-contained Linux executable bundle:
 python packaging/installer/linux/build_package.py
 ```
 
+On Ubuntu/Xubuntu, use `Chief-Installer-Linux-amd64.deb` from the Linux
+artifact bundle. Open it with the system's Software Install or GDebi application,
+install the setup application, then open **Chief Installer** from the applications
+menu. Installing the package does not deploy Chief; deployment starts only in
+the wizard. A file manager may require choosing the package installer once.
+If no graphical package installer is present, run
+`sudo apt install ./Chief-Installer-Linux-amd64.deb`, then use the menu entry.
+
+The bare `chief-installer` executable is for terminal use; Linux file managers
+are not guaranteed to launch downloaded ELF binaries by double-click. The native
+Linux build now emits the `.deb` and its SHA-256 checksum alongside that binary.
+The zipapp development fallback does not produce a desktop package. Real desktop
+launch and installation acceptance remain required before release.
+
 ## Running Tests
 
 ```bash
