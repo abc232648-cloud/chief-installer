@@ -170,8 +170,11 @@ def test_automatic_startup_failure_blocks_completion(tmp_path, monkeypatch, miss
     assert orchestrator.state_machine.current_status != StepStatus.SUCCESS
 
 
-@pytest.mark.parametrize("failure", [None, "certificate", "missing", "redirect"])
+@pytest.mark.parametrize("failure", [None, "certificate", "missing", "redirect", "starting"])
 def test_https_routes_require_trust_and_expected_pages(tmp_path, monkeypatch, failure):
+    clock = _Clock()
+    monkeypatch.setattr(orchestrator_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(orchestrator_module.time, "sleep", clock.sleep)
     engine = InstallerOrchestrator(
         platform=_DeadlinePlatform(_Clock()),
         options=InstallOptions(owner_name="Test", owner_password="StrongPassword2026!",
@@ -185,6 +188,8 @@ def test_https_routes_require_trust_and_expected_pages(tmp_path, monkeypatch, fa
         assert cafile == str(engine.paths.caddy_root / "data/caddy/pki/authorities/local/root.crt")
         if failure == "certificate":
             raise ValueError("invalid CA")
+        if failure == "starting" and clock.now < 2:
+            raise FileNotFoundError("CA not yet created")
         return trusted_context
     visited = []
     class Response:
@@ -194,14 +199,16 @@ def test_https_routes_require_trust_and_expected_pages(tmp_path, monkeypatch, fa
         def geturl(self): return "https://unexpected.example/" if failure == "redirect" else visited[-1]
     def open_url(url, *, context, timeout):
         assert context is trusted_context
-        assert timeout == 5
+        assert 0 < timeout <= 5
         visited.append(url)
         return Response()
     monkeypatch.setattr(orchestrator_module.ssl, "create_default_context", context)
     monkeypatch.setattr(orchestrator_module.urllib.request, "urlopen", open_url)
-    if failure:
+    if failure and failure != "starting":
         with pytest.raises(InstallerError, match="not ready"):
             engine._verify_https_routes()
+        assert clock.now == 30
     else:
         engine._verify_https_routes()
         assert visited == ["https://chief-test.local" + p for p in ("/login", "/owner/", "/staff/", "/jobs/")]
+        assert clock.now == (2 if failure == "starting" else 0)

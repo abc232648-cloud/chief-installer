@@ -1307,16 +1307,29 @@ class InstallerOrchestrator:
         if not host:
             raise InstallerError("HTTPS verification requires the installation hostname")
         ca = self.paths.caddy_root / "data/caddy/pki/authorities/local/root.crt"
-        try:
-            context = ssl.create_default_context(
-                cafile=str(ca) if self.options.tls_mode == "LOCAL" else None)
-            for route in ("/login", "/owner/", "/staff/", "/jobs/"):
-                url = f"https://{host}{route}"
-                with urllib.request.urlopen(url, context=context, timeout=5) as response:
-                    if response.status != 200 or response.geturl() != url:
-                        raise InstallerError(f"HTTPS route {route} did not return its expected page")
-        except Exception as exc:
-            raise InstallerError("Trusted HTTPS route verification failed; installation is not ready") from exc
+        deadline = time.monotonic() + 30.0
+        last_error = None
+        # systemd reports active before Caddy has created its CA/listener.
+        # Retry readiness, always retaining certificate/hostname validation.
+        while time.monotonic() < deadline:
+            try:
+                context = ssl.create_default_context(
+                    cafile=str(ca) if self.options.tls_mode == "LOCAL" else None)
+                for route in ("/login", "/owner/", "/staff/", "/jobs/"):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("HTTPS readiness deadline exceeded")
+                    url = f"https://{host}{route}"
+                    with urllib.request.urlopen(url, context=context, timeout=min(5.0, remaining)) as response:
+                        if response.status != 200 or response.geturl() != url:
+                            raise InstallerError(f"HTTPS route {route} did not return its expected page")
+                return
+            except Exception as exc:
+                last_error = exc
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(1.0, remaining))
+        raise InstallerError("Trusted HTTPS route verification failed; installation is not ready") from last_error
 
     def _step_device_setup(self) -> None:
         self.state_machine.transition(StepId.DEVICE_SETUP, StepStatus.RUNNING, message="Exporting mobile setup certificates...")
