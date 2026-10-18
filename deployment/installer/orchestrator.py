@@ -849,21 +849,13 @@ class InstallerOrchestrator:
             if not os.access(chromium_exec, os.X_OK):
                 raise InstallerError(f"Chromium binary at {chromium_exec} is not executable")
 
-            ver_res = run_quiet([str(chromium_exec), "--version"], capture_output=True, text=True)
-            if ver_res.returncode != 0:
-                raise InstallerError(f"Chromium --version failed with exit code {ver_res.returncode}: {ver_res.stderr.strip()}")
-
-            ver_match = re.search(r"(\d+\.\d+\.\d+\.\d+)", ver_res.stdout)
-            if not ver_match:
-                raise InstallerError(f"Failed to parse numeric version from chromium output: {ver_res.stdout.strip()!r}")
-            chromium_version = ver_match.group(1)
-
             # Real Chromium-launch verification smoke test
             self.logger.info("Performing live Chromium launch smoke test...")
             smoke_script = (
                 "from playwright.sync_api import sync_playwright\n"
                 "with sync_playwright() as p:\n"
                 "    browser = p.chromium.launch(headless=True)\n"
+                "    print('CHIEF_BROWSER_VERSION=' + browser.version)\n"
                 "    page = browser.new_page()\n"
                 "    page.set_content('<title>Chief browser acceptance</title><h1>OK</h1>')\n"
                 "    assert page.title() == 'Chief browser acceptance'\n"
@@ -880,6 +872,11 @@ class InstallerOrchestrator:
                 raise InstallerError(
                     f"Chromium browser launch smoke test failed with exit code {smoke_res.returncode}: {smoke_res.stderr.strip()}"
                 )
+
+            ver_match = re.search(r"CHIEF_BROWSER_VERSION=(\d+\.\d+\.\d+\.\d+)", smoke_res.stdout)
+            if not ver_match:
+                raise InstallerError("Headless Chromium check did not report a valid version")
+            chromium_version = ver_match.group(1)
 
             h = hashlib.sha256()
             with open(chromium_exec, "rb") as bf:
