@@ -16,6 +16,7 @@ import platform as py_platform
 import re
 import shutil
 import subprocess
+from ..process import run as run_quiet
 import sys
 import time
 from typing import Callable, Dict, List, Optional, Tuple
@@ -264,7 +265,7 @@ class WindowsPlatformAdapter(PlatformAdapter):
         # Stop existing background tasks if present
         for task in ("chief-agent-dashboard", "chief-agent-worker", "chief-agent-scheduler", "chief-tls-proxy"):
             try:
-                subprocess.run(["schtasks", "/end", "/tn", task], capture_output=True, text=True)
+                run_quiet(["schtasks", "/end", "/tn", task], capture_output=True, text=True)
             except Exception:
                 pass
 
@@ -339,7 +340,7 @@ class WindowsPlatformAdapter(PlatformAdapter):
             task_name = unit_file.stem
             if shutil.which("schtasks"):
                 cmd = ["schtasks", "/create", "/tn", task_name, "/xml", str(target), "/f"]
-                res = subprocess.run(cmd, capture_output=True, text=True)
+                res = run_quiet(cmd, capture_output=True, text=True)
                 if res.returncode != 0:
                     # Non-fatal during testing if Task Scheduler service is offline
                     pass
@@ -371,24 +372,24 @@ class WindowsPlatformAdapter(PlatformAdapter):
             try:
                 if action == "start":
                     cmd = ["schtasks", "/run", "/tn", task]
-                    res = subprocess.run(cmd, capture_output=True, text=True)
+                    res = run_quiet(cmd, capture_output=True, text=True)
                     results[s] = res.returncode == 0
                 elif action == "stop":
                     cmd = ["schtasks", "/end", "/tn", task]
-                    res = subprocess.run(cmd, capture_output=True, text=True)
+                    res = run_quiet(cmd, capture_output=True, text=True)
                     results[s] = res.returncode == 0
                 elif action == "restart":
-                    subprocess.run(["schtasks", "/end", "/tn", task], capture_output=True, text=True)
+                    run_quiet(["schtasks", "/end", "/tn", task], capture_output=True, text=True)
                     time.sleep(0.5)
-                    res = subprocess.run(["schtasks", "/run", "/tn", task], capture_output=True, text=True)
+                    res = run_quiet(["schtasks", "/run", "/tn", task], capture_output=True, text=True)
                     results[s] = res.returncode == 0
                 elif action == "enable":
                     cmd = ["schtasks", "/change", "/tn", task, "/enable"]
-                    res = subprocess.run(cmd, capture_output=True, text=True)
+                    res = run_quiet(cmd, capture_output=True, text=True)
                     results[s] = res.returncode == 0
                 elif action == "disable":
                     cmd = ["schtasks", "/change", "/tn", task, "/disable"]
-                    res = subprocess.run(cmd, capture_output=True, text=True)
+                    res = run_quiet(cmd, capture_output=True, text=True)
                     results[s] = res.returncode == 0
             except Exception:
                 results[s] = False
@@ -402,7 +403,7 @@ class WindowsPlatformAdapter(PlatformAdapter):
         task = self._normalize_task_name(service_name)
         try:
             cmd = ["schtasks", "/query", "/tn", task, "/fo", "CSV", "/nh"]
-            res = subprocess.run(cmd, capture_output=True, text=True)
+            res = run_quiet(cmd, capture_output=True, text=True)
             if res.returncode == 0:
                 output = res.stdout.strip()
                 # If Status is Running or Ready

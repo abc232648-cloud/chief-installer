@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+from .process import run as run_quiet, popen as popen_quiet
 import sys
 from typing import Any, Dict, List, Optional
 import unicodedata
@@ -84,7 +85,7 @@ class ChiefAgentDeploymentClient:
         env["PYTHONPATH"] = str(root) + (f"{os.pathsep}{env['PYTHONPATH']}" if "PYTHONPATH" in env else "")
 
         try:
-            res = subprocess.run(
+            res = run_quiet(
                 cmd,
                 cwd=str(root),
                 env=env,
@@ -210,7 +211,7 @@ class ChiefAgentDeploymentClient:
         serializable_kwargs = {k: str(v) if isinstance(v, Path) else v for k, v in kwargs.items()}
         payload = json.dumps(serializable_kwargs)
 
-        proc = subprocess.Popen(
+        proc = popen_quiet(
             cmd,
             cwd=str(root),
             env=env,
@@ -401,7 +402,7 @@ class ChiefAgentDeploymentClient:
         cmd = [str(self.python_bin), "-c", runner, str(config_path), str(timeout)]
         env = dict(os.environ)
         env["PYTHONPATH"] = str(root) + (f"{os.pathsep}{env['PYTHONPATH']}" if "PYTHONPATH" in env else "")
-        proc = subprocess.run(cmd, cwd=str(root), env=env, capture_output=True, text=True)
+        proc = run_quiet(cmd, cwd=str(root), env=env, capture_output=True, text=True)
         if proc.returncode != 0:
             raise ContractCompatibilityError(f"Starting services failed: {proc.stderr.strip()}")
         return json.loads(proc.stdout)

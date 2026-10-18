@@ -13,6 +13,7 @@ import re
 import shutil
 import ssl
 import subprocess
+from .process import run as run_quiet
 import sys
 import tarfile
 import time
@@ -357,14 +358,14 @@ class InstallerOrchestrator:
         if not target_dir.exists() or not any(target_dir.iterdir()):
             target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             self.logger.info(f"Cloning {component} from {clone_source} at commit {commit}")
-            res = subprocess.run(
+            res = run_quiet(
                 ["git", "clone", clone_source, str(target_dir)],
                 capture_output=True,
                 text=True,
             )
             if res.returncode != 0:
                 raise InstallerError(f"Failed to clone {component} from {clone_source}: {res.stderr.strip()}")
-            res = subprocess.run(
+            res = run_quiet(
                 ["git", "-C", str(target_dir), "checkout", commit],
                 capture_output=True,
                 text=True,
@@ -373,26 +374,26 @@ class InstallerOrchestrator:
                 raise InstallerError(f"Failed to checkout {component} commit {commit}: {res.stderr.strip()}")
         else:
             if git_dir.exists():
-                res = subprocess.run(
+                res = run_quiet(
                     ["git", "-C", str(target_dir), "rev-parse", "HEAD"],
                     capture_output=True,
                     text=True,
                 )
                 actual_head = res.stdout.strip().lower()
                 if actual_head != commit.lower():
-                    checkout_res = subprocess.run(
+                    checkout_res = run_quiet(
                         ["git", "-C", str(target_dir), "checkout", commit],
                         capture_output=True,
                         text=True,
                     )
                     if checkout_res.returncode != 0:
                         fetch_src = str(local_override) if local_override else "origin"
-                        subprocess.run(
+                        run_quiet(
                             ["git", "-C", str(target_dir), "fetch", fetch_src],
                             capture_output=True,
                             text=True,
                         )
-                        res2 = subprocess.run(
+                        res2 = run_quiet(
                             ["git", "-C", str(target_dir), "checkout", commit],
                             capture_output=True,
                             text=True,
@@ -401,7 +402,7 @@ class InstallerOrchestrator:
                             raise InstallerError(f"Failed to checkout {component} commit {commit}: {res2.stderr.strip()}")
 
         if git_dir.exists():
-            res = subprocess.run(
+            res = run_quiet(
                 ["git", "-C", str(target_dir), "rev-parse", "HEAD"],
                 capture_output=True,
                 text=True,
@@ -435,7 +436,7 @@ class InstallerOrchestrator:
         sys_node = shutil.which("node")
         sys_npm = shutil.which("npm.cmd") if is_windows else shutil.which("npm")
         if sys_node and sys_npm:
-            res = subprocess.run([sys_node, "--version"], capture_output=True, text=True)
+            res = run_quiet([sys_node, "--version"], capture_output=True, text=True)
             if res.returncode == 0 and res.stdout.strip() == f"v{self.manifest.node_version}":
                 return Path(sys_node), Path(sys_npm)
 
@@ -771,18 +772,18 @@ class InstallerOrchestrator:
         if not self.paths.python.exists():
             venv_cmd = [sys.executable, "-m", "venv", str(self.paths.runtime)]
             self.logger.info("Creating isolated Python virtual environment", venv_cmd=venv_cmd)
-            res = subprocess.run(venv_cmd, capture_output=True, text=True)
+            res = run_quiet(venv_cmd, capture_output=True, text=True)
             if res.returncode != 0:
                 raise InstallerError(f"Failed to create Python virtual environment: {res.stderr.strip()}")
 
             pip_cmd = [str(self.paths.python), "-m", "pip", "install", "--upgrade", "pip"]
-            subprocess.run(pip_cmd, capture_output=True, text=True)
+            run_quiet(pip_cmd, capture_output=True, text=True)
 
             reqs_file = self.paths.tooling / "requirements.txt"
             if reqs_file.exists():
                 self.logger.info(f"Installing Chief requirements from {reqs_file}")
                 install_cmd = [str(self.paths.python), "-m", "pip", "install", "-r", str(reqs_file)]
-                res = subprocess.run(install_cmd, capture_output=True, text=True)
+                res = run_quiet(install_cmd, capture_output=True, text=True)
                 if res.returncode != 0:
                     raise InstallerError(f"Failed to install requirements: {res.stderr.strip()}")
 
@@ -808,7 +809,7 @@ class InstallerOrchestrator:
         if not self.paths.browser_config.exists():
             self.logger.info("Installing Playwright Chromium browser...")
             install_cmd = [str(self.paths.python), "-m", "playwright", "install", "chromium"]
-            install_res = subprocess.run(
+            install_res = run_quiet(
                 install_cmd,
                 capture_output=True,
                 text=True,
@@ -817,7 +818,7 @@ class InstallerOrchestrator:
                 if os.name != "nt":
                     self.logger.info("Retrying with --with-deps...", error=install_res.stderr.strip())
                     install_cmd = [str(self.paths.python), "-m", "playwright", "install", "--with-deps", "chromium"]
-                    install_res = subprocess.run(
+                    install_res = run_quiet(
                         install_cmd,
                         capture_output=True,
                         text=True,
@@ -833,7 +834,7 @@ class InstallerOrchestrator:
                 "print(p.chromium.executable_path)\n"
                 "p.stop()\n"
             )
-            path_res = subprocess.run(
+            path_res = run_quiet(
                 [str(self.paths.python), "-c", find_script],
                 capture_output=True,
                 text=True,
@@ -848,7 +849,7 @@ class InstallerOrchestrator:
             if not os.access(chromium_exec, os.X_OK):
                 raise InstallerError(f"Chromium binary at {chromium_exec} is not executable")
 
-            ver_res = subprocess.run([str(chromium_exec), "--version"], capture_output=True, text=True)
+            ver_res = run_quiet([str(chromium_exec), "--version"], capture_output=True, text=True)
             if ver_res.returncode != 0:
                 raise InstallerError(f"Chromium --version failed with exit code {ver_res.returncode}: {ver_res.stderr.strip()}")
 
@@ -870,7 +871,7 @@ class InstallerOrchestrator:
                 "    browser.close()\n"
                 "print('CHIEF_PLAYWRIGHT_BROWSER_OK')\n"
             )
-            smoke_res = subprocess.run(
+            smoke_res = run_quiet(
                 [str(self.paths.python), "-c", smoke_script],
                 capture_output=True,
                 text=True,
@@ -937,11 +938,11 @@ class InstallerOrchestrator:
                 self.logger.info(f"Building {name} PWA with npm...")
                 npm_env = os.environ.copy()
                 npm_env["PATH"] = f"{node_bin.parent}{os.pathsep}{npm_env.get('PATH', '')}"
-                ci_res = subprocess.run([str(npm_bin), "ci", "--engine-strict"], cwd=str(app_dir), capture_output=True, text=True, env=npm_env)
+                ci_res = run_quiet([str(npm_bin), "ci", "--engine-strict"], cwd=str(app_dir), capture_output=True, text=True, env=npm_env)
                 if ci_res.returncode != 0:
                     raise InstallerError(f"npm ci failed for {name} PWA: {ci_res.stderr.strip()}")
 
-                build_res = subprocess.run([str(npm_bin), "run", "build"], cwd=str(app_dir), capture_output=True, text=True, env=npm_env)
+                build_res = run_quiet([str(npm_bin), "run", "build"], cwd=str(app_dir), capture_output=True, text=True, env=npm_env)
                 if build_res.returncode != 0:
                     raise InstallerError(f"npm run build failed for {name} PWA: {build_res.stderr.strip()}")
 
@@ -1163,7 +1164,7 @@ class InstallerOrchestrator:
 
         target_platform = getattr(self.platform, "os_name", "windows" if os.name == "nt" else "linux")
         if target_platform == "linux" and os.name != "nt" and shutil.which(str(caddy_bin)):
-            val_res = subprocess.run(
+            val_res = run_quiet(
                 [str(caddy_bin), "validate", "--config", str(self.paths.caddyfile), "--adapter", "caddyfile"],
                 capture_output=True,
                 text=True,
@@ -1171,7 +1172,7 @@ class InstallerOrchestrator:
             if val_res.returncode != 0:
                 raise InstallerError(f"Caddyfile validation failed: {val_res.stderr.strip()}")
         elif target_platform == "windows" and caddy_bin.name.endswith(".exe") and shutil.which(str(caddy_bin)):
-            val_res = subprocess.run(
+            val_res = run_quiet(
                 [str(caddy_bin), "validate", "--config", str(self.paths.caddyfile), "--adapter", "caddyfile"],
                 capture_output=True,
                 text=True,
@@ -1186,7 +1187,7 @@ class InstallerOrchestrator:
             task_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             task_file.write_text(task_xml, encoding="utf-16")
             if shutil.which("schtasks"):
-                subprocess.run(["schtasks", "/create", "/tn", "chief-tls-proxy", "/xml", str(task_file), "/f"], capture_output=True, text=True)
+                run_quiet(["schtasks", "/create", "/tn", "chief-tls-proxy", "/xml", str(task_file), "/f"], capture_output=True, text=True)
         else:
             service_content = self.generate_caddy_service_unit()
             service_file = self.paths.unit_dest / "chief-tls-proxy.service"
