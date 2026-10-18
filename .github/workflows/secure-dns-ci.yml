@@ -23,7 +23,7 @@ jobs:
       - name: Checkout exact chief-agent DNS review commit
         run: |
           git clone https://github.com/abc232648-cloud/chief-agent.git ../chief-agent
-          git -C ../chief-agent checkout 96aacadf8e111fb2c108c49d0d49fac40aea47e3
+          git -C ../chief-agent checkout 89abfd22705ec331dd9f33a133a59ec9473513aa
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5

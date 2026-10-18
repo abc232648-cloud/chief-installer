@@ -4,6 +4,7 @@ Validates the self-contained native PE executable (Chief-Installer-Windows.exe) 
 Verifies PE binary integrity, SHA-256 metadata, windowed configuration, and CLI dispatch.
 """
 import hashlib
+from functools import cache
 import importlib.util
 import json
 import os
@@ -12,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import pytest
+from deployment.installer.manifest import CURRENT_RELEASE_MANIFEST
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="Windows executable acceptance tests run only on Windows")
 
@@ -22,11 +24,9 @@ _DIST_META = _PROJECT_ROOT / "dist" / "installer" / "windows" / "INSTALLER_SHA25
 _DIST_SHA256 = _PROJECT_ROOT / "dist" / "installer" / "windows" / "Chief-Installer-Windows.exe.sha256"
 
 
+@cache
 def _ensure_package() -> Path:
-    """Return existing packaged Windows executable or build it."""
-    if _DIST_EXE.exists() and _DIST_META.exists():
-        return _DIST_EXE
-
+    """Build this source once per test process; never certify a stale dist."""
     has_pyinstaller = bool(
         shutil.which("pyinstaller")
         or (Path(sys.executable).parent / ("pyinstaller.exe" if os.name == "nt" else "pyinstaller")).exists()
@@ -45,7 +45,10 @@ def _run_artifact(artifact: Path, *args: str, env: dict = None) -> subprocess.Co
     run_env = dict(os.environ)
     if env:
         run_env.update(env)
-    return subprocess.run(cmd, capture_output=True, text=True, env=run_env)
+    # Frozen Python may use the Windows code page regardless of PYTHONUTF8.
+    # These CLI contracts concern ASCII flags; inspect bytes without guessing
+    # the encoding of localized descriptive text.
+    return subprocess.run(cmd, capture_output=True, env=run_env, timeout=60)
 
 
 def test_windows_packaged_artifact_integrity():
@@ -60,7 +63,7 @@ def test_windows_packaged_artifact_integrity():
     assert _DIST_META.exists(), "INSTALLER_SHA256.json metadata file not found"
     meta = json.loads(_DIST_META.read_text(encoding="utf-8"))
     assert meta["artifact"] == "Chief-Installer-Windows.exe"
-    assert meta["release_id"] == "chief-2026-10-16-accepted"
+    assert meta["release_id"] == CURRENT_RELEASE_MANIFEST.release_id
     assert len(meta["sha256"]) == 64
 
     actual_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
@@ -78,13 +81,13 @@ def test_windows_packaged_artifact_help():
     assert proc.returncode == 0
     # In windowed GUI app, stdout is piped when captured
     combined = proc.stdout + proc.stderr
-    assert "chief-installer" in combined
-    assert "--owner-name" in combined
-    assert "--username" in combined
-    assert "--farm-operations" in combined
-    assert "--tls-mode" in combined
-    assert "--non-interactive" in combined
-    assert "--dns-mode" in combined
+    assert b"chief-installer" in combined
+    assert b"--owner-name" in combined
+    assert b"--username" in combined
+    assert b"--farm-operations" in combined
+    assert b"--tls-mode" in combined
+    assert b"--non-interactive" in combined
+    assert b"--dns-mode" in combined
 
 
 def test_windows_packaged_artifact_fail_closed_validation():
@@ -93,7 +96,7 @@ def test_windows_packaged_artifact_fail_closed_validation():
     proc = _run_artifact(artifact, "--non-interactive")
     assert proc.returncode == 1
     combined = proc.stdout + proc.stderr
-    assert "--owner-name is required" in combined
+    assert b"--owner-name is required" in combined
 
 
 def test_windows_packaged_artifact_invalid_manifest():

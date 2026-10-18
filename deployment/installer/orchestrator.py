@@ -29,7 +29,7 @@ from .errors import (
 )
 from .events import EventBus, InstallEvent
 from .logging import InstallerLogger
-from .manifest import ACCEPTED_FIRST_RELEASE_MANIFEST, ReleaseManifest
+from .manifest import CURRENT_RELEASE_MANIFEST, ReleaseManifest
 from .models import (
     InstallOptions,
     InstallResult,
@@ -129,7 +129,7 @@ class InstallerOrchestrator:
     ):
         self.platform = platform
         self.options = options
-        self.manifest = manifest or ACCEPTED_FIRST_RELEASE_MANIFEST
+        self.manifest = manifest or CURRENT_RELEASE_MANIFEST
         self.paths = paths or InstallerPaths.create()
         self.event_bus = event_bus or EventBus()
         self.logger = logger or InstallerLogger()
@@ -923,7 +923,7 @@ class InstallerOrchestrator:
                 self.logger.info(f"Building {name} PWA with npm...")
                 npm_env = os.environ.copy()
                 npm_env["PATH"] = f"{node_bin.parent}{os.pathsep}{npm_env.get('PATH', '')}"
-                ci_res = subprocess.run([str(npm_bin), "ci"], cwd=str(app_dir), capture_output=True, text=True, env=npm_env)
+                ci_res = subprocess.run([str(npm_bin), "ci", "--engine-strict"], cwd=str(app_dir), capture_output=True, text=True, env=npm_env)
                 if ci_res.returncode != 0:
                     raise InstallerError(f"npm ci failed for {name} PWA: {ci_res.stderr.strip()}")
 

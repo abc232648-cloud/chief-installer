@@ -1,4 +1,5 @@
 import importlib.util
+from deployment.installer.manifest import CURRENT_RELEASE_MANIFEST
 import json
 import os
 from pathlib import Path
@@ -32,7 +33,7 @@ def test_linux_package_build_and_metadata(tmp_path):
 
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     assert meta["artifact"] == "chief-installer"
-    assert meta["release_id"] == "chief-2026-10-16-accepted"
+    assert meta["release_id"] == CURRENT_RELEASE_MANIFEST.release_id
     assert meta["sha256"] == sha256_file(artifact)
     assert meta["size_bytes"] == artifact.stat().st_size
 

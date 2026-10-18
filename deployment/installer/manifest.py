@@ -1,5 +1,5 @@
 """Release manifest contract and validation for Chief Unified Installer."""
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 import re
@@ -134,4 +134,14 @@ ACCEPTED_FIRST_RELEASE_MANIFEST = ReleaseManifest(
     caddy_version="2.11.7",
     caddy_checksum="5d27b76b95f496638d79208c55250317b8755fd9e90005f7466aa32956944a90",
     supported_installer_schema=1,
+)
+
+
+# Candidate used by this installer build. Historical acceptance above is immutable.
+# Review status is explicit in release_id; packaging is not deployment approval.
+CURRENT_RELEASE_MANIFEST = replace(
+    ACCEPTED_FIRST_RELEASE_MANIFEST,
+    release_id="chief-2026-10-18-release-review",
+    chief_agent_commit="89abfd22705ec331dd9f33a133a59ec9473513aa",
+    node_version="24.19.0",
 )

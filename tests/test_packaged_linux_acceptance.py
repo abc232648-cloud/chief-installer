@@ -4,6 +4,7 @@ Validates the self-contained native executable package built for Linux (Xubuntu 
 Verifies package integrity, command-line interface contracts, fail-closed parameter validation,
 and packaged helper routing without relying only on source-level tests.
 """
+from deployment.installer.manifest import CURRENT_RELEASE_MANIFEST
 import importlib.util
 import json
 import os
@@ -49,7 +50,7 @@ def test_packaged_artifact_integrity():
     assert _DIST_META.exists(), "INSTALLER_SHA256.json metadata file not found"
     meta = json.loads(_DIST_META.read_text(encoding="utf-8"))
     assert meta["artifact"] == "chief-installer"
-    assert meta["release_id"] == "chief-2026-10-16-accepted"
+    assert meta["release_id"] == CURRENT_RELEASE_MANIFEST.release_id
     assert len(meta["sha256"]) == 64
 
     import hashlib
