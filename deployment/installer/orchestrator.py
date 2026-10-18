@@ -11,6 +11,7 @@ from pathlib import Path
 import platform as py_platform
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tarfile
@@ -611,7 +612,12 @@ class InstallerOrchestrator:
             f"        try_files {{path}} /index.html\n"
             f"        file_server\n"
             f"    }}\n"
-            f"    respond 404\n"
+            f"    handle {{\n"
+            f"        reverse_proxy 127.0.0.1:8765 {{\n"
+            f"            header_up Host {{host}}\n"
+            f"            header_up X-Forwarded-Proto https\n"
+            f"        }}\n"
+            f"    }}\n"
             f"}}\n"
         )
 
@@ -1213,6 +1219,13 @@ class InstallerOrchestrator:
             self.state_machine.transition(StepId.HEALTH_CHECK, StepStatus.SUCCESS, message="All services active and healthy (mock).")
             return
 
+        services = ["chief-agent-dashboard.service", "chief-agent-worker.service",
+                    "chief-agent-scheduler.service", "chief-tls-proxy.service"]
+        enabled = self.platform.control_services("enable", services)
+        for service in services:
+            if not enabled.get(service, False):
+                raise InstallerError(f"Service {service} could not be enabled for automatic startup")
+
         target_platform = getattr(self.platform, "os_name", "windows" if os.name == "nt" else "linux")
         if target_platform == "windows":
             self.logger.info("Starting managed Chief services via Task Scheduler...")
@@ -1285,7 +1298,25 @@ class InstallerOrchestrator:
                 f"within the {health_deadline_seconds:.0f}-second deadline."
             )
 
-        self.state_machine.transition(StepId.HEALTH_CHECK, StepStatus.SUCCESS, message="All services active and healthy.")
+        self._verify_https_routes()
+        self.state_machine.transition(StepId.HEALTH_CHECK, StepStatus.SUCCESS, message="All services active and HTTPS routes healthy.")
+
+    def _verify_https_routes(self) -> None:
+        """Check the user-facing routes with certificate and hostname validation."""
+        host = self._public_host
+        if not host:
+            raise InstallerError("HTTPS verification requires the installation hostname")
+        ca = self.paths.caddy_root / "data/caddy/pki/authorities/local/root.crt"
+        try:
+            context = ssl.create_default_context(
+                cafile=str(ca) if self.options.tls_mode == "LOCAL" else None)
+            for route in ("/login", "/owner/", "/staff/", "/jobs/"):
+                url = f"https://{host}{route}"
+                with urllib.request.urlopen(url, context=context, timeout=5) as response:
+                    if response.status != 200 or response.geturl() != url:
+                        raise InstallerError(f"HTTPS route {route} did not return its expected page")
+        except Exception as exc:
+            raise InstallerError("Trusted HTTPS route verification failed; installation is not ready") from exc
 
     def _step_device_setup(self) -> None:
         self.state_machine.transition(StepId.DEVICE_SETUP, StepStatus.RUNNING, message="Exporting mobile setup certificates...")

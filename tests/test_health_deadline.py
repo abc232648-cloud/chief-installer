@@ -144,3 +144,64 @@ def test_health_check_enforces_15_second_wall_clock_deadline(tmp_path, monkeypat
     assert all(timeout <= 2.0 for timeout in platform.probe_timeouts)
     assert orchestrator.state_machine.current_step == StepId.HEALTH_CHECK
     assert orchestrator.state_machine.current_status == StepStatus.RUNNING
+
+
+@pytest.mark.parametrize("missing_result", [False, True])
+def test_automatic_startup_failure_blocks_completion(tmp_path, monkeypatch, missing_result):
+    platform = _DeadlinePlatform(_Clock())
+    calls = []
+    def control(action, names):
+        calls.append(action)
+        return {} if missing_result else {name: False for name in names}
+    monkeypatch.setattr(platform, "control_services", control)
+    orchestrator = InstallerOrchestrator(
+        platform=platform,
+        options=InstallOptions(owner_name="Test", owner_password="StrongPassword2026!"),
+        paths=InstallerPaths.create(custom_root=tmp_path / "chief", home=tmp_path / "home"),
+        logger=InstallerLogger(log_dir=tmp_path / "logs", session_id="startup"),
+        deployment_client=_DeploymentClient(),
+    )
+    orchestrator.state_machine.current_step = StepId.LOCAL_DISCOVERY
+    orchestrator.state_machine.current_status = StepStatus.SUCCESS
+    with pytest.raises(InstallerError, match="automatic startup"):
+        orchestrator._step_health_check()
+    assert calls == ["enable"]
+    assert not platform.probe_timeouts
+    assert orchestrator.state_machine.current_status != StepStatus.SUCCESS
+
+
+@pytest.mark.parametrize("failure", [None, "certificate", "missing", "redirect"])
+def test_https_routes_require_trust_and_expected_pages(tmp_path, monkeypatch, failure):
+    engine = InstallerOrchestrator(
+        platform=_DeadlinePlatform(_Clock()),
+        options=InstallOptions(owner_name="Test", owner_password="StrongPassword2026!",
+                               public_host="chief-test.local", tls_mode="LOCAL"),
+        paths=InstallerPaths.create(custom_root=tmp_path / "chief", home=tmp_path / "home"),
+        logger=InstallerLogger(log_dir=tmp_path / "logs", session_id="https"),
+        deployment_client=_DeploymentClient(),
+    )
+    trusted_context = object()
+    def context(*, cafile):
+        assert cafile == str(engine.paths.caddy_root / "data/caddy/pki/authorities/local/root.crt")
+        if failure == "certificate":
+            raise ValueError("invalid CA")
+        return trusted_context
+    visited = []
+    class Response:
+        status = 404 if failure == "missing" else 200
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def geturl(self): return "https://unexpected.example/" if failure == "redirect" else visited[-1]
+    def open_url(url, *, context, timeout):
+        assert context is trusted_context
+        assert timeout == 5
+        visited.append(url)
+        return Response()
+    monkeypatch.setattr(orchestrator_module.ssl, "create_default_context", context)
+    monkeypatch.setattr(orchestrator_module.urllib.request, "urlopen", open_url)
+    if failure:
+        with pytest.raises(InstallerError, match="not ready"):
+            engine._verify_https_routes()
+    else:
+        engine._verify_https_routes()
+        assert visited == ["https://chief-test.local" + p for p in ("/login", "/owner/", "/staff/", "/jobs/")]

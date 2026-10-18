@@ -94,6 +94,12 @@ def test_windows_caddyfile_spaces_and_slashes(tmp_path):
     )
     caddyfile = orchestrator.generate_caddyfile("chief-test.local", "LOCAL")
     assert "tls internal" in caddyfile
+    assert "    handle {\n        reverse_proxy 127.0.0.1:8765" in caddyfile
+    assert "respond 404" not in caddyfile
+    assert "header_up Host {host}" in caddyfile
+    assert "header_up X-Forwarded-Proto https" in caddyfile
+    for client in ("owner", "staff", "jobs"):
+        assert f"handle_path /{client}/*" in caddyfile
     # Forward slashes must be present, no backslashes in root directives
     assert "\\" not in caddyfile
     assert f'root * "{str(paths.pwa_root).replace(chr(92), "/")}/owner/dist"' in caddyfile

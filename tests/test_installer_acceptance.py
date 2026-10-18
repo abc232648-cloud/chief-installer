@@ -157,7 +157,7 @@ def _dns_review_manifest():
     return parse_manifest(Path(__file__).resolve().parents[1] / "review-dns-manifest.json")
 
 
-def test_clean_host_acceptance_with_real_chief_deployment_contract(tmp_path):
+def test_clean_host_acceptance_with_real_chief_deployment_contract(tmp_path, monkeypatch):
     """Real Chief Agent deployment contract integration acceptance test (allow_test_mock=False)."""
     if sys.version_info < (3, 11):
         pytest.skip("chief-agent requires Python 3.11+ (hashlib.file_digest); skipping acceptance test on Python 3.10")
@@ -249,6 +249,9 @@ def test_clean_host_acceptance_with_real_chief_deployment_contract(tmp_path):
     ca_dir.mkdir(parents=True, exist_ok=True)
     (ca_dir / "root.crt").write_text("-----BEGIN CERTIFICATE-----\nACCEPTANCE-CA\n-----END CERTIFICATE-----\n", encoding="utf-8")
 
+    # This contract fixture uses a fake Caddy binary/CA; real TLS is qualified
+    # separately against the native installation, not by this fixture.
+    monkeypatch.setattr(orchestrator, "_verify_https_routes", lambda: None)
     result = orchestrator.execute_all()
 
     assert result.status == "SUCCESS", f"Installation failed with: {result.error}"
