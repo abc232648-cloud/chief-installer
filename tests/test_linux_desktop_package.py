@@ -25,6 +25,9 @@ def test_desktop_package_contains_launchable_application_without_install_hooks(t
     package=build.build_desktop_package(executable)
     extracted=tmp_path/'extracted'
     subprocess.run(['dpkg-deb','--raw-extract',str(package),str(extracted)],check=True)
+    assert extracted.stat().st_mode & 0o777 == 0o755
+    for directory in ('opt','opt/chief-installer','usr','usr/share','usr/share/applications'):
+        assert (extracted/directory).stat().st_mode & 0o777 == 0o755
     binary=extracted/'opt/chief-installer/chief-installer'
     assert binary.read_bytes()==executable.read_bytes()
     assert binary.stat().st_mode & 0o111 == 0o111

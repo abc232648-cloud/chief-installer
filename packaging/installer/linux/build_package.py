@@ -53,6 +53,10 @@ def build_desktop_package(executable: Path) -> Path:
             "Description: Chief graphical setup application\n"
             " Opens the Chief setup wizard. Installing this package does not deploy Chief.\n",
             encoding="utf-8")
+        # Archive directories must be traversable regardless of the build umask.
+        root.chmod(0o755)
+        for item in root.rglob("*"):
+            item.chmod(0o755 if item.is_dir() or item==binary else 0o644)
         subprocess.run(["dpkg-deb","--root-owner-group","--build",str(root),str(target)],check=True)
     target.with_suffix(".deb.sha256").write_text(sha256_file(target)+"  "+target.name+"\n",encoding="utf-8")
     return target
