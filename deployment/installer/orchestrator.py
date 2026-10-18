@@ -696,6 +696,14 @@ class InstallerOrchestrator:
             raise ReleaseMismatchError("Empty release_id in manifest.")
 
         if not self._is_test_fixture():
+            # Release acquisition itself needs Git, before the later runtime
+            # dependency step. Provision it before touching an existing install.
+            if shutil.which("git") is None:
+                self.platform.install_system_dependencies(
+                    progress_callback=lambda msg, prog: self.logger.info(f"Bootstrap: {msg}"),
+                )
+                if shutil.which("git") is None:
+                    raise PreflightError("Git is required to verify the release. Install Git and restart the installer.")
             repo_url = getattr(self.manifest, "chief_agent_repo", "https://github.com/abc232648-cloud/chief-agent.git")
             if not self.paths.tooling.exists() or not (self.paths.tooling / "deployment" / "contract.py").exists():
                 self._acquire_repository(

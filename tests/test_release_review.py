@@ -44,3 +44,38 @@ def test_incompatible_client_engine_stops_before_build(tmp_path, monkeypatch):
     assert len(calls) == 1
     assert calls[0][1:] == ['ci', '--engine-strict']
     assert not (paths.pwa_root/'owner'/'dist').exists()
+
+
+@pytest.mark.parametrize('outcome', ['installed', 'unavailable', 'denied'])
+def test_fresh_host_bootstraps_git_before_release_and_existing_data(tmp_path, monkeypatch, outcome):
+    from deployment.installer.errors import PreflightError, PrivilegeError
+    adapter = FakePlatformAdapter(has_existing_install=True)
+    paths = InstallerPaths.create(custom_root=tmp_path/'chief', home=tmp_path/'home')
+    runner = InstallerOrchestrator(platform=adapter,
+        options=InstallOptions(owner_name='Fixture', owner_password='SyntheticPassword123!'),
+        paths=paths, logger=InstallerLogger(log_dir=tmp_path/'logs', session_id='bootstrap'))
+    monkeypatch.setattr(runner, '_is_test_fixture', lambda: False)
+    available = {'git': False}
+    calls = []
+    monkeypatch.setattr('deployment.installer.orchestrator.shutil.which', lambda name: '/usr/bin/git' if available['git'] else None)
+    def install(**kwargs):
+        calls.append('dependencies')
+        if outcome == 'denied':
+            raise PrivilegeError('Administrator declined')
+        available['git'] = outcome == 'installed'
+    def acquire(**kwargs):
+        assert available['git'] and calls[0] == 'dependencies'
+        calls.append('acquire')
+    monkeypatch.setattr(adapter, 'install_system_dependencies', install)
+    monkeypatch.setattr(runner, '_acquire_repository', acquire)
+    monkeypatch.setattr(runner.deployment_client, 'verify_compatibility', lambda *a, **kw: SimpleNamespace(chief_agent_commit=runner.manifest.chief_agent_commit))
+    runner._step_preflight()
+    if outcome == 'installed':
+        runner._step_release_validation()
+        assert calls == ['dependencies', 'acquire', 'acquire']
+    else:
+        with pytest.raises(PrivilegeError if outcome == 'denied' else PreflightError):
+            runner._step_release_validation()
+        assert calls == ['dependencies']
+    assert 'archive_existing_installation' not in adapter.calls
+    assert not paths.production.exists()
