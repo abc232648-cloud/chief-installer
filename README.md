@@ -26,6 +26,11 @@ Chief Unified Installer provides one shared installation engine, one shared GUI 
 
 ## Building and Packaging
 
+Build the native Linux executable and desktop package using a Python environment
+with Tkinter available (`python3-tk` on Ubuntu) and PyInstaller installed. The
+Linux packaging CI uses Ubuntu 24.04 system Python and verifies the bundled GUI
+under a virtual display. General unit-test dependencies do not install PyInstaller.
+
 Build self-contained Linux executable bundle:
 
 ```bash

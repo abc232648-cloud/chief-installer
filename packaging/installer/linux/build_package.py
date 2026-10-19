@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import platform
 from pathlib import Path
 import shutil
 import subprocess
@@ -47,9 +48,9 @@ def build_desktop_package(executable: Path) -> Path:
         control=root / "DEBIAN/control"
         control.parent.mkdir()
         control.write_text(
-            "Package: chief-installer\nVersion: 0.1.0\nArchitecture: amd64\n"
+            "Package: chief-installer\nVersion: 0.1.1\nArchitecture: amd64\n"
             "Maintainer: Chief Installer maintainers\nSection: admin\nPriority: optional\n"
-            "Depends: libc6 (>= 2.35), libx11-6, libxext6, libxrender1, libxft2, libfontconfig1\n"
+            f"Depends: libc6 (>= {platform.libc_ver()[1]}), libx11-6, libxext6, libxrender1, libxft2, libfontconfig1\n"
             "Description: Chief graphical setup application\n"
             " Opens the Chief setup wizard. Installing this package does not deploy Chief.\n",
             encoding="utf-8")
@@ -73,6 +74,9 @@ def build_package(output_dir: Optional[Path] = None) -> Path:
 
     # If on Linux and pyinstaller is available in environment, build using spec
     if sys.platform.startswith("linux") and shutil.which("pyinstaller"):
+        # Hidden imports cannot bundle a module missing from the build Python.
+        import tkinter
+        import _tkinter
         spec_path = _PROJECT_ROOT / "packaging" / "installer" / "linux" / "chief_installer.spec"
         print(f"Running pyinstaller with spec: {spec_path}...")
         cmd = ["pyinstaller", "--clean", "--distpath", str(out), str(spec_path)]

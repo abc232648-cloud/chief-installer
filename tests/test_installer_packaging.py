@@ -156,5 +156,5 @@ def test_desktop_file_contract():
     assert "[Desktop Entry]" in content
     assert "Type=Application" in content
     assert "Name=Chief Installer" in content
-    assert "Exec=chief-installer" in content
+    assert "Exec=/opt/chief-installer/chief-installer --gui" in content
     assert "Terminal=false" in content
