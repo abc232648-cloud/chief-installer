@@ -372,6 +372,16 @@ class InstallerOrchestrator:
                 raise InstallerError(f"Failed to checkout {component} commit {commit}: {res.stderr.strip()}")
         else:
             if git_dir.exists():
+                status = subprocess.run(
+                    ["git", "-C", str(target_dir), "status", "--porcelain"],
+                    capture_output=True, text=True,
+                )
+                if status.returncode != 0 or status.stdout.strip():
+                    raise InstallerError(
+                        f"Cannot refresh {component} staging at {target_dir}: "
+                        "it contains local changes or its Git status cannot be verified. "
+                        "Preserve those files before retrying; nothing was discarded."
+                    )
                 res = subprocess.run(
                     ["git", "-C", str(target_dir), "rev-parse", "HEAD"],
                     capture_output=True,
@@ -697,16 +707,12 @@ class InstallerOrchestrator:
 
         if not self._is_test_fixture():
             repo_url = getattr(self.manifest, "chief_agent_repo", "https://github.com/abc232648-cloud/chief-agent.git")
-            if not self.paths.tooling.exists() or not (self.paths.tooling / "deployment" / "contract.py").exists():
+            # Retry staging must be reconciled even when a previous attempt left
+            # a complete but different checkout behind. The contract still verifies
+            # the exact pinned commit after both repositories have been acquired.
+            for target in (self.paths.tooling, self.paths.release_source):
                 self._acquire_repository(
-                    target_dir=self.paths.tooling,
-                    repo_url=repo_url,
-                    commit=self.manifest.chief_agent_commit,
-                    component="chief_agent",
-                )
-            if not self.paths.release_source.exists():
-                self._acquire_repository(
-                    target_dir=self.paths.release_source,
+                    target_dir=target,
                     repo_url=repo_url,
                     commit=self.manifest.chief_agent_commit,
                     component="chief_agent",
