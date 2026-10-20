@@ -488,7 +488,14 @@ class LinuxPlatformAdapter(PlatformAdapter):
             "2. Choose 'Install a certificate' > 'CA certificate'.\n"
             "3. Select Chief-Local-CA.crt.\n"
             f"4. Open the remote Owner PWA (https://{public_host}/owner/) or the on-farm console (https://{public_host}/) in Chrome.\n\n"
-            "Only the public CA certificate is exported here. No private TLS key is copied.\n"
+            "Only the public CA certificate is exported here. No private TLS key is copied.\n\n"
+            "WireGuard Remote Access (When away from farm Wi-Fi):\n"
+            "1. Install the WireGuard app from App Store (iOS) or Google Play (Android).\n"
+            "2. Import the tunnel configuration 'Chief-Owner-WireGuard.conf'.\n"
+            "3. Enable the tunnel. Chief will be reached securely at the exact same address:\n"
+            f"   - On-farm console: https://{public_host}/\n"
+            f"   - Remote Owner PWA: https://{public_host}/owner/\n"
+            "4. On iOS/Android, configure 'On-Demand' to automatically activate WireGuard when leaving farm Wi-Fi.\n"
         )
         readme = destination_dir / "README.txt"
         readme.write_text(readme_content, encoding="utf-8")

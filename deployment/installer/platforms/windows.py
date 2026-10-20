@@ -437,7 +437,14 @@ class WindowsPlatformAdapter(PlatformAdapter):
             f"   - Remote Owner PWA (Mobile):        https://{public_host}/owner/\n"
             f"   - Mobile Staff PWA (Field):         https://{public_host}/staff/\n"
             f"   - Job Agent Companion:              https://{public_host}/jobs/\n\n"
-            f"3. Sign in with your Chief credentials.\n"
+            f"3. Sign in with your Chief credentials.\n\n"
+            "WireGuard Remote Access (When away from farm Wi-Fi):\n"
+            "1. Install the WireGuard app from App Store (iOS) or Google Play (Android).\n"
+            "2. Import the tunnel configuration 'Chief-Owner-WireGuard.conf'.\n"
+            "3. Enable the tunnel. Chief will be reached securely at the exact same address:\n"
+            f"   - On-Farm Chief Console: https://{public_host}/\n"
+            f"   - Remote Owner PWA:      https://{public_host}/owner/\n"
+            "4. On iOS/Android, configure 'On-Demand' to automatically activate WireGuard when leaving farm Wi-Fi.\n"
         )
         readme_file.write_text(readme_content, encoding="utf-8")
         return readme_file

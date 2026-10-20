@@ -25,6 +25,7 @@ STEP_DEFINITIONS: Dict[StepId, StepDefinition] = {
     StepId.SERVICES: StepDefinition(StepId.SERVICES, "Configuring Services", "Installing systemd background user services", idempotent=True, retryable=True),
     StepId.TLS: StepDefinition(StepId.TLS, "Installing HTTPS Proxy", "Installing verified Caddy server and local TLS", idempotent=True, retryable=True),
     StepId.LOCAL_DISCOVERY: StepDefinition(StepId.LOCAL_DISCOVERY, "Configuring Local Discovery", "Advertising local mDNS hostname across network", idempotent=True, retryable=True),
+    StepId.REMOTE_ACCESS: StepDefinition(StepId.REMOTE_ACCESS, "Remote Access Setup", "Configuring secure WireGuard remote access", idempotent=True, retryable=True),
     StepId.HEALTH_CHECK: StepDefinition(StepId.HEALTH_CHECK, "Verifying Health", "Starting services and validating health endpoints", idempotent=True, retryable=True),
     StepId.DEVICE_SETUP: StepDefinition(StepId.DEVICE_SETUP, "Preparing Mobile Pairing", "Exporting local CA certificates for phones", idempotent=True, retryable=True),
     StepId.COMPLETE: StepDefinition(StepId.COMPLETE, "Installation Complete", "Chief is ready to use", idempotent=True, retryable=False),
@@ -50,6 +51,7 @@ ORDERED_INSTALL_STEPS: List[StepId] = [
     StepId.SERVICES,
     StepId.TLS,
     StepId.LOCAL_DISCOVERY,
+    StepId.REMOTE_ACCESS,
     StepId.HEALTH_CHECK,
     StepId.DEVICE_SETUP,
     StepId.COMPLETE,
@@ -68,6 +70,7 @@ def _build_valid_transitions() -> Dict[StepId, Set[StepId]]:
         allowed.add(step)
         transitions[step] = allowed
 
+    transitions[StepId.LOCAL_DISCOVERY].add(StepId.HEALTH_CHECK)
     transitions[StepId.COMPLETE] = {StepId.COMPLETE}
     transitions[StepId.FAILED] = {StepId.IDLE, StepId.PREFLIGHT}  # Allow restart after failure
     transitions[StepId.CANCELLED] = {StepId.IDLE}
