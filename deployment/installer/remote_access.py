@@ -270,8 +270,39 @@ class InstallerWireGuardManager:
         subprocess.run([systemctl, "stop", "wg-quick@wg0"], capture_output=True, text=True, check=False)
         self._service_started = False
 
-    def start_dns_server(self, canonical_hostname: str, port: int = 53, server_ip: str = "10.77.0.1") -> bool:
-        """Start the authoritative split-DNS daemon on server_ip:port."""
+    def start_dns_server(
+        self,
+        port: Union[int, str] = 53,
+        canonical_hostname: Optional[str] = None,
+        server_ip: str = "10.77.0.1",
+        **kwargs: Any,
+    ) -> bool:
+        """Start the authoritative split-DNS daemon on server_ip:port.
+
+        Accepts port and canonical_hostname flexibly by keyword or position.
+        """
+        actual_port = 53
+        actual_hostname = canonical_hostname
+
+        if isinstance(port, int):
+            actual_port = port
+        elif isinstance(port, str):
+            if port.isdigit():
+                actual_port = int(port)
+            else:
+                actual_hostname = port
+
+        if isinstance(canonical_hostname, int):
+            actual_port = canonical_hostname
+            if isinstance(port, str):
+                actual_hostname = port
+
+        if "port" in kwargs and kwargs["port"] is not None:
+            actual_port = int(kwargs["port"])
+        if "canonical_hostname" in kwargs and kwargs["canonical_hostname"] is not None:
+            actual_hostname = str(kwargs["canonical_hostname"])
+
+        hostname = actual_hostname or "chief.local"
         if self._dns_server and getattr(self._dns_server, "is_running", False):
             return True
         try:
@@ -295,8 +326,8 @@ class InstallerWireGuardManager:
         try:
             self._dns_server = WireGuardDNSServer(
                 bind_ip=server_ip,
-                port=port,
-                canonical_hostname=canonical_hostname,
+                port=actual_port,
+                canonical_hostname=hostname,
                 answer_ip=server_ip,
             )
             self._dns_server.start()
@@ -313,7 +344,14 @@ class InstallerWireGuardManager:
                 pass
             self._dns_server = None
 
-    def check_dns_readiness(self, canonical_hostname: str, server_ip: str = "10.77.0.1", port: int = 53, timeout: float = 2.0) -> bool:
+    def check_dns_readiness(
+        self,
+        canonical_hostname: str,
+        server_ip: str = "10.77.0.1",
+        port: int = 53,
+        expected_answer_ip: str = "10.77.0.1",
+        timeout: float = 2.0,
+    ) -> bool:
         """Verify real DNS query resolution through UDP socket."""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -324,7 +362,8 @@ class InstallerWireGuardManager:
             sock.sendto(query, (server_ip, port))
             resp, _ = sock.recvfrom(2048)
             sock.close()
-            if len(resp) >= 12 and socket.inet_aton(server_ip) in resp:
+            target_ip = expected_answer_ip or server_ip
+            if len(resp) >= 12 and socket.inet_aton(target_ip) in resp:
                 return True
             return False
         except Exception:
@@ -346,6 +385,11 @@ class InstallerWireGuardManager:
             try:
                 self.rollback_firewall_policy()
             except Exception:
+                pass
+        if hasattr(self, "wg_conf_path") and self.wg_conf_path and self.wg_conf_path.exists():
+            try:
+                self.wg_conf_path.unlink()
+            except OSError:
                 pass
 
     def provision_initial_server_and_owner(

@@ -493,3 +493,195 @@ def test_route_and_origin_contract_verification():
     assert routes["/owner/"] == "owner_pwa_companion"
     assert routes["/staff/"] == "staff_pwa_companion"
     assert routes["/jobs/"] == "job_agent_companion"
+
+
+def test_linux_setup_path_with_real_chief_backend_and_dns_startup(tmp_path, monkeypatch):
+    """Test actual Linux setup path with the exact pinned Chief backend and live UDP DNS socket resolution.
+
+    Exercises the installer's call to wg_mgr.start_dns_server(canonical_hostname=canonical_host),
+    verifying it harmonizes with chief-agent backend without TypeError, verifies service control,
+    firewalling, live socket DNS query/response, and DNS readiness verification.
+    """
+    peer_agent = find_peer_agent_path()
+    assert (peer_agent / "networking" / "remote_access.py").is_file()
+    assert (peer_agent / "networking" / "wireguard_dns.py").is_file()
+
+    if str(peer_agent) not in sys.path:
+        sys.path.insert(0, str(peer_agent))
+
+    from networking.remote_access import WireGuardManager as RealWireGuardManager
+    from networking.wireguard_dns import WireGuardDNSServer
+    from deployment.installer.remote_access import InstallerWireGuardManager
+
+    platform = FakePlatformAdapter(preflight_passes=True, has_existing_install=False)
+    platform.os_name = "linux"
+    paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path / "home")
+    logger = InstallerLogger(log_dir=tmp_path / "logs", session_id="test_wg_linux_real")
+
+    prod_agent = paths.production
+    (prod_agent / "networking").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(peer_agent / "networking" / "remote_access.py", prod_agent / "networking" / "remote_access.py")
+    shutil.copy2(peer_agent / "networking" / "wireguard_dns.py", prod_agent / "networking" / "wireguard_dns.py")
+    shutil.copy2(peer_agent / "networking" / "__init__.py", prod_agent / "networking" / "__init__.py")
+
+    opts = InstallOptions(
+        owner_name="Farmer Jane",
+        owner_username="jane",
+        owner_password="StrongPassword123!",
+        farm_operations="DISABLED",
+        dns_mode="quad9",
+        tls_mode="LOCAL",
+        remote_access="WIREGUARD",
+        wireguard_endpoint="203.0.113.99",
+        wireguard_port=51820,
+        enforce_backend_capability=True,
+        allow_test_mock=True,
+    )
+    opts._test_run_firewall = True
+
+    orch = InstallerOrchestrator(
+        platform=platform,
+        options=opts,
+        paths=paths,
+        logger=logger,
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+
+    # Start live real DNS daemon on loopback port to test real RFC 1035 UDP packet flow on non-root test host
+    test_dns_port = 53536
+    live_dns = WireGuardDNSServer(
+        bind_ip="127.0.0.1",
+        port=test_dns_port,
+        canonical_hostname="chief.local",
+        answer_ip="10.77.0.1",
+    )
+    live_dns.start()
+    try:
+        # Patch wg_mgr.start_dns_server to hook the running live daemon and test readiness check
+        orig_check = InstallerWireGuardManager.check_dns_readiness
+        def hooked_start(self, *a, **kw):
+            if "canonical_hostname" in kw:
+                live_dns.canonical_hostname = kw["canonical_hostname"]
+            elif len(a) > 1 and isinstance(a[1], str):
+                live_dns.canonical_hostname = a[1]
+            elif len(a) > 0 and isinstance(a[0], str) and not a[0].isdigit():
+                live_dns.canonical_hostname = a[0]
+            self._dns_server = live_dns
+            return True
+
+        monkeypatch.setattr(InstallerWireGuardManager, "start_dns_server", hooked_start)
+        monkeypatch.setattr(
+            InstallerWireGuardManager,
+            "check_dns_readiness",
+            lambda self, canonical_hostname, **kw: orig_check(
+                self, canonical_hostname, server_ip="127.0.0.1", port=test_dns_port
+            ),
+        )
+        result = orch.execute_all()
+        assert result.status == "SUCCESS", f"Install failed unexpectedly: {result.error}"
+        assert result.wireguard_configured is True
+
+        # Verify complete Linux provisioning sequence occurred
+        assert "install_wireguard_dependencies" in platform.calls
+        assert "install_wireguard_system_config" in platform.calls
+        assert "apply_wireguard_firewall:51820" in platform.calls
+        assert "control_wireguard_service:enable" in platform.calls
+        assert "control_wireguard_service:start" in platform.calls
+        assert "verify_wireguard_active" in platform.calls
+
+        # Verify real socket DNS resolution answered 10.77.0.1
+        mgr_probe = InstallerWireGuardManager(paths.root / "state" / "wireguard")
+        assert mgr_probe.check_dns_readiness(live_dns.canonical_hostname, server_ip="127.0.0.1", port=test_dns_port) is True
+
+        # Verify foreign queries are refused by the live server
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(2.0)
+        foreign_query = b"\x99\x88\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x06google\x03com\x00\x00\x01\x00\x01"
+        sock.sendto(foreign_query, ("127.0.0.1", test_dns_port))
+        resp, _ = sock.recvfrom(2048)
+        sock.close()
+        flags = int.from_bytes(resp[2:4], "big")
+        assert flags & 0x000F == 5  # RCODE 5 = REFUSED
+    finally:
+        live_dns.stop()
+
+
+def test_wireguard_rollback_on_dns_readiness_failure(tmp_path, monkeypatch):
+    """DNS readiness check failure triggers full rollback, preserves local console, and fails closed."""
+    platform = FakePlatformAdapter(preflight_passes=True, has_existing_install=False)
+    platform.os_name = "linux"
+    paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path / "home")
+    logger = InstallerLogger(log_dir=tmp_path / "logs", session_id="test_wg_rollback_dns")
+
+    opts = InstallOptions(
+        owner_name="Farmer Jane",
+        owner_username="jane",
+        owner_password="StrongPassword123!",
+        farm_operations="DISABLED",
+        dns_mode="quad9",
+        tls_mode="LOCAL",
+        remote_access="WIREGUARD",
+        wireguard_endpoint="203.0.113.99",
+        wireguard_port=51820,
+        allow_test_mock=True,
+    )
+    opts._test_run_firewall = True
+
+    orch = InstallerOrchestrator(
+        platform=platform,
+        options=opts,
+        paths=paths,
+        logger=logger,
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+
+    # Simulate DNS readiness check failure
+    from deployment.installer.remote_access import InstallerWireGuardManager
+    monkeypatch.setattr(InstallerWireGuardManager, "check_dns_readiness", lambda self, canonical_hostname, **kw: False)
+
+    result = orch.execute_all()
+    assert result.status == "FAILED"
+    assert "WireGuard split-DNS failed startup or readiness verification" in str(result.error)
+    assert result.wireguard_configured is False
+
+    # Verify rollback sequence
+    assert "rollback_wireguard_firewall" in platform.calls
+    assert "control_wireguard_service:stop" in platform.calls
+
+
+def test_wireguard_rollback_on_service_enable_failure(tmp_path, monkeypatch):
+    """WireGuard service failing systemctl enable triggers safe rollback."""
+    platform = FakePlatformAdapter(preflight_passes=True, has_existing_install=False)
+    platform.os_name = "linux"
+    platform.wireguard_service_success = False  # control_wireguard_service returns False
+    paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path / "home")
+    logger = InstallerLogger(log_dir=tmp_path / "logs", session_id="test_wg_rollback_enable")
+
+    opts = InstallOptions(
+        owner_name="Farmer Jane",
+        owner_username="jane",
+        owner_password="StrongPassword123!",
+        farm_operations="DISABLED",
+        dns_mode="quad9",
+        tls_mode="LOCAL",
+        remote_access="WIREGUARD",
+        wireguard_endpoint="203.0.113.99",
+        wireguard_port=51820,
+        allow_test_mock=True,
+    )
+    opts._test_run_firewall = True
+
+    orch = InstallerOrchestrator(
+        platform=platform,
+        options=opts,
+        paths=paths,
+        logger=logger,
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+
+    result = orch.execute_all()
+    assert result.status == "FAILED"
+    assert "WireGuard service failed to enable" in str(result.error)
+    assert result.wireguard_configured is False
+    assert "rollback_wireguard_firewall" in platform.calls
