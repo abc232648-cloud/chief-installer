@@ -83,6 +83,15 @@ def main() -> int:
 
     _configure_packaged_python()
 
+    if sys.argv[1:] == ["--gui-smoke-test"]:
+        # Exercise the actual bundled GUI without starting any installation.
+        from deployment.installer.ui.app import InstallerApp
+        app=InstallerApp()
+        app.update_idletasks()
+        app.destroy()
+        print("Chief installer GUI smoke test passed")
+        return 0
+
     # If explicit CLI arguments or help flags were provided, run CLI
     if len(sys.argv) > 1 and not (len(sys.argv) == 2 and sys.argv[1] == "--gui"):
         return run_cli(sys.argv[1:])

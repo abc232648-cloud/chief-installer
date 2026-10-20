@@ -49,21 +49,20 @@ jobs:
 
   package-linux:
     name: Linux Package Build & Verification
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: test
     steps:
       - name: Checkout chief-installer
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install dependencies
+      - name: Install build Python with Tk and virtual display
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          sudo apt-get update
+          sudo apt-get install -y python3-venv python3-tk xvfb xauth
+          python3 -m venv .build-venv
+          echo "$PWD/.build-venv/bin" >> "$GITHUB_PATH"
+          .build-venv/bin/python -m pip install -r requirements.txt pyinstaller==6.22.3
+          .build-venv/bin/python -c "import tkinter; import _tkinter"
 
       - name: Build self-contained Linux installer package
         run: |
@@ -73,6 +72,9 @@ jobs:
         run: |
           test -f dist/installer/linux/chief-installer
           test -x dist/installer/linux/chief-installer
+          test -f dist/installer/linux/Chief-Installer-Linux-amd64.deb
+          dpkg-deb --info dist/installer/linux/Chief-Installer-Linux-amd64.deb
+          (cd dist/installer/linux && sha256sum --check Chief-Installer-Linux-amd64.deb.sha256)
           test -f dist/installer/linux/INSTALLER_SHA256.json
           python -c "
           import json, hashlib
@@ -83,6 +85,9 @@ jobs:
           assert actual_sha == meta['sha256'], f'Checksum mismatch: {actual_sha} vs {meta[\"sha256\"]}'
           print('Package verification passed: SHA-256 matches.')
           "
+
+      - name: Verify the bundled graphical application opens
+        run: xvfb-run -a ./dist/installer/linux/chief-installer --gui-smoke-test
 
       - name: Run packaged executable help test
         run: |
