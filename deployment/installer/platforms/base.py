@@ -105,6 +105,30 @@ class PlatformAdapter(ABC):
         """Launch URL in the user's default web browser."""
         raise NotImplementedError
 
+    def install_wireguard_dependencies(self, progress_callback: Optional[Callable[[str], None]] = None) -> None:
+        """Install WireGuard server tools and dependencies."""
+        pass
+
+    def install_wireguard_system_config(self, source_conf: Path) -> None:
+        """Install wg0.conf to /etc/wireguard/wg0.conf."""
+        raise NotImplementedError
+
+    def control_wireguard_service(self, action: str) -> bool:
+        """Control wg-quick systemd service."""
+        raise NotImplementedError
+
+    def apply_wireguard_firewall(self, port: int) -> None:
+        """Apply fail-closed WireGuard firewall rules."""
+        raise NotImplementedError
+
+    def rollback_wireguard_firewall(self) -> None:
+        """Remove WireGuard firewall rules."""
+        pass
+
+    def verify_wireguard_active(self) -> bool:
+        """Verify WireGuard interface and service are active."""
+        return False
+
     def probe_health_endpoint(self, url: str, timeout: float = 2.0, headers: Optional[Dict[str, str]] = None) -> bool:
         """Check whether the application health endpoint responds with 200 OK."""
         import urllib.request

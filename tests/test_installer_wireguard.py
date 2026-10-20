@@ -3,24 +3,26 @@
 Verifies:
 - Honest reachability analysis (CGNAT, private WAN, syntax, unverified UDP)
 - Provisioning of initial server and owner client profiles
-- Execution within the orchestrator
+- Idempotency across repeated provisioning (keys and peer identities preserved)
+- Orchestrator execution with WireGuard enabled/disabled
 - Integration with real Chief Agent backend from peer repository (no dummy files)
 - Real WireGuard split-DNS authoritative behavior (canonical domain vs REFUSED)
 - Platform fail-closed enforcement on Windows (UnsupportedPlatformError)
-- Atomic rollback preserving local on-farm console
-- Secret protection: zero private keys logged
-- Route contract preservation
+- Atomic rollback preserving local on-farm console on firewall or service readiness failure
+- Secret protection: zero private keys logged in installer logs or diagnostic state
+- Route contract preservation across all interfaces
 """
 from __future__ import annotations
 
 import base64
+import json
 import os
 from pathlib import Path
 import shutil
 import sys
 import pytest
 
-from deployment.installer.errors import InstallerError, UnsupportedPlatformError
+from deployment.installer.errors import InstallerError, PrivilegeError, UnsupportedPlatformError
 from deployment.installer.models import InstallOptions, StepId, StepStatus
 from deployment.installer.orchestrator import InstallerOrchestrator, InstallerPaths
 from deployment.installer.logging import InstallerLogger
@@ -90,12 +92,36 @@ def test_installer_wireguard_provisioning(tmp_path):
     assert "[Interface]" in server_conf
     assert "Address = 10.77.0.1/32" in server_conf
     assert "ListenPort = 51820" in server_conf
+    assert "PostUp = systemctl start chief-wireguard-dns.service" in server_conf
     assert "AllowedIPs = 10.77.0.2/32" in server_conf  # Owner IP
 
     assert "Jane Farmer" in client_conf
     assert "Address = 10.77.0.2/32" in client_conf
     assert "DNS = 10.77.0.1" in client_conf
     assert "AllowedIPs = 10.77.0.1/32" in client_conf  # Split tunnel
+
+
+def test_installer_wireguard_provisioning_idempotency(tmp_path):
+    """Re-running provisioning preserves existing server keys and owner credentials."""
+    mgr = InstallerWireGuardManager(tmp_path / "wg_state")
+    server1, client1 = mgr.provision_initial_server_and_owner(
+        endpoint="203.0.113.88",
+        canonical_hostname="chief-farm.local",
+        owner_name="Jane Farmer",
+    )
+    server_key_first = mgr.server_key_path.read_text(encoding="utf-8")
+
+    # Second run with same state directory
+    server2, client2 = mgr.provision_initial_server_and_owner(
+        endpoint="203.0.113.88",
+        canonical_hostname="chief-farm.local",
+        owner_name="Jane Farmer",
+    )
+    server_key_second = mgr.server_key_path.read_text(encoding="utf-8")
+
+    assert server_key_first == server_key_second, "Server private key was unexpectedly regenerated on retry"
+    assert server1 == server2, "Server configuration changed unexpectedly on idempotent retry"
+    assert client1 == client2, "Owner client configuration changed unexpectedly on idempotent retry"
 
 
 def test_orchestrator_execution_with_wireguard_enabled(tmp_path, monkeypatch):
@@ -115,7 +141,6 @@ def test_orchestrator_execution_with_wireguard_enabled(tmp_path, monkeypatch):
         wireguard_port=51820,
         allow_test_mock=True,
     )
-    # Allow simulated wireguard execution in unit fixture
     opts._allow_windows_wireguard_test = True
 
     orch = InstallerOrchestrator(
@@ -124,8 +149,6 @@ def test_orchestrator_execution_with_wireguard_enabled(tmp_path, monkeypatch):
         paths=paths,
         logger=logger,
     )
-
-    # Mock Path.home() so device setup exports into tmp_path / "home"
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
 
     result = orch.execute_all()
@@ -198,7 +221,6 @@ def test_orchestrator_fails_when_backend_capability_absent(tmp_path):
         logger=logger,
     )
 
-    # Empty candidate locations to simulate absence of backend capability
     result = orch.execute_all()
     assert result.status == "FAILED"
     assert "lacks WireGuard remote access capability" in str(result.error)
@@ -224,7 +246,6 @@ def test_windows_server_fails_closed_with_unsupported_platform(tmp_path):
         wireguard_port=51820,
         allow_test_mock=True,
     )
-    # Do NOT set _allow_windows_wireguard_test: it must fail closed
 
     orch = InstallerOrchestrator(
         platform=platform,
@@ -246,7 +267,6 @@ def test_orchestrator_wireguard_integration_with_real_chief_backend(tmp_path, mo
     assert (peer_agent / "networking" / "remote_access.py").is_file()
     assert (peer_agent / "networking" / "wireguard_dns.py").is_file()
 
-    # Import real modules from peer agent to verify functionality
     if str(peer_agent) not in sys.path:
         sys.path.insert(0, str(peer_agent))
 
@@ -257,7 +277,6 @@ def test_orchestrator_wireguard_integration_with_real_chief_backend(tmp_path, mo
     paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path / "home")
     logger = InstallerLogger(log_dir=tmp_path / "logs", session_id="test_wg_real_integ")
 
-    # Copy real networking package from peer agent into production path
     prod_agent = paths.production
     (prod_agent / "networking").mkdir(parents=True, exist_ok=True)
     shutil.copy2(peer_agent / "networking" / "remote_access.py", prod_agent / "networking" / "remote_access.py")
@@ -293,7 +312,6 @@ def test_orchestrator_wireguard_integration_with_real_chief_backend(tmp_path, mo
     assert result.wireguard_client_config_path is not None
     assert Path(result.wireguard_client_config_path).exists()
 
-    # Verify real WireGuardManager can read the provisioned server state
     wg_state_dir = paths.root / "state" / "wireguard"
     real_mgr = RealWireGuardManager(wg_state_dir)
     assert real_mgr.is_configured() is True
@@ -310,13 +328,88 @@ def test_orchestrator_wireguard_integration_with_real_chief_backend(tmp_path, mo
 
     resp_valid = build_dns_response(wire_q, "chief.local", "10.77.0.1")
     assert resp_valid[:2] == b"\x12\x34"
-    assert resp_valid[-4:] == b"\x0a\x4d\x00\x01"  # 10.77.0.1 in binary
+    assert resp_valid[-4:] == b"\x0a\x4d\x00\x01"
 
     # Verify open-resolver protection: foreign domain query returns REFUSED (RCODE = 5)
     wire_q_foreign = b"\x56\x78\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x06google\x03com\x00\x00\x01\x00\x01"
     resp_refused = build_dns_response(wire_q_foreign, "chief.local", "10.77.0.1")
     flags = int.from_bytes(resp_refused[2:4], "big")
     assert flags & 0x000F == 5  # RCODE 5 = REFUSED
+
+
+def test_wireguard_rollback_on_firewall_failure_preserves_local_console(tmp_path, monkeypatch):
+    """Firewall failure triggers rollback and leaves local console files undamaged."""
+    platform = FakePlatformAdapter(preflight_passes=True, has_existing_install=False)
+    platform.fail_wireguard_firewall = True
+    paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path / "home")
+    logger = InstallerLogger(log_dir=tmp_path / "logs", session_id="test_wg_rollback_fw")
+
+    opts = InstallOptions(
+        owner_name="Farmer Jane",
+        owner_username="jane",
+        owner_password="StrongPassword123!",
+        farm_operations="DISABLED",
+        dns_mode="quad9",
+        tls_mode="LOCAL",
+        remote_access="WIREGUARD",
+        wireguard_endpoint="203.0.113.99",
+        wireguard_port=51820,
+        allow_test_mock=True,
+    )
+    platform.os_name = "linux"
+    opts._test_run_firewall = True
+
+    orch = InstallerOrchestrator(
+        platform=platform,
+        options=opts,
+        paths=paths,
+        logger=logger,
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+
+    result = orch.execute_all()
+    assert result.status == "FAILED"
+    assert "Simulated firewall failure" in str(result.error)
+    assert result.wireguard_configured is False
+    assert "rollback_wireguard_firewall" in platform.calls
+
+
+def test_wireguard_rollback_on_service_readiness_failure(tmp_path, monkeypatch):
+    """WireGuard service failing readiness verification triggers safe rollback."""
+    platform = FakePlatformAdapter(preflight_passes=True, has_existing_install=False)
+    platform.os_name = "linux"
+    platform.wireguard_active_result = False
+    paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path / "home")
+    logger = InstallerLogger(log_dir=tmp_path / "logs", session_id="test_wg_rollback_svc")
+
+    opts = InstallOptions(
+        owner_name="Farmer Jane",
+        owner_username="jane",
+        owner_password="StrongPassword123!",
+        farm_operations="DISABLED",
+        dns_mode="quad9",
+        tls_mode="LOCAL",
+        remote_access="WIREGUARD",
+        wireguard_endpoint="203.0.113.99",
+        wireguard_port=51820,
+        allow_test_mock=True,
+    )
+    opts._test_run_firewall = True
+
+    orch = InstallerOrchestrator(
+        platform=platform,
+        options=opts,
+        paths=paths,
+        logger=logger,
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+
+    result = orch.execute_all()
+    assert result.status == "FAILED"
+    assert "WireGuard service failed readiness verification" in str(result.error)
+    assert result.wireguard_configured is False
+    assert "control_wireguard_service:stop" in platform.calls
+    assert "rollback_wireguard_firewall" in platform.calls
 
 
 def test_secret_scanning_in_installer_logs_and_state(tmp_path, monkeypatch):
@@ -326,7 +419,6 @@ def test_secret_scanning_in_installer_logs_and_state(tmp_path, monkeypatch):
     log_dir = tmp_path / "logs"
     logger = InstallerLogger(log_dir=log_dir, session_id="test_wg_secrets")
 
-    # Set up production with real peer backend
     peer_agent = find_peer_agent_path()
     (paths.production / "networking").mkdir(parents=True, exist_ok=True)
     shutil.copy2(peer_agent / "networking" / "remote_access.py", paths.production / "networking" / "remote_access.py")
@@ -357,12 +449,10 @@ def test_secret_scanning_in_installer_logs_and_state(tmp_path, monkeypatch):
     result = orch.execute_all()
     assert result.status == "SUCCESS"
 
-    # Read server private key from secret location
     server_key_path = paths.root / "state" / "wireguard" / "server.key"
     assert server_key_path.exists()
     server_private_key = server_key_path.read_text(encoding="utf-8").strip()
 
-    # Read client config to get client private key and PSK
     client_conf_path = Path(result.wireguard_client_config_path)
     client_conf_text = client_conf_path.read_text(encoding="utf-8")
     client_priv = ""
@@ -377,7 +467,6 @@ def test_secret_scanning_in_installer_logs_and_state(tmp_path, monkeypatch):
     assert client_priv
     assert psk
 
-    # Scan installer log files: NO private keys or PSKs must appear anywhere in logs
     log_files = list(log_dir.glob("*.log")) + list(log_dir.glob("*.json"))
     assert len(log_files) > 0
     for log_f in log_files:
@@ -390,16 +479,10 @@ def test_secret_scanning_in_installer_logs_and_state(tmp_path, monkeypatch):
 def test_route_and_origin_contract_verification():
     from deployment.installer.models import InstallOptions
 
-    # Default options enforce farm operations DISABLED
     opts = InstallOptions(owner_name="Jane", owner_password="SafePassword2026!")
     assert opts.farm_operations == "DISABLED"
     assert opts.remote_access == "DISABLED"
 
-    # Route mapping verification:
-    # / -> on-farm local console
-    # /owner/ -> remote companion
-    # /staff/ -> staff experience
-    # /jobs/ -> job agent
     routes = {
         "/": "local_on_farm_console",
         "/owner/": "owner_pwa_companion",

@@ -1280,39 +1280,63 @@ class InstallerOrchestrator:
         from .remote_access import InstallerWireGuardManager
         wg_state_dir = self.paths.root / "state" / "wireguard"
         wg_mgr = InstallerWireGuardManager(wg_state_dir)
+        port = int(getattr(self.options, "wireguard_port", 51820))
+        canonical_host = self._public_host or "chief.local"
 
-        rep = wg_mgr.check_reachability(endpoint, getattr(self.options, "wireguard_port", 51820))
+        rep = wg_mgr.check_reachability(endpoint, port)
         if not self._is_test_fixture():
             if rep.cgnat_detected:
-                raise InstallerError(f"WireGuard setup blocked: {rep.message}")
+                raise InstallerError(f"WireGuard setup blocked by CGNAT: {rep.message}")
             if rep.is_private_ip:
-                raise InstallerError(f"WireGuard setup blocked: {rep.message}")
+                raise InstallerError(f"WireGuard setup blocked by private IP: {rep.message}")
             if not rep.syntax_valid:
-                raise InstallerError(f"WireGuard setup blocked: {rep.message}")
+                raise InstallerError(f"WireGuard setup blocked by invalid endpoint syntax: {rep.message}")
 
         try:
+            # 1. Install or verify system dependencies if running on Linux
+            if target_platform == "linux" and (not self._is_test_fixture() or getattr(self.options, "_test_run_firewall", False)):
+                self.platform.install_wireguard_dependencies()
+
+            # 2. Idempotent configuration provisioning
             server_conf, client_conf = wg_mgr.provision_initial_server_and_owner(
                 endpoint=endpoint,
-                canonical_hostname=self._public_host or "chief.local",
+                canonical_hostname=canonical_host,
                 owner_name=self.options.owner_name,
-                port=getattr(self.options, "wireguard_port", 51820),
+                port=port,
                 vpn_subnet=getattr(self.options, "wireguard_subnet", "10.77.0.0/24"),
             )
 
-            # On Linux (non-fixture), apply dedicated firewall chains and start systemd service
-            if target_platform == "linux" and not self._is_test_fixture():
-                wg_mgr.apply_firewall_policy(port=getattr(self.options, "wireguard_port", 51820))
-                wg_mgr.enable_and_start_service()
+            # 3. On supported Linux host (non-fixture), install system wg0.conf, apply firewall, and start services
+            if target_platform == "linux" and (not self._is_test_fixture() or getattr(self.options, "_test_run_firewall", False)):
+                self.platform.install_wireguard_system_config(wg_mgr.wg_conf_path)
+                self.platform.apply_wireguard_firewall(port)
+                self.platform.control_wireguard_service("enable")
+                self.platform.control_wireguard_service("start")
+                if not self.platform.verify_wireguard_active():
+                    raise InstallerError("WireGuard service failed readiness verification (wg-quick@wg0 inactive or interface missing).")
+
+                # 4. Start authoritative split-DNS daemon and verify
+                wg_mgr.start_dns_server(canonical_hostname=canonical_host)
+                if not wg_mgr.check_dns_readiness(canonical_hostname=canonical_host):
+                    self.logger.warning("WireGuard split-DNS readiness check pending or unavailable.")
 
             self._wireguard_configured = True
             self._wireguard_client_conf = client_conf
             self.state_machine.transition(
                 StepId.REMOTE_ACCESS,
                 StepStatus.SUCCESS,
-                message=f"WireGuard remote access configured for {endpoint} (UDP reachability unverified until client connects).",
+                message=f"WireGuard remote access provisioned locally for {endpoint}. External reachability remains unverified until an authorized mobile client completes a handshake.",
             )
         except Exception as exc:
-            self.logger.warning(f"WireGuard setup encountered error; rolling back remote access without affecting local services: {exc}")
+            self.logger.warning(f"WireGuard remote access setup failed: {exc}. Performing rollback to preserve local console operational state...")
+            try:
+                self.platform.rollback_wireguard_firewall()
+            except Exception:
+                pass
+            try:
+                self.platform.control_wireguard_service("stop")
+            except Exception:
+                pass
             wg_mgr.rollback()
             raise
 

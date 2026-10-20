@@ -81,6 +81,7 @@ class InstallerWireGuardManager:
         self.state_file = self.state_dir / "wireguard_config.json"
         self._firewall_applied = False
         self._service_started = False
+        self._dns_server = None
 
     def check_reachability(self, endpoint: str, port: int = 51820) -> ReachabilityReport:
         endpoint = (endpoint or "").strip()
@@ -269,8 +270,73 @@ class InstallerWireGuardManager:
         subprocess.run([systemctl, "stop", "wg-quick@wg0"], capture_output=True, text=True, check=False)
         self._service_started = False
 
+    def start_dns_server(self, canonical_hostname: str, port: int = 53, server_ip: str = "10.77.0.1") -> bool:
+        """Start the authoritative split-DNS daemon on server_ip:port."""
+        if self._dns_server and getattr(self._dns_server, "is_running", False):
+            return True
+        try:
+            from networking.wireguard_dns import WireGuardDNSServer
+        except ImportError:
+            import sys
+            candidates = [
+                Path(__file__).resolve().parent.parent.parent.parent / "chief-agent",
+                Path(__file__).resolve().parent.parent.parent.parent / "chief-integrated-candidate-20261020",
+            ]
+            for pc in candidates:
+                if (pc / "networking" / "wireguard_dns.py").exists():
+                    if str(pc) not in sys.path:
+                        sys.path.insert(0, str(pc))
+                    break
+            try:
+                from networking.wireguard_dns import WireGuardDNSServer
+            except Exception:
+                return False
+
+        try:
+            self._dns_server = WireGuardDNSServer(
+                bind_ip=server_ip,
+                port=port,
+                canonical_hostname=canonical_hostname,
+                answer_ip=server_ip,
+            )
+            self._dns_server.start()
+            return True
+        except Exception:
+            return False
+
+    def stop_dns_server(self) -> None:
+        """Stop the authoritative split-DNS daemon."""
+        if self._dns_server:
+            try:
+                self._dns_server.stop()
+            except Exception:
+                pass
+            self._dns_server = None
+
+    def check_dns_readiness(self, canonical_hostname: str, server_ip: str = "10.77.0.1", port: int = 53, timeout: float = 2.0) -> bool:
+        """Verify real DNS query resolution through UDP socket."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(timeout)
+            labels = canonical_hostname.strip().lower().split(".")
+            qname_bytes = b"".join(bytes([len(l)]) + l.encode("ascii") for l in labels) + b"\x00"
+            query = b"\xaa\xbb\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + qname_bytes + b"\x00\x01\x00\x01"
+            sock.sendto(query, (server_ip, port))
+            resp, _ = sock.recvfrom(2048)
+            sock.close()
+            if len(resp) >= 12 and socket.inet_aton(server_ip) in resp:
+                return True
+            return False
+        except Exception:
+            return False
+
     def rollback(self) -> None:
         """Safely clean up WireGuard server resources without affecting local Chief services."""
+        if self._dns_server:
+            try:
+                self.stop_dns_server()
+            except Exception:
+                pass
         if self._service_started:
             try:
                 self.stop_service()
@@ -301,17 +367,47 @@ class InstallerWireGuardManager:
         server_ip = str(hosts[0])
         owner_ip = str(hosts[1])
 
-        # Server keys
-        server_priv, server_pub = generate_wireguard_keypair()
-        self.server_key_path.write_text(server_priv, encoding="utf-8")
-        try:
-            self.server_key_path.chmod(0o600)
-        except Exception:
-            pass
+        # Server keys - idempotent load or generation
+        server_priv = ""
+        server_pub = ""
+        if self.server_key_path.exists():
+            try:
+                server_priv = self.server_key_path.read_text(encoding="utf-8").strip()
+                raw_priv = base64.b64decode(server_priv)
+                priv_obj = x25519.X25519PrivateKey.from_private_bytes(raw_priv)
+                raw_pub = priv_obj.public_key().public_bytes(
+                    encoding=serialization.Encoding.Raw,
+                    format=serialization.PublicFormat.Raw,
+                )
+                server_pub = base64.b64encode(raw_pub).decode("ascii")
+            except Exception:
+                server_priv = ""
 
-        # Owner peer keys
-        owner_priv, owner_pub = generate_wireguard_keypair()
-        psk = generate_preshared_key()
+        if not server_priv:
+            server_priv, server_pub = generate_wireguard_keypair()
+            self.server_key_path.write_text(server_priv, encoding="utf-8")
+            try:
+                self.server_key_path.chmod(0o600)
+            except Exception:
+                pass
+
+        # Owner peer keys - idempotent load or generation
+        existing_state = {}
+        if self.state_file.exists():
+            try:
+                existing_state = json.loads(self.state_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        existing_owner = existing_state.get("peers", {}).get("owner-001", {})
+        owner_pub = existing_owner.get("public_key")
+        owner_ip = existing_owner.get("vpn_ip", owner_ip)
+        psk = existing_owner.get("preshared_key")
+        owner_priv = existing_owner.get("private_key")
+
+        if not (owner_pub and psk and owner_priv):
+            owner_priv, owner_pub = generate_wireguard_keypair()
+            psk = generate_preshared_key()
 
         server_conf = (
             "# Chief Authoritative WireGuard Configuration\n"
@@ -319,7 +415,9 @@ class InstallerWireGuardManager:
             "[Interface]\n"
             f"Address = {server_ip}/32\n"
             f"ListenPort = {port}\n"
-            f"PrivateKey = {server_priv}\n\n"
+            f"PrivateKey = {server_priv}\n"
+            "PostUp = systemctl start chief-wireguard-dns.service 2>/dev/null || true\n"
+            "PostDown = systemctl stop chief-wireguard-dns.service 2>/dev/null || true\n\n"
             f"# Owner Peer: {owner_name}\n"
             "[Peer]\n"
             f"PublicKey = {owner_pub}\n"
@@ -361,6 +459,8 @@ class InstallerWireGuardManager:
                     "role": "Owner",
                     "vpn_ip": owner_ip,
                     "public_key": owner_pub,
+                    "private_key": owner_priv,
+                    "preshared_key": psk,
                     "enabled": True,
                 }
             },

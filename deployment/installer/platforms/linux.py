@@ -458,6 +458,52 @@ class LinuxPlatformAdapter(PlatformAdapter):
         proc = subprocess.run(["systemctl", "--user", "is-active", "--quiet", service_name])
         return proc.returncode == 0
 
+    def install_wireguard_dependencies(self, progress_callback: Optional[Callable[[str], None]] = None) -> None:
+        needed = []
+        if not shutil.which("wg"):
+            needed.append("wireguard-tools")
+        if not shutil.which("iptables"):
+            needed.append("iptables")
+        if not (Path("/sys/module/wireguard").exists() or shutil.which("wg")):
+            needed.append("wireguard")
+
+        if not needed:
+            if progress_callback:
+                progress_callback("WireGuard system tools already satisfied.")
+            return
+
+        if progress_callback:
+            progress_callback(f"Installing WireGuard system dependencies ({', '.join(needed)})...")
+        self._run_privileged(["install-packages", *needed])
+
+    def install_wireguard_system_config(self, source_conf: Path) -> None:
+        self._run_privileged(["install-wireguard-config", str(source_conf)])
+
+    def control_wireguard_service(self, action: str) -> bool:
+        try:
+            self._run_privileged(["control-wireguard-service", action])
+            return True
+        except Exception:
+            return False
+
+    def apply_wireguard_firewall(self, port: int) -> None:
+        self._run_privileged(["apply-wireguard-firewall", str(port)])
+
+    def rollback_wireguard_firewall(self) -> None:
+        try:
+            self._run_privileged(["rollback-wireguard-firewall"])
+        except Exception:
+            pass
+
+    def verify_wireguard_active(self) -> bool:
+        if not shutil.which("systemctl") or not shutil.which("wg"):
+            return False
+        res_svc = subprocess.run(["systemctl", "is-active", "wg-quick@wg0"], capture_output=True, text=True)
+        if res_svc.returncode != 0 or res_svc.stdout.strip() != "active":
+            return False
+        res_wg = subprocess.run(["wg", "show", "wg0"], capture_output=True, text=True)
+        return res_wg.returncode == 0
+
     def export_device_ca(
         self,
         ca_cert_path: Path,

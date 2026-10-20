@@ -413,6 +413,15 @@ class WindowsPlatformAdapter(PlatformAdapter):
             pass
         return False
 
+    def install_wireguard_system_config(self, source_conf: Path) -> None:
+        raise UnsupportedPlatformError("WireGuard server hosting is only supported on Linux (Ubuntu systemd on Folio). WireGuard server cannot be hosted on Windows.")
+
+    def control_wireguard_service(self, action: str) -> bool:
+        raise UnsupportedPlatformError("WireGuard server hosting is only supported on Linux (Ubuntu systemd on Folio). WireGuard server cannot be hosted on Windows.")
+
+    def apply_wireguard_firewall(self, port: int) -> None:
+        raise UnsupportedPlatformError("WireGuard server hosting is only supported on Linux (Ubuntu systemd on Folio). WireGuard server cannot be hosted on Windows.")
+
     def export_device_ca(
         self,
         ca_cert_path: Path,
