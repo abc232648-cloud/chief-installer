@@ -10,7 +10,7 @@ from typing import Callable, Dict, List, Optional
 
 from ..errors import InstallerError
 from ..events import EventBus, InstallEvent
-from ..manifest import ACCEPTED_FIRST_RELEASE_MANIFEST, ReleaseManifest
+from ..manifest import DEFAULT_RELEASE_MANIFEST, ReleaseManifest
 from ..models import InstallOptions, InstallResult, PreflightReport, StepId, StepStatus
 from ..orchestrator import InstallerOrchestrator
 from ..platforms.base import PlatformAdapter
@@ -42,7 +42,7 @@ class InstallerUIController:
         orchestrator_factory: Optional[Callable[[InstallOptions], InstallerOrchestrator]] = None,
     ):
         self.platform = platform_adapter
-        self.manifest = manifest or ACCEPTED_FIRST_RELEASE_MANIFEST
+        self.manifest = manifest or DEFAULT_RELEASE_MANIFEST
         self._orchestrator_factory = orchestrator_factory
 
         self.current_screen: ScreenId = ScreenId.WELCOME

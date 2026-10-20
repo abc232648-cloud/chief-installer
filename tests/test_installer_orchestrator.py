@@ -20,6 +20,13 @@ from deployment.installer.orchestrator import InstallerOrchestrator, InstallerPa
 from deployment.installer.platforms.base import PlatformAdapter
 
 
+@pytest.fixture(autouse=True)
+def isolated_owner_home(tmp_path,monkeypatch):
+    home=tmp_path/'owner-home'
+    home.mkdir()
+    monkeypatch.setattr(Path,'home',classmethod(lambda cls:home))
+
+
 class FakePlatformAdapter(PlatformAdapter):
     """Controllable test platform adapter."""
 

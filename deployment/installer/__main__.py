@@ -83,6 +83,12 @@ def main() -> int:
 
     _configure_packaged_python()
 
+    if sys.argv[1:] == ["--release-info"]:
+        import json
+        from deployment.installer.manifest import DEFAULT_RELEASE_MANIFEST
+        print(json.dumps(DEFAULT_RELEASE_MANIFEST.to_dict(),sort_keys=True))
+        return 0
+
     if sys.argv[1:] == ["--gui-smoke-test"]:
         # Exercise the actual bundled GUI without starting any installation.
         from deployment.installer.ui.app import InstallerApp

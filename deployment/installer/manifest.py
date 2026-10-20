@@ -1,5 +1,5 @@
 """Release manifest contract and validation for Chief Unified Installer."""
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 import re
@@ -134,4 +134,14 @@ ACCEPTED_FIRST_RELEASE_MANIFEST = ReleaseManifest(
     caddy_version="2.11.7",
     caddy_checksum="5d27b76b95f496638d79208c55250317b8755fd9e90005f7466aa32956944a90",
     supported_installer_schema=1,
+)
+
+
+# This installer branch requires scoped-DNS capabilities. Keep the historical
+# accepted manifest unchanged and identify the new default as a review candidate.
+DEFAULT_RELEASE_MANIFEST = replace(
+    ACCEPTED_FIRST_RELEASE_MANIFEST,
+    release_id="chief-2026-10-20-dns-review",
+    chief_agent_commit="96aacadf8e111fb2c108c49d0d49fac40aea47e3",
+    node_version="24.21.0",
 )

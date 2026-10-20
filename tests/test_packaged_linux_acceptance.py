@@ -49,7 +49,7 @@ def test_packaged_artifact_integrity():
     assert _DIST_META.exists(), "INSTALLER_SHA256.json metadata file not found"
     meta = json.loads(_DIST_META.read_text(encoding="utf-8"))
     assert meta["artifact"] == "chief-installer"
-    assert meta["release_id"] == "chief-2026-10-16-accepted"
+    assert meta["release_id"] == "chief-2026-10-20-dns-review"
     assert len(meta["sha256"]) == 64
 
     import hashlib
@@ -109,3 +109,10 @@ def test_packaged_desktop_integration():
     assert "Exec=/opt/chief-installer/chief-installer --gui" in content
     assert "Terminal=false" in content
     assert "Categories=System;Setup;" in content
+
+
+def test_packaged_default_release_matches_source():
+    from deployment.installer.manifest import DEFAULT_RELEASE_MANIFEST
+    proc=_run_artifact(_ensure_package(),'--release-info')
+    assert proc.returncode==0,proc.stderr
+    assert json.loads(proc.stdout)==DEFAULT_RELEASE_MANIFEST.to_dict()

@@ -14,7 +14,7 @@ import zipapp
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from deployment.installer.manifest import ACCEPTED_FIRST_RELEASE_MANIFEST
+from deployment.installer.manifest import DEFAULT_RELEASE_MANIFEST
 
 
 def sha256_file(path: Path) -> str:
@@ -48,7 +48,7 @@ def build_desktop_package(executable: Path) -> Path:
         control=root / "DEBIAN/control"
         control.parent.mkdir()
         control.write_text(
-            "Package: chief-installer\nVersion: 0.1.1\nArchitecture: amd64\n"
+            "Package: chief-installer\nVersion: 0.1.2\nArchitecture: amd64\n"
             "Maintainer: Chief Installer maintainers\nSection: admin\nPriority: optional\n"
             f"Depends: libc6 (>= {platform.libc_ver()[1]}), libx11-6, libxext6, libxrender1, libxft2, libfontconfig1\n"
             "Description: Chief graphical setup application\n"
@@ -68,7 +68,7 @@ def build_package(output_dir: Optional[Path] = None) -> Path:
     out.mkdir(parents=True, exist_ok=True)
 
     target_executable = out / "chief-installer"
-    manifest = ACCEPTED_FIRST_RELEASE_MANIFEST
+    manifest = DEFAULT_RELEASE_MANIFEST
 
     print(f"Building Chief Installer package for release: {manifest.release_id}...")
 

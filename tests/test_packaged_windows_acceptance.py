@@ -60,7 +60,7 @@ def test_windows_packaged_artifact_integrity():
     assert _DIST_META.exists(), "INSTALLER_SHA256.json metadata file not found"
     meta = json.loads(_DIST_META.read_text(encoding="utf-8"))
     assert meta["artifact"] == "Chief-Installer-Windows.exe"
-    assert meta["release_id"] == "chief-2026-10-16-accepted"
+    assert meta["release_id"] == "chief-2026-10-20-dns-review"
     assert len(meta["sha256"]) == 64
 
     actual_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()

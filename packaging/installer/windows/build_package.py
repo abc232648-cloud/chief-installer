@@ -11,7 +11,7 @@ from typing import Optional
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from deployment.installer.manifest import ACCEPTED_FIRST_RELEASE_MANIFEST
+from deployment.installer.manifest import DEFAULT_RELEASE_MANIFEST
 
 
 def sha256_file(path: Path) -> str:
@@ -27,7 +27,7 @@ def build_package(output_dir: Optional[Path] = None) -> Path:
     out.mkdir(parents=True, exist_ok=True)
 
     target_executable = out / "Chief-Installer-Windows.exe"
-    manifest = ACCEPTED_FIRST_RELEASE_MANIFEST
+    manifest = DEFAULT_RELEASE_MANIFEST
 
     print(f"Building Windows Chief Installer package for release: {manifest.release_id}...")
 

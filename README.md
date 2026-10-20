@@ -70,7 +70,11 @@ their own transports; this is not complete host-wide DNS enforcement.
 The installer requires the agent capability `chief_scoped_dns`; an older agent
 must fail compatibility validation rather than silently ignore the selection.
 The accepted-release manifest remains unchanged. To review the new combination,
-use the separately pinned `review-dns-manifest.json` with `--manifest`; this file
-is a review candidate, not an accepted release or deployment authorization.
+the default GUI and CLI now use the exact pins in `review-dns-manifest.json`,
+including the DNS-capable agent and Node 24 required by Staff. This is labelled
+as a review candidate, not an accepted release or deployment authorization.
+Run `chief-installer --release-info` to inspect the bundled pins. Existing clean
+staging checkouts are updated to those pins on retry; local edits stop the
+refresh without discarding files.
 See the agent's `docs/Chief-Scoped-DNS.md` for coverage, safety audit, and browser
 qualification limits. No real-host acceptance is claimed by CI.

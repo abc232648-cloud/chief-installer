@@ -81,7 +81,7 @@ class ChiefAgentDeploymentClient:
         python_exec = str(self.python_bin) if self.python_bin.exists() else sys.executable
         cmd = [python_exec, "-m", "deployment.contract", "--info"]
         env = dict(os.environ)
-        env["PYTHONPATH"] = str(root) + (f"{os.pathsep}{env['PYTHONPATH']}" if "PYTHONPATH" in env else "")
+        env["PYTHONPATH"] = str(root)
 
         try:
             res = subprocess.run(
@@ -205,7 +205,7 @@ class ChiefAgentDeploymentClient:
         python_exec = str(self.python_bin) if self.python_bin.exists() else sys.executable
         cmd = [python_exec, "-c", runner]
         env = dict(os.environ)
-        env["PYTHONPATH"] = str(root) + (f"{os.pathsep}{env['PYTHONPATH']}" if "PYTHONPATH" in env else "")
+        env["PYTHONPATH"] = str(root)
 
         serializable_kwargs = {k: str(v) if isinstance(v, Path) else v for k, v in kwargs.items()}
         payload = json.dumps(serializable_kwargs)
@@ -400,7 +400,7 @@ class ChiefAgentDeploymentClient:
         )
         cmd = [str(self.python_bin), "-c", runner, str(config_path), str(timeout)]
         env = dict(os.environ)
-        env["PYTHONPATH"] = str(root) + (f"{os.pathsep}{env['PYTHONPATH']}" if "PYTHONPATH" in env else "")
+        env["PYTHONPATH"] = str(root)
         proc = subprocess.run(cmd, cwd=str(root), env=env, capture_output=True, text=True)
         if proc.returncode != 0:
             raise ContractCompatibilityError(f"Starting services failed: {proc.stderr.strip()}")

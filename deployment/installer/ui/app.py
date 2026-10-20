@@ -8,7 +8,7 @@ from typing import Optional
 
 from .controller import InstallerUIController, ScreenId
 from ..events import InstallEvent
-from ..manifest import ACCEPTED_FIRST_RELEASE_MANIFEST, ReleaseManifest
+from ..manifest import DEFAULT_RELEASE_MANIFEST, ReleaseManifest
 from ..models import PreflightReport, StepStatus
 from ..platforms.base import PlatformAdapter
 from ..platforms.linux import LinuxPlatformAdapter
@@ -44,7 +44,7 @@ class InstallerApp(tk.Tk):
 
         self.controller = controller or InstallerUIController(
             platform_adapter=platform_adapter,
-            manifest=manifest or ACCEPTED_FIRST_RELEASE_MANIFEST,
+            manifest=manifest or DEFAULT_RELEASE_MANIFEST,
         )
 
         self.container = ttk.Frame(self, padding="24 20 24 20")

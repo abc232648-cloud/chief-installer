@@ -13,7 +13,7 @@ from typing import List, Optional
 from .errors import InstallerError
 from .events import EventBus, InstallEvent
 from .logging import InstallerLogger
-from .manifest import ACCEPTED_FIRST_RELEASE_MANIFEST, parse_manifest
+from .manifest import DEFAULT_RELEASE_MANIFEST, parse_manifest
 from .models import InstallOptions, StepStatus
 from .orchestrator import InstallerOrchestrator, InstallerPaths
 from .platforms.base import PlatformAdapter
@@ -80,7 +80,7 @@ def run_cli(argv: Optional[List[str]] = None, platform_adapter: Optional[Platfor
             sys.stderr.write(f"ERROR: Failed to load manifest from '{args.manifest}': {exc}\n")
             return 1
     else:
-        manifest = ACCEPTED_FIRST_RELEASE_MANIFEST
+        manifest = DEFAULT_RELEASE_MANIFEST
 
     # Collect owner name
     owner_name = args.owner_name
