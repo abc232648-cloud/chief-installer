@@ -123,7 +123,10 @@ def test_ui_controller_execution_success():
             return InstallResult(
                 status="SUCCESS",
                 public_host="test.local",
-                urls={"owner": "https://test.local/owner/"},
+                urls={
+                    "chief": "https://test.local/",
+                    "owner": "https://test.local/owner/",
+                },
             )
 
     controller = InstallerUIController(
@@ -139,6 +142,7 @@ def test_ui_controller_execution_success():
 
     assert controller.current_screen == ScreenId.COMPLETION
     assert controller.install_result.status == "SUCCESS"
+    assert "https://test.local/" in controller.install_result.urls["chief"]
     assert "https://test.local/owner/" in controller.install_result.urls["owner"]
 
 

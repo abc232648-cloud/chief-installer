@@ -261,6 +261,10 @@ def test_clean_host_acceptance_with_real_chief_deployment_contract(tmp_path, mon
     assert result.status == "SUCCESS", f"Installation failed with: {result.error}"
     assert orchestrator.current_step == StepId.COMPLETE
     assert result.public_host == "chief-acceptance-farm-ltd.local"
+    assert "https://chief-acceptance-farm-ltd.local/" in result.urls["chief"]
+    assert "https://chief-acceptance-farm-ltd.local/owner/" in result.urls["owner"]
+    assert "https://chief-acceptance-farm-ltd.local/staff/" in result.urls["staff"]
+    assert "https://chief-acceptance-farm-ltd.local/jobs/" in result.urls["jobs"]
 
     assert paths.source_manifest.exists()
     source_manifest_data = json.loads(paths.source_manifest.read_text(encoding="utf-8"))

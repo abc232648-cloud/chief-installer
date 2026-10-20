@@ -222,6 +222,7 @@ def test_linux_adapter_device_setup_export(tmp_path):
     assert readme.exists()
     readme_text = readme.read_text(encoding="utf-8")
     assert "Chief device setup for Jane Doe" in readme_text
+    assert "https://jane-chief.local/" in readme_text
     assert "https://jane-chief.local/owner/" in readme_text
     assert (dest_dir / "Chief-Local-CA.crt").exists()
     assert (dest_dir / "Chief-Local-CA.crt").read_text(encoding="utf-8") == "CERT_DATA"

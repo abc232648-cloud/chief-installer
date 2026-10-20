@@ -433,7 +433,10 @@ class WindowsPlatformAdapter(PlatformAdapter):
             f"1. To access Chief from your mobile device or another PC on your local network,\n"
             f"   install the certificate 'Chief-Local-CA.crt' onto that device as a trusted root.\n\n"
             f"2. Navigate to:\n"
-            f"   https://{public_host}/owner/\n\n"
+            f"   - On-Farm Chief Console (Local/LAN): https://{public_host}/\n"
+            f"   - Remote Owner PWA (Mobile):        https://{public_host}/owner/\n"
+            f"   - Mobile Staff PWA (Field):         https://{public_host}/staff/\n"
+            f"   - Job Agent Companion:              https://{public_host}/jobs/\n\n"
             f"3. Sign in with your Chief credentials.\n"
         )
         readme_file.write_text(readme_content, encoding="utf-8")

@@ -270,6 +270,7 @@ class InstallerOrchestrator:
             # 20. Complete
             duration = round(time.time() - start_time, 2)
             urls = {
+                "chief": f"https://{self._public_host}/",
                 "owner": f"https://{self._public_host}/owner/",
                 "staff": f"https://{self._public_host}/staff/",
                 "jobs": f"https://{self._public_host}/jobs/",
@@ -277,7 +278,7 @@ class InstallerOrchestrator:
             self.state_machine.transition(
                 StepId.COMPLETE,
                 StepStatus.SUCCESS,
-                message=f"Installation complete in {duration}s. Chief is ready at https://{self._public_host}/owner/",
+                message=f"Installation complete in {duration}s. Chief is ready at https://{self._public_host}/",
                 progress=1.0,
             )
 

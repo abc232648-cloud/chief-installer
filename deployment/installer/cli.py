@@ -197,9 +197,10 @@ def run_cli(argv: Optional[List[str]] = None, platform_adapter: Optional[Platfor
         print("INSTALLATION COMPLETE")
         print("=" * 60)
         print(f"Chief Owner: {options.owner_name}")
-        print(f"Owner PWA:   {result.urls.get('owner')}")
-        print(f"Staff PWA:   {result.urls.get('staff')}")
-        print(f"Job PWA:     {result.urls.get('jobs')}")
+        print(f"Chief Console (On-Farm): {result.urls.get('chief', f'https://{result.public_host}/')}")
+        print(f"Owner PWA (Remote):     {result.urls.get('owner')}")
+        print(f"Staff PWA (Field):      {result.urls.get('staff')}")
+        print(f"Job PWA (Specialist):   {result.urls.get('jobs')}")
         if result.archive_path:
             print(f"Archive:     {result.archive_path}")
         print(f"Log:         {result.log_path}")

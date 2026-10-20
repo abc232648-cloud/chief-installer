@@ -148,6 +148,8 @@ def test_windows_export_device_ca(tmp_path):
     assert (dest_dir / "Chief-Local-CA.crt").read_text(encoding="utf-8") == ca_cert.read_text(encoding="utf-8")
     readme_text = readme.read_text(encoding="utf-8")
     assert "chief-windows.local" in readme_text
+    assert "https://chief-windows.local/" in readme_text
+    assert "https://chief-windows.local/owner/" in readme_text
     assert "Windows Owner" in readme_text
 
 

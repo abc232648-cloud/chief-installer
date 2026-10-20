@@ -250,10 +250,12 @@ class InstallerUIController:
             except Exception:
                 pass
 
-    def open_chief_url(self, app_name: str = "owner") -> bool:
+    def open_chief_url(self, app_name: str = "chief") -> bool:
         if not self.install_result or not self.install_result.urls:
             return False
         url = self.install_result.urls.get(app_name)
+        if not url and app_name == "owner":
+            url = self.install_result.urls.get("chief")
         if url:
             return self.platform.open_url_in_browser(url)
         return False

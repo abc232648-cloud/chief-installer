@@ -435,12 +435,15 @@ class InstallerApp(tk.Tk):
         title.pack(anchor=tk.W, pady=(0, 12))
 
         urls = self.controller.install_result.urls if self.controller.install_result else {}
+        chief_url = urls.get("chief", f"https://{self.controller.public_host or 'chief.local'}/")
+        owner_url = urls.get("owner", f"https://{self.controller.public_host or 'chief.local'}/owner/")
         desc = ttk.Label(
             parent,
             text=(
                 "Installation completed successfully.\n\n"
-                f"Chief Address: {urls.get('owner', 'https://chief.local/owner/')}\n\n"
-                "You can now launch Chief or configure mobile access."
+                f"Chief Console (On-Farm): {chief_url}\n"
+                f"Remote Owner PWA:         {owner_url}\n\n"
+                "Launch the on-farm console to configure your system, or open a companion app below."
             ),
             wraplength=540,
         )
@@ -449,8 +452,11 @@ class InstallerApp(tk.Tk):
         action_box = ttk.Frame(parent)
         action_box.pack(anchor=tk.W, fill=tk.X, pady=(0, 24))
 
-        open_chief_btn = ttk.Button(action_box, text="Open Chief (Owner)", command=lambda: self.controller.open_chief_url("owner"))
+        open_chief_btn = ttk.Button(action_box, text="Open Chief Console", command=lambda: self.controller.open_chief_url("chief"))
         open_chief_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        open_owner_btn = ttk.Button(action_box, text="Open Owner PWA", command=lambda: self.controller.open_chief_url("owner"))
+        open_owner_btn.pack(side=tk.LEFT, padx=(0, 8))
 
         open_staff_btn = ttk.Button(action_box, text="Open Staff App", command=lambda: self.controller.open_chief_url("staff"))
         open_staff_btn.pack(side=tk.LEFT, padx=(0, 8))

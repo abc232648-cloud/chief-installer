@@ -164,6 +164,7 @@ def test_orchestrator_clean_host_install(tmp_path):
 
     assert result.status == "SUCCESS"
     assert result.public_host == "farm-owner.local"
+    assert "https://farm-owner.local/" in result.urls["chief"]
     assert "https://farm-owner.local/owner/" in result.urls["owner"]
     assert "https://farm-owner.local/staff/" in result.urls["staff"]
     assert "https://farm-owner.local/jobs/" in result.urls["jobs"]
