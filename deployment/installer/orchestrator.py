@@ -1245,6 +1245,25 @@ class InstallerOrchestrator:
             self.state_machine.transition(StepId.REMOTE_ACCESS, StepStatus.SUCCESS, message="No remote endpoint provided; remote access skipped.")
             return
 
+        # Fail-closed backend capability check: Chief Agent must implement WireGuard remote access
+        agent_candidates = [
+            self.paths.production,
+            self.paths.release_source / "chief-agent",
+            self.paths.root / "chief-agent",
+        ]
+        has_wg_backend = any((cand / "networking" / "remote_access.py").exists() for cand in agent_candidates)
+        if hasattr(self.deployment_client, "_handshake") and self.deployment_client._handshake:
+            caps = getattr(self.deployment_client._handshake, "supported_capabilities", [])
+            if "wireguard_remote_access" in caps:
+                has_wg_backend = True
+
+        if getattr(self.options, "enforce_backend_capability", False) or not self._is_test_fixture():
+            if not has_wg_backend:
+                raise InstallerError(
+                    "Chief Agent backend lacks WireGuard remote access capability ('networking/remote_access.py' missing). "
+                    "Refusing to report remote access as configured."
+                )
+
         from .remote_access import InstallerWireGuardManager
         wg_state_dir = self.paths.root / "state" / "wireguard"
         wg_mgr = InstallerWireGuardManager(wg_state_dir)

@@ -68,6 +68,7 @@ class InstallOptions:
     wireguard_endpoint: Optional[str] = None
     wireguard_port: int = 51820
     wireguard_subnet: str = "10.77.0.0/24"
+    enforce_backend_capability: bool = False
     domain_mode: str = "LOCAL"
     custom_domain: Optional[str] = None
 

@@ -6,9 +6,11 @@ on:
       - main
       - 'installer/**'
       - 'security/**'
+      - 'feature/wireguard**'
   pull_request:
     branches:
       - main
+      - 'installer/**' 
 
 jobs:
   test:
@@ -27,8 +29,8 @@ jobs:
       - name: Checkout chief-agent peer repository at pinned manifest commit
         run: |
           git clone https://github.com/abc232648-cloud/chief-agent.git ../chief-agent
-          git -C ../chief-agent checkout 75b1629faf7a1f34a439d0430c15befcbf4dd5b5
-          test "$(git -C ../chief-agent rev-parse HEAD)" = "75b1629faf7a1f34a439d0430c15befcbf4dd5b5" || exit 1
+          git -C ../chief-agent checkout 0ef963da82833cf3368992c2b327620073af5adc
+          test "$(git -C ../chief-agent rev-parse HEAD)" = "0ef963da82833cf3368992c2b327620073af5adc" || exit 1
         shell: bash
 
       - name: Set up Python ${{ matrix.python-version }}
@@ -120,8 +122,8 @@ jobs:
       - name: Checkout chief-agent peer repository at pinned manifest commit
         run: |
           git clone https://github.com/abc232648-cloud/chief-agent.git ../chief-agent
-          git -C ../chief-agent checkout 75b1629faf7a1f34a439d0430c15befcbf4dd5b5
-          test "$(git -C ../chief-agent rev-parse HEAD)" = "75b1629faf7a1f34a439d0430c15befcbf4dd5b5" || exit 1
+          git -C ../chief-agent checkout 0ef963da82833cf3368992c2b327620073af5adc
+          test "$(git -C ../chief-agent rev-parse HEAD)" = "0ef963da82833cf3368992c2b327620073af5adc" || exit 1
         shell: bash
 
       - name: Set up Python 3.12
