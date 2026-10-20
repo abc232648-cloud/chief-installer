@@ -432,7 +432,13 @@ class InstallerOrchestrator:
             node_bin = self.paths.node_root / "bin" / node_bin_name
             npm_bin = self.paths.node_root / "bin" / npm_bin_name
 
-        if node_bin.exists() and npm_bin.exists():
+        def matches_pin(binary: Path, npm: Path) -> bool:
+            if not binary.exists() or not npm.exists():
+                return False
+            result = run_quiet([str(binary), "--version"], capture_output=True, text=True)
+            return result.returncode == 0 and result.stdout.strip() == f"v{self.manifest.node_version}"
+
+        if matches_pin(node_bin, npm_bin):
             return node_bin, npm_bin
 
         for cand in self.paths.node_root.glob("node-v*"):
@@ -440,7 +446,7 @@ class InstallerOrchestrator:
                 for sub in ("", "bin"):
                     n = (cand / sub / node_bin_name) if sub else (cand / node_bin_name)
                     p = (cand / sub / npm_bin_name) if sub else (cand / npm_bin_name)
-                    if n.exists() and p.exists():
+                    if matches_pin(n, p):
                         return n, p
 
         sys_node = shutil.which("node")
@@ -509,7 +515,13 @@ class InstallerOrchestrator:
                         else:
                             tar.extract(member, path=str(self.paths.node_root))
 
-        if node_bin.exists() and npm_bin.exists():
+        def matches_pin(binary: Path, npm: Path) -> bool:
+            if not binary.exists() or not npm.exists():
+                return False
+            result = run_quiet([str(binary), "--version"], capture_output=True, text=True)
+            return result.returncode == 0 and result.stdout.strip() == f"v{self.manifest.node_version}"
+
+        if matches_pin(node_bin, npm_bin):
             return node_bin, npm_bin
 
         for cand in self.paths.node_root.glob("node-v*"):
@@ -517,10 +529,10 @@ class InstallerOrchestrator:
                 for sub in ("", "bin"):
                     n = (cand / sub / node_bin_name) if sub else (cand / node_bin_name)
                     p = (cand / sub / npm_bin_name) if sub else (cand / npm_bin_name)
-                    if n.exists() and p.exists():
+                    if matches_pin(n, p):
                         return n, p
 
-        return node_bin, npm_bin
+        raise InstallerError("Downloaded Node.js runtime does not match the release version.")
 
     def _download_and_verify_caddy(self) -> Path:
         """Download Caddy binary, verify checksums, and extract to caddy root."""

@@ -1,10 +1,10 @@
 {
-  "release_id": "chief-2026-10-18-release-review",
-  "chief_agent_commit": "86862585ab8be5b8ce620cf9bfa39e4d5d056205",
+  "release_id": "chief-2026-10-20-integrated-review",
+  "chief_agent_commit": "75b1629faf7a1f34a439d0430c15befcbf4dd5b5",
   "owner_pwa_commit": "b8d139b0789918f3c937e640cc618e66194c966b",
   "staff_pwa_commit": "4a07d324e13630e2742a4e69127569d70a3cdf83",
   "job_pwa_commit": "90eb0cfa2155c4d5f6a4ca8bf510a5d01e1f7db9",
-  "node_version": "24.19.0",
+  "node_version": "24.21.0",
   "caddy_version": "2.11.7",
   "caddy_checksum": "5d27b76b95f496638d79208c55250317b8755fd9e90005f7466aa32956944a90",
   "supported_installer_schema": 1

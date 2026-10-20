@@ -16,7 +16,7 @@ from test_installer_orchestrator import FakePlatformAdapter
 def test_current_packaged_manifest_matches_review_and_preserves_history():
     review = parse_manifest(Path(__file__).resolve().parents[1] / 'review-dns-manifest.json')
     assert CURRENT_RELEASE_MANIFEST == review
-    assert review.node_version == '24.19.0'
+    assert review.node_version == '24.21.0'
     assert ACCEPTED_FIRST_RELEASE_MANIFEST.node_version == '22.23.3'
     assert review.chief_agent_commit != ACCEPTED_FIRST_RELEASE_MANIFEST.chief_agent_commit
 

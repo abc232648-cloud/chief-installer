@@ -20,6 +20,13 @@ from deployment.installer.orchestrator import InstallerOrchestrator, InstallerPa
 from deployment.installer.platforms.base import PlatformAdapter
 
 
+@pytest.fixture(autouse=True)
+def isolated_owner_home(tmp_path, monkeypatch):
+    home = tmp_path / "owner-home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+
 class FakePlatformAdapter(PlatformAdapter):
     """Controllable test platform adapter."""
 
@@ -295,14 +302,14 @@ def test_step_browser_fails_closed_when_version_check_fails(tmp_path, monkeypatc
             fake_bin = tmp_path / "fake_chromium"
             fake_bin.write_bytes(b"mock")
             return subprocess.CompletedProcess(cmd, returncode=0, stdout=str(fake_bin), stderr="")
-        elif "--version" in cmd_str:
-            return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="command failed")
+        elif "sync_playwright" in str(cmd):
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout="CHIEF_PLAYWRIGHT_BROWSER_OK", stderr="")
         return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_subprocess_run)
     monkeypatch.setattr("os.access", lambda path, mode: True)
 
-    with pytest.raises(InstallerError, match="Chromium --version failed"):
+    with pytest.raises(InstallerError, match="Headless Chromium check did not report a valid version"):
         orchestrator._step_browser()
 
 

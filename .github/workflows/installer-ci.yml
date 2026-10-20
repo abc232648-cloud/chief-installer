@@ -27,8 +27,8 @@ jobs:
       - name: Checkout chief-agent peer repository at pinned manifest commit
         run: |
           git clone https://github.com/abc232648-cloud/chief-agent.git ../chief-agent
-          git -C ../chief-agent checkout 86862585ab8be5b8ce620cf9bfa39e4d5d056205
-          test "$(git -C ../chief-agent rev-parse HEAD)" = "86862585ab8be5b8ce620cf9bfa39e4d5d056205" || exit 1
+          git -C ../chief-agent checkout 75b1629faf7a1f34a439d0430c15befcbf4dd5b5
+          test "$(git -C ../chief-agent rev-parse HEAD)" = "75b1629faf7a1f34a439d0430c15befcbf4dd5b5" || exit 1
         shell: bash
 
       - name: Set up Python ${{ matrix.python-version }}
@@ -120,8 +120,8 @@ jobs:
       - name: Checkout chief-agent peer repository at pinned manifest commit
         run: |
           git clone https://github.com/abc232648-cloud/chief-agent.git ../chief-agent
-          git -C ../chief-agent checkout 86862585ab8be5b8ce620cf9bfa39e4d5d056205
-          test "$(git -C ../chief-agent rev-parse HEAD)" = "86862585ab8be5b8ce620cf9bfa39e4d5d056205" || exit 1
+          git -C ../chief-agent checkout 75b1629faf7a1f34a439d0430c15befcbf4dd5b5
+          test "$(git -C ../chief-agent rev-parse HEAD)" = "75b1629faf7a1f34a439d0430c15befcbf4dd5b5" || exit 1
         shell: bash
 
       - name: Set up Python 3.12

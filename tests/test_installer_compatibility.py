@@ -99,3 +99,25 @@ def test_missing_capabilities_raises(tmp_path):
     with pytest.raises(ContractCompatibilityError) as exc_info:
         client.verify_compatibility(agent_root=tmp_path)
     assert "missing required capabilities" in str(exc_info.value)
+
+
+def test_contract_ignores_inherited_pythonpath(tmp_path, monkeypatch):
+    import json
+    root = tmp_path / "agent"
+    (root / "deployment").mkdir(parents=True)
+    info = {
+        "contract_version": "1.0.0",
+        "chief_agent_commit": "a" * 40,
+        "supported_capabilities": ["prepare_instance", "bootstrap_install", "install_readiness", "chief_scoped_dns"],
+    }
+    (root / "deployment/contract.py").write_text(
+        "import json\ndef probe(): return {'verified': True}\nif __name__=='__main__': print(" + repr(json.dumps(info)) + ")\n"
+    )
+    foreign = tmp_path / "foreign"
+    (foreign / "deployment").mkdir(parents=True)
+    (foreign / "deployment/__init__.py").write_text('raise RuntimeError("wrong deployment package")\n')
+    monkeypatch.setenv("PYTHONPATH", str(foreign))
+    client = ChiefAgentDeploymentClient(agent_root=root)
+    assert client.verify_compatibility(expected_commit="a" * 40).is_compatible
+    assert client._invoke_contract("probe") == {"verified": True}
+

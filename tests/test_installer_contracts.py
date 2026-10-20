@@ -208,3 +208,13 @@ def test_platform_adapter_abc_enforcement():
 
     with pytest.raises(TypeError):
         IncompleteAdapter()
+
+
+def test_default_candidate_matches_review_manifest_and_staff_runtime():
+    from deployment.installer.manifest import DEFAULT_RELEASE_MANIFEST, ACCEPTED_FIRST_RELEASE_MANIFEST
+    review = parse_manifest(Path(__file__).resolve().parents[1] / "review-dns-manifest.json")
+    assert DEFAULT_RELEASE_MANIFEST == review
+    assert "review" in DEFAULT_RELEASE_MANIFEST.release_id
+    assert DEFAULT_RELEASE_MANIFEST.node_version.split(".")[0] == "24"
+    assert DEFAULT_RELEASE_MANIFEST.chief_agent_commit != ACCEPTED_FIRST_RELEASE_MANIFEST.chief_agent_commit
+

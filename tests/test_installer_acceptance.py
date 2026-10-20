@@ -140,10 +140,14 @@ class AcceptancePlatformAdapter(PlatformAdapter):
 
 
 def _find_chief_agent_repo() -> Optional[Path]:
-    if os.environ.get("CHIEF_AGENT_ROOT"):
-        p = Path(os.environ["CHIEF_AGENT_ROOT"])
-        if (p / "deployment" / "contract.py").exists():
-            return p
+    for env_var in ("CHIEF_AGENT_ROOT", "CHIEF_AGENT_SOURCE"):
+        if os.environ.get(env_var):
+            p = Path(os.environ[env_var])
+            if (p / "deployment" / "contract.py").exists():
+                return p
+    candidate = Path("C:/Users/DELL/Documents/Codex/chief-integrated-candidate-20261020")
+    if (candidate / "deployment" / "contract.py").exists():
+        return candidate
     sibling = Path(__file__).resolve().parents[2] / "chief-agent"
     if (sibling / "deployment" / "contract.py").exists():
         return sibling
