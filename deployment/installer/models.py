@@ -23,6 +23,7 @@ class StepId(str, Enum):
     SERVICES = "SERVICES"
     TLS = "TLS"
     LOCAL_DISCOVERY = "LOCAL_DISCOVERY"
+    REMOTE_ACCESS = "REMOTE_ACCESS"
     HEALTH_CHECK = "HEALTH_CHECK"
     DEVICE_SETUP = "DEVICE_SETUP"
     COMPLETE = "COMPLETE"
@@ -63,6 +64,13 @@ class InstallOptions:
     tls_mode: str = "LOCAL"  # LOCAL or PUBLIC
     dns_mode: str = "quad9"
     allow_test_mock: bool = False
+    remote_access: str = "DISABLED"
+    wireguard_endpoint: Optional[str] = None
+    wireguard_port: int = 51820
+    wireguard_subnet: str = "10.77.0.0/24"
+    enforce_backend_capability: bool = False
+    domain_mode: str = "LOCAL"
+    custom_domain: Optional[str] = None
 
     def __post_init__(self):
         if self.dns_mode not in ('quad9', 'system'):
@@ -119,3 +127,5 @@ class InstallResult:
     duration_seconds: float = 0.0
     error: Optional[str] = None
     error_code: Optional[str] = None
+    wireguard_configured: bool = False
+    wireguard_client_config_path: Optional[str] = None

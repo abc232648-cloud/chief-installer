@@ -201,6 +201,8 @@ def run_cli(argv: Optional[List[str]] = None, platform_adapter: Optional[Platfor
         print(f"Owner PWA (Remote):     {result.urls.get('owner')}")
         print(f"Staff PWA (Field):      {result.urls.get('staff')}")
         print(f"Job PWA (Specialist):   {result.urls.get('jobs')}")
+        if getattr(result, "wireguard_configured", False):
+            print(f"WireGuard:   Configured (Profile: {result.wireguard_client_config_path})")
         if result.archive_path:
             print(f"Archive:     {result.archive_path}")
         print(f"Log:         {result.log_path}")

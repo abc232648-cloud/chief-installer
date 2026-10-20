@@ -132,6 +132,30 @@ class FakePlatformAdapter(PlatformAdapter):
         self.calls.append(f"open_url:{url}")
         return True
 
+    def install_wireguard_dependencies(self, progress_callback: Optional[Callable[[str], None]] = None) -> None:
+        self.calls.append("install_wireguard_dependencies")
+
+    def install_wireguard_system_config(self, source_conf: Path) -> None:
+        self.calls.append("install_wireguard_system_config")
+
+    def control_wireguard_service(self, action: str) -> bool:
+        self.calls.append(f"control_wireguard_service:{action}")
+        return getattr(self, "wireguard_service_success", True)
+
+    def apply_wireguard_firewall(self, port: int) -> None:
+        self.calls.append(f"apply_wireguard_firewall:{port}")
+        if getattr(self, "fail_wireguard_firewall", False):
+            from deployment.installer.errors import PrivilegeError
+            raise PrivilegeError("Simulated firewall failure")
+
+    def rollback_wireguard_firewall(self) -> None:
+        self.calls.append("rollback_wireguard_firewall")
+
+    def verify_wireguard_active(self) -> bool:
+        self.calls.append("verify_wireguard_active")
+        return getattr(self, "wireguard_active_result", True)
+
+
 
 def test_orchestrator_clean_host_install(tmp_path):
     paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path / "home")

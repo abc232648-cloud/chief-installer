@@ -84,6 +84,11 @@ class TlsError(InstallerError):
         super().__init__(message, code="TLS_ERROR", retryable=True, details=details)
 
 
+class UnsupportedPlatformError(InstallerError):
+    def __init__(self, message: str, details: Optional[dict] = None):
+        super().__init__(message, code="UNSUPPORTED_PLATFORM", retryable=False, details=details)
+
+
 class CancelledError(InstallerError):
     def __init__(self, message: str = "Installation cancelled by user."):
         super().__init__(message, code="CANCELLED", retryable=False)

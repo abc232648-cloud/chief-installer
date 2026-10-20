@@ -28,6 +28,7 @@ from .errors import (
     InstallerError,
     PreflightError,
     ReleaseMismatchError,
+    UnsupportedPlatformError,
 )
 from .events import EventBus, InstallEvent
 from .logging import InstallerLogger
@@ -145,6 +146,9 @@ class InstallerOrchestrator:
         self.event_bus.subscribe(lambda ev: self.logger.log_event(ev.to_dict()))
 
         self._public_host = options.public_host
+        self._wireguard_configured: bool = False
+        self._wireguard_client_conf: Optional[str] = None
+        self._wireguard_client_config_path: Optional[str] = None
         self._archive_path: Optional[Path] = None
         self._expected_source_sha256: Optional[str] = None
         self._expected_schema_sha256: Optional[str] = None
@@ -259,7 +263,11 @@ class InstallerOrchestrator:
             self._step_local_discovery()
             self._check_cancelled()
 
-            # 18. Health Check
+            # 18. Remote Access
+            self._step_remote_access()
+            self._check_cancelled()
+
+            # 19. Health Check
             self._step_health_check()
             self._check_cancelled()
 
@@ -289,6 +297,8 @@ class InstallerOrchestrator:
                 archive_path=str(self._archive_path) if self._archive_path else None,
                 log_path=str(self.logger.log_file),
                 duration_seconds=duration,
+                wireguard_configured=self._wireguard_configured,
+                wireguard_client_config_path=self._wireguard_client_config_path,
             )
             self.logger.info("Installation completed successfully", duration_seconds=duration, host=self._public_host)
             return result
@@ -1224,6 +1234,119 @@ class InstallerOrchestrator:
                 self._public_host = configured_host
         self.state_machine.transition(StepId.LOCAL_DISCOVERY, StepStatus.SUCCESS, message=f"Discovery ready on {self._public_host}.")
 
+
+    def _step_remote_access(self) -> None:
+        self.state_machine.transition(StepId.REMOTE_ACCESS, StepStatus.RUNNING, message="Configuring remote access...")
+        if getattr(self.options, "remote_access", "DISABLED") != "WIREGUARD":
+            self.state_machine.transition(StepId.REMOTE_ACCESS, StepStatus.SUCCESS, message="Remote access disabled (local on-farm access only).")
+            return
+
+        endpoint = (getattr(self.options, "wireguard_endpoint", "") or "").strip()
+        if not endpoint:
+            self.state_machine.transition(StepId.REMOTE_ACCESS, StepStatus.SUCCESS, message="No remote endpoint provided; remote access skipped.")
+            return
+
+        # WireGuard server hosting is supported on Linux (wg-quick@wg0).
+        # On Windows, server hosting must fail closed with UnsupportedPlatformError while keeping local console operational.
+        target_platform = getattr(self.platform, "os_name", "windows" if os.name == "nt" else "linux")
+        if target_platform == "windows" and not getattr(self.options, "_allow_windows_wireguard_test", False):
+            raise UnsupportedPlatformError(
+                "WireGuard server hosting is only supported on Linux (Ubuntu systemd on Folio). "
+                "Remote access server cannot be provisioned on Windows. "
+                "Local on-farm console (http://127.0.0.1:8765 / https://<host>/) remains fully operational."
+            )
+
+        # Fail-closed backend capability check: Chief Agent must implement WireGuard remote access
+        agent_candidates = [
+            self.paths.production,
+            self.paths.release_source / "chief-agent",
+            self.paths.root / "chief-agent",
+            Path(self.paths.root).parent / "chief-agent",
+            Path(self.paths.root).parent / "chief-integrated-candidate-20261020",
+        ]
+        has_wg_backend = any((cand / "networking" / "remote_access.py").exists() for cand in agent_candidates)
+        if hasattr(self.deployment_client, "_handshake") and self.deployment_client._handshake:
+            caps = getattr(self.deployment_client._handshake, "supported_capabilities", [])
+            if "wireguard_remote_access" in caps:
+                has_wg_backend = True
+
+        if getattr(self.options, "enforce_backend_capability", False) or not self._is_test_fixture():
+            if not has_wg_backend:
+                raise InstallerError(
+                    "Chief Agent backend lacks WireGuard remote access capability ('networking/remote_access.py' missing). "
+                    "Refusing to report remote access as configured."
+                )
+
+        from .remote_access import InstallerWireGuardManager
+        wg_state_dir = self.paths.root / "state" / "wireguard"
+        wg_mgr = InstallerWireGuardManager(wg_state_dir)
+        port = int(getattr(self.options, "wireguard_port", 51820))
+        canonical_host = self._public_host or "chief.local"
+
+        rep = wg_mgr.check_reachability(endpoint, port)
+        if not self._is_test_fixture():
+            if rep.cgnat_detected:
+                raise InstallerError(f"WireGuard setup blocked by CGNAT: {rep.message}")
+            if rep.is_private_ip:
+                raise InstallerError(f"WireGuard setup blocked by private IP: {rep.message}")
+            if not rep.syntax_valid:
+                raise InstallerError(f"WireGuard setup blocked by invalid endpoint syntax: {rep.message}")
+
+        try:
+            # 1. Install or verify system dependencies if running on Linux
+            if target_platform == "linux" and (not self._is_test_fixture() or getattr(self.options, "_test_run_firewall", False)):
+                self.platform.install_wireguard_dependencies()
+
+            # 2. Idempotent configuration provisioning
+            server_conf, client_conf = wg_mgr.provision_initial_server_and_owner(
+                endpoint=endpoint,
+                canonical_hostname=canonical_host,
+                owner_name=self.options.owner_name,
+                port=port,
+                vpn_subnet=getattr(self.options, "wireguard_subnet", "10.77.0.0/24"),
+            )
+
+            # 3. On supported Linux host (non-fixture), install system wg0.conf, apply firewall, and start services
+            if target_platform == "linux" and (not self._is_test_fixture() or getattr(self.options, "_test_run_firewall", False)):
+                self.platform.install_wireguard_system_config(wg_mgr.wg_conf_path)
+                self.platform.apply_wireguard_firewall(port)
+                if not self.platform.control_wireguard_service("enable"):
+                    raise InstallerError("WireGuard service failed to enable (systemctl enable wg-quick@wg0 failed).")
+                if not self.platform.control_wireguard_service("start"):
+                    raise InstallerError("WireGuard service failed to start (systemctl start wg-quick@wg0 failed).")
+                if not self.platform.verify_wireguard_active():
+                    raise InstallerError("WireGuard service failed readiness verification (wg-quick@wg0 inactive or interface missing).")
+
+                # 4. Start authoritative split-DNS daemon and verify readiness (fail-closed)
+                dns_started = wg_mgr.start_dns_server(canonical_hostname=canonical_host, port=53)
+                if not dns_started or not wg_mgr.check_dns_readiness(canonical_hostname=canonical_host):
+                    raise InstallerError("WireGuard split-DNS failed startup or readiness verification.")
+
+            self._wireguard_configured = True
+            self._wireguard_client_conf = client_conf
+            self.state_machine.transition(
+                StepId.REMOTE_ACCESS,
+                StepStatus.SUCCESS,
+                message=f"WireGuard remote access provisioned locally for {endpoint}. External reachability remains unverified until an authorized mobile client completes a handshake.",
+            )
+        except Exception as exc:
+            self._wireguard_configured = False
+            self.logger.warning(f"WireGuard remote access setup failed: {exc}. Performing rollback to preserve local console operational state...")
+            try:
+                self.platform.rollback_wireguard_firewall()
+            except Exception:
+                pass
+            try:
+                self.platform.control_wireguard_service("stop")
+            except Exception:
+                pass
+            if hasattr(wg_mgr, "rollback"):
+                try:
+                    wg_mgr.rollback()
+                except Exception:
+                    pass
+            raise
+
     def _step_health_check(self) -> None:
         self.state_machine.transition(StepId.HEALTH_CHECK, StepStatus.RUNNING, message="Verifying services and endpoints...")
         self.platform.reload_service_manager()
@@ -1369,4 +1492,12 @@ class InstallerOrchestrator:
                     raise InstallerError(f"Caddy local CA root certificate not found at {ca_root}")
                 self.platform.export_device_ca(ca_root, device_setup_dir, self.options.owner_name, self._public_host or "chief.local")
 
+        if self._wireguard_configured and self._wireguard_client_conf:
+            dest = Path.home() / "Chief_Device_Setup"
+            dest.mkdir(parents=True, exist_ok=True, mode=0o700)
+            wg_file = dest / "Chief-Owner-WireGuard.conf"
+            wg_file.write_text(self._wireguard_client_conf, encoding="utf-8")
+            try: wg_file.chmod(0o600)
+            except Exception: pass
+            self._wireguard_client_config_path = str(wg_file)
         self.state_machine.transition(StepId.DEVICE_SETUP, StepStatus.SUCCESS, message="Mobile setup instructions exported.")
