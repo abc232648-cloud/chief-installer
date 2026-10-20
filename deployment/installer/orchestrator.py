@@ -28,6 +28,7 @@ from .errors import (
     InstallerError,
     PreflightError,
     ReleaseMismatchError,
+    UnsupportedPlatformError,
 )
 from .events import EventBus, InstallEvent
 from .logging import InstallerLogger
@@ -1245,11 +1246,23 @@ class InstallerOrchestrator:
             self.state_machine.transition(StepId.REMOTE_ACCESS, StepStatus.SUCCESS, message="No remote endpoint provided; remote access skipped.")
             return
 
+        # WireGuard server hosting is supported on Linux (wg-quick@wg0).
+        # On Windows, server hosting must fail closed with UnsupportedPlatformError while keeping local console operational.
+        target_platform = getattr(self.platform, "os_name", "windows" if os.name == "nt" else "linux")
+        if target_platform == "windows" and not getattr(self.options, "_allow_windows_wireguard_test", False):
+            raise UnsupportedPlatformError(
+                "WireGuard server hosting is only supported on Linux (Ubuntu systemd on Folio). "
+                "Remote access server cannot be provisioned on Windows. "
+                "Local on-farm console (http://127.0.0.1:8765 / https://<host>/) remains fully operational."
+            )
+
         # Fail-closed backend capability check: Chief Agent must implement WireGuard remote access
         agent_candidates = [
             self.paths.production,
             self.paths.release_source / "chief-agent",
             self.paths.root / "chief-agent",
+            Path(self.paths.root).parent / "chief-agent",
+            Path(self.paths.root).parent / "chief-integrated-candidate-20261020",
         ]
         has_wg_backend = any((cand / "networking" / "remote_access.py").exists() for cand in agent_candidates)
         if hasattr(self.deployment_client, "_handshake") and self.deployment_client._handshake:
@@ -1268,23 +1281,40 @@ class InstallerOrchestrator:
         wg_state_dir = self.paths.root / "state" / "wireguard"
         wg_mgr = InstallerWireGuardManager(wg_state_dir)
 
+        rep = wg_mgr.check_reachability(endpoint, getattr(self.options, "wireguard_port", 51820))
         if not self._is_test_fixture():
-            rep = wg_mgr.check_reachability(endpoint, getattr(self.options, "wireguard_port", 51820))
-            if not rep.is_valid:
-                self.logger.warning(f"WireGuard endpoint reachability issue: {rep.message}")
-                if rep.cgnat_detected:
-                    raise InstallerError(f"WireGuard setup blocked: {rep.message}")
+            if rep.cgnat_detected:
+                raise InstallerError(f"WireGuard setup blocked: {rep.message}")
+            if rep.is_private_ip:
+                raise InstallerError(f"WireGuard setup blocked: {rep.message}")
+            if not rep.syntax_valid:
+                raise InstallerError(f"WireGuard setup blocked: {rep.message}")
 
-        server_conf, client_conf = wg_mgr.provision_initial_server_and_owner(
-            endpoint=endpoint,
-            canonical_hostname=self._public_host or "chief.local",
-            owner_name=self.options.owner_name,
-            port=getattr(self.options, "wireguard_port", 51820),
-            vpn_subnet=getattr(self.options, "wireguard_subnet", "10.77.0.0/24"),
-        )
-        self._wireguard_configured = True
-        self._wireguard_client_conf = client_conf
-        self.state_machine.transition(StepId.REMOTE_ACCESS, StepStatus.SUCCESS, message=f"WireGuard remote access configured for {endpoint}.")
+        try:
+            server_conf, client_conf = wg_mgr.provision_initial_server_and_owner(
+                endpoint=endpoint,
+                canonical_hostname=self._public_host or "chief.local",
+                owner_name=self.options.owner_name,
+                port=getattr(self.options, "wireguard_port", 51820),
+                vpn_subnet=getattr(self.options, "wireguard_subnet", "10.77.0.0/24"),
+            )
+
+            # On Linux (non-fixture), apply dedicated firewall chains and start systemd service
+            if target_platform == "linux" and not self._is_test_fixture():
+                wg_mgr.apply_firewall_policy(port=getattr(self.options, "wireguard_port", 51820))
+                wg_mgr.enable_and_start_service()
+
+            self._wireguard_configured = True
+            self._wireguard_client_conf = client_conf
+            self.state_machine.transition(
+                StepId.REMOTE_ACCESS,
+                StepStatus.SUCCESS,
+                message=f"WireGuard remote access configured for {endpoint} (UDP reachability unverified until client connects).",
+            )
+        except Exception as exc:
+            self.logger.warning(f"WireGuard setup encountered error; rolling back remote access without affecting local services: {exc}")
+            wg_mgr.rollback()
+            raise
 
     def _step_health_check(self) -> None:
         self.state_machine.transition(StepId.HEALTH_CHECK, StepStatus.RUNNING, message="Verifying services and endpoints...")
