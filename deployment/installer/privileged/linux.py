@@ -9,7 +9,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from typing import List
+from typing import List, Optional
 
 _ALLOWED_PACKAGES = {
     "git",
@@ -71,14 +71,103 @@ def run_enable_linger(username: str) -> int:
     return proc.returncode
 
 
-def run_configure_avahi(label: str) -> int:
-    """Update /etc/avahi/avahi-daemon.conf with host-name and restart avahi-daemon."""
+def _update_hosts_file(hosts_path: Path, canonical_host: str) -> None:
+    """Atomically ensure 127.0.0.1 is mapped to canonical_host in /etc/hosts."""
+    try:
+        hosts_text = hosts_path.read_text(encoding="utf-8") if hosts_path.exists() else ""
+        lines = hosts_text.splitlines()
+        found = False
+        new_lines: List[str] = []
+        for l in lines:
+            parts = l.strip().split()
+            if len(parts) >= 2 and parts[0] == "127.0.0.1":
+                if canonical_host in parts[1:]:
+                    found = True
+                    new_lines.append(l)
+                else:
+                    # Clean up any stale chief-*.local hostname mapping
+                    cleaned_aliases = [p for p in parts[1:] if not (p.startswith("chief-") and p.endswith(".local"))]
+                    if cleaned_aliases:
+                        new_lines.append(f"127.0.0.1\t{' '.join(cleaned_aliases)}")
+            else:
+                new_lines.append(l)
+
+        if not found:
+            new_lines.append(f"127.0.0.1\t{canonical_host}\t# Chief on-farm console local host")
+
+        payload = "\n".join(new_lines) + "\n"
+        fd, tmp = tempfile.mkstemp(prefix=".hosts.", dir=str(hosts_path.parent if hosts_path.parent.exists() else "/tmp"))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+            if hosts_path.exists():
+                os.chmod(tmp, hosts_path.stat().st_mode & 0o777)
+            else:
+                os.chmod(tmp, 0o644)
+            os.replace(tmp, hosts_path)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+    except Exception as exc:
+        sys.stderr.write(f"WARNING: Could not update hosts file {hosts_path}: {exc}\n")
+
+
+def _update_nsswitch_file(nss_path: Path) -> None:
+    """Ensure /etc/nsswitch.conf routes .local lookups through libnss-mdns."""
+    if not nss_path.exists():
+        return
+    try:
+        nss_text = nss_path.read_text(encoding="utf-8")
+        if "hosts:" not in nss_text:
+            return
+        lines = nss_text.splitlines(keepends=True)
+        updated = False
+        new_lines: List[str] = []
+        for l in lines:
+            stripped = l.strip()
+            if stripped.startswith("hosts:") and "mdns" not in stripped:
+                if "dns" in stripped:
+                    new_lines.append(l.replace("dns", "mdns4_minimal [NOTFOUND=return] dns"))
+                else:
+                    new_lines.append(l.rstrip() + " mdns4_minimal [NOTFOUND=return]\n")
+                updated = True
+            else:
+                new_lines.append(l)
+
+        if updated:
+            fd, tmp = tempfile.mkstemp(prefix=".nsswitch.", dir=str(nss_path.parent if nss_path.parent.exists() else "/tmp"))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write("".join(new_lines))
+                os.chmod(tmp, nss_path.stat().st_mode & 0o777)
+                os.replace(tmp, nss_path)
+            finally:
+                if os.path.exists(tmp):
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+    except Exception as exc:
+        sys.stderr.write(f"WARNING: Could not update nsswitch file {nss_path}: {exc}\n")
+
+
+def run_configure_avahi(
+    label: str,
+    *,
+    conf_path_override: Optional[Path] = None,
+    hosts_path_override: Optional[Path] = None,
+    nsswitch_path_override: Optional[Path] = None,
+) -> int:
+    """Update /etc/avahi/avahi-daemon.conf with host-name, update /etc/hosts for loopback resolution, and restart avahi-daemon."""
     label = label.lower().strip()
     if not _LABEL_RE.fullmatch(label):
         sys.stderr.write(f"ERROR: Invalid local hostname label: {label!r}\n")
         return 2
 
-    conf_path = Path("/etc/avahi/avahi-daemon.conf")
+    conf_path = conf_path_override or Path("/etc/avahi/avahi-daemon.conf")
     existing_text = conf_path.read_text(encoding="utf-8") if conf_path.exists() else ""
     lines = existing_text.splitlines(keepends=True)
     out: List[str] = []
@@ -123,6 +212,14 @@ def run_configure_avahi(label: str) -> int:
                 os.unlink(tmp)
             except OSError:
                 pass
+
+    # Update loopback hosts mapping so local getent / socket resolution works without relying on mDNS multicast
+    hosts_path = hosts_path_override or Path("/etc/hosts")
+    _update_hosts_file(hosts_path, f"{label}.local")
+
+    # Update nsswitch.conf so libnss-mdns is active if installed
+    nss_path = nsswitch_path_override or Path("/etc/nsswitch.conf")
+    _update_nsswitch_file(nss_path)
 
     # Enable and restart service
     subprocess.run(["systemctl", "enable", "avahi-daemon"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

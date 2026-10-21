@@ -34,6 +34,7 @@ a = Analysis(
         'deployment.installer.privileged.linux',
         'deployment.installer.ui.app',
         'deployment.installer.ui.controller',
+        'deployment.installer.console',
     ],
     hookspath=[],
     hooksconfig={},

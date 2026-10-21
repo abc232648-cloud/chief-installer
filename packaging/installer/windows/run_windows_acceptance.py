@@ -85,6 +85,17 @@ def main() -> int:
         return 1
     print("[OK] Fail-closed argument validation verified (exit code != 0)")
 
+    # 6. Test Console smoke test
+    print("Testing Console smoke dispatch (--console-smoke-test)...")
+    res = subprocess.run([str(PACKAGE_BIN), "--console-smoke-test"], capture_output=True, text=True)
+    if res.returncode != 0:
+        print(f"ERROR: --console-smoke-test failed with code {res.returncode}: {res.stderr}", file=sys.stderr)
+        return 1
+    if "smoke test passed" not in res.stdout.lower():
+        print(f"ERROR: Expected smoke test confirmation, got: {res.stdout}", file=sys.stderr)
+        return 1
+    print("[OK] --console-smoke-test verified successfully")
+
     print("=== Packaged Windows artifact qualification passed successfully ===")
     return 0
 

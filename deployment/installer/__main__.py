@@ -89,6 +89,20 @@ def main() -> int:
         print(json.dumps(DEFAULT_RELEASE_MANIFEST.to_dict(), sort_keys=True))
         return 0
 
+    if "--console-smoke-test" in sys.argv:
+        try:
+            from .console import console_smoke_test
+        except ImportError:
+            from deployment.installer.console import console_smoke_test
+        return console_smoke_test()
+
+    if "--console" in sys.argv:
+        try:
+            from .console import main as console_main
+        except ImportError:
+            from deployment.installer.console import main as console_main
+        return console_main(sys.argv[1:])
+
     if sys.argv[1:] == ["--gui-smoke-test"]:
         # Exercise the actual bundled GUI without starting any installation.
         from deployment.installer.ui.app import InstallerApp

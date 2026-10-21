@@ -452,7 +452,7 @@ class InstallerApp(tk.Tk):
         action_box = ttk.Frame(parent)
         action_box.pack(anchor=tk.W, fill=tk.X, pady=(0, 24))
 
-        open_chief_btn = ttk.Button(action_box, text="Open Chief Console", command=lambda: self.controller.open_chief_url("chief"))
+        open_chief_btn = ttk.Button(action_box, text="Open Chief Console", command=lambda: self.controller.open_chief_console())
         open_chief_btn.pack(side=tk.LEFT, padx=(0, 8))
 
         open_owner_btn = ttk.Button(action_box, text="Open Owner PWA", command=lambda: self.controller.open_chief_url("owner"))

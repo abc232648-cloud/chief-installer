@@ -42,9 +42,10 @@ def build_desktop_package(executable: Path) -> Path:
         binary=root / "opt/chief-installer/chief-installer"
         binary.parent.mkdir(parents=True)
         shutil.copy2(executable,binary);binary.chmod(0o755)
-        applications=root / "usr/share/applications"
+        applications = root / "usr/share/applications"
         applications.mkdir(parents=True)
-        shutil.copy2(_PROJECT_ROOT / "packaging/installer/linux/chief-installer.desktop",applications)
+        shutil.copy2(_PROJECT_ROOT / "packaging/installer/linux/chief-installer.desktop", applications)
+        shutil.copy2(_PROJECT_ROOT / "packaging/installer/linux/chief-console.desktop", applications)
         control=root / "DEBIAN/control"
         control.parent.mkdir()
         control.write_text(
@@ -98,9 +99,12 @@ def build_package(output_dir: Optional[Path] = None) -> Path:
         main_source = _PROJECT_ROOT / "deployment" / "installer" / "__main__.py"
         shutil.copy2(main_source, stage_dir / "__main__.py")
 
-        # Copy desktop file
+        # Copy desktop files
         desktop_file = _PROJECT_ROOT / "packaging" / "installer" / "linux" / "chief-installer.desktop"
         shutil.copy2(desktop_file, stage_dir / "chief-installer.desktop")
+        console_desktop = _PROJECT_ROOT / "packaging" / "installer" / "linux" / "chief-console.desktop"
+        if console_desktop.exists():
+            shutil.copy2(console_desktop, stage_dir / "chief-console.desktop")
 
         # Create zipapp
         zipapp.create_archive(

@@ -1593,4 +1593,11 @@ class InstallerOrchestrator:
             try: wg_file.chmod(0o600)
             except Exception: pass
             self._wireguard_client_config_path = str(wg_file)
+
+        # Create dedicated desktop launcher and shortcuts for Chief Console
+        try:
+            self.platform.create_console_launchers(self.paths, self._public_host or "chief.local")
+        except Exception as exc:
+            self.logger.warning(f"Could not create desktop launchers: {exc}")
+
         self.state_machine.transition(StepId.DEVICE_SETUP, StepStatus.SUCCESS, message="Mobile setup instructions exported.")

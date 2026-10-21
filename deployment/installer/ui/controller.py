@@ -250,7 +250,27 @@ class InstallerUIController:
             except Exception:
                 pass
 
+    def open_chief_console(self) -> bool:
+        """Launch the on-farm Chief Console desktop application."""
+        try:
+            from ..console import launch_console_window, probe_local_console
+            from ..orchestrator import InstallerPaths
+            paths = InstallerPaths.create()
+            diag = probe_local_console(paths)
+            if diag.state.value == "HEALTHY":
+                if launch_console_window(diag, paths):
+                    return True
+        except Exception:
+            pass
+
+        url = self.install_result.urls.get("chief") if self.install_result and self.install_result.urls else None
+        if url:
+            return self.platform.open_url_in_browser(url)
+        return False
+
     def open_chief_url(self, app_name: str = "chief") -> bool:
+        if app_name == "chief":
+            return self.open_chief_console()
         if not self.install_result or not self.install_result.urls:
             return False
         url = self.install_result.urls.get(app_name)

@@ -1,7 +1,7 @@
 """Abstract platform adapter interface for Chief Unified Installer."""
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..models import PlatformInfo, PreflightReport
 
@@ -104,6 +104,10 @@ class PlatformAdapter(ABC):
     def open_url_in_browser(self, url: str) -> bool:
         """Launch URL in the user's default web browser."""
         raise NotImplementedError
+
+    def create_console_launchers(self, paths: Any, public_host: str) -> None:
+        """Create desktop launcher/shortcut for Chief Console desktop application."""
+        pass
 
     def install_wireguard_dependencies(self, progress_callback: Optional[Callable[[str], None]] = None) -> None:
         """Install WireGuard server tools and dependencies."""

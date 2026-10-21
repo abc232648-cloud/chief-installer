@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Chief Console
+GenericName=Chief Farm Operations Console
+Comment=On-farm Chief Console desktop application
+Exec=/opt/chief-installer/chief-installer --console
+Icon=chief-console
+Terminal=false
+StartupNotify=true
+Categories=Office;System;
+StartupWMClass=ChiefConsole

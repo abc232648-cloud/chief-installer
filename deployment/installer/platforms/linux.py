@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..errors import PrivilegeError, SystemDependencyError
 from ..models import PlatformInfo, PreflightCheck, PreflightReport
@@ -554,3 +554,56 @@ class LinuxPlatformAdapter(PlatformAdapter):
             return True
         import webbrowser
         return webbrowser.open(url)
+
+    def create_console_launchers(self, paths: Any, public_host: str) -> None:
+        """Create distinct desktop entries for Chief Console and Chief Installer."""
+        home = Path.home()
+        apps_dir = home / ".local" / "share" / "applications"
+        desktop_dir = home / "Desktop"
+        apps_dir.mkdir(parents=True, exist_ok=True)
+
+        exec_bin = "/opt/chief-installer/chief-installer"
+        if not Path(exec_bin).exists():
+            exec_bin = f"{sys.executable} -m deployment.installer"
+
+        console_desktop = (
+            "[Desktop Entry]\n"
+            "Version=1.0\n"
+            "Type=Application\n"
+            "Name=Chief Console\n"
+            "GenericName=Chief Farm Operations Console\n"
+            "Comment=On-farm Chief Console desktop application\n"
+            f"Exec={exec_bin} --console\n"
+            "Icon=chief-console\n"
+            "Terminal=false\n"
+            "StartupNotify=true\n"
+            "Categories=Office;System;\n"
+            "StartupWMClass=ChiefConsole\n"
+        )
+        installer_desktop = (
+            "[Desktop Entry]\n"
+            "Version=1.0\n"
+            "Type=Application\n"
+            "Name=Chief Installer\n"
+            "GenericName=Chief Installation Setup\n"
+            "Comment=Install or repair Chief deployment\n"
+            f"Exec={exec_bin} --gui\n"
+            "Icon=system-software-install\n"
+            "Terminal=false\n"
+            "StartupNotify=true\n"
+            "Categories=System;Setup;\n"
+        )
+
+        (apps_dir / "chief-console.desktop").write_text(console_desktop, encoding="utf-8")
+        (apps_dir / "chief-installer.desktop").write_text(installer_desktop, encoding="utf-8")
+
+        if desktop_dir.is_dir():
+            dt_console = desktop_dir / "chief-console.desktop"
+            dt_installer = desktop_dir / "chief-installer.desktop"
+            dt_console.write_text(console_desktop, encoding="utf-8")
+            dt_installer.write_text(installer_desktop, encoding="utf-8")
+            try:
+                dt_console.chmod(0o755)
+                dt_installer.chmod(0o755)
+            except OSError:
+                pass

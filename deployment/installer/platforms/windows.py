@@ -19,7 +19,7 @@ import subprocess
 from ..process import run as run_quiet
 import sys
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..errors import PrivilegeError, SystemDependencyError
 from ..models import PlatformInfo, PreflightCheck, PreflightReport
@@ -468,3 +468,32 @@ class WindowsPlatformAdapter(PlatformAdapter):
             return webbrowser.open(url)
         except Exception:
             return False
+
+    def create_console_launchers(self, paths: Any, public_host: str) -> None:
+        """Create distinct Windows desktop and Start Menu shortcuts for Chief Console and Chief Installer."""
+        desktop_dir = Path(os.environ.get("USERPROFILE") or str(Path.home())) / "Desktop"
+        start_menu_dir = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Chief"
+        start_menu_dir.mkdir(parents=True, exist_ok=True)
+
+        target_exe = sys.executable
+        if getattr(sys, "frozen", False):
+            target_exe = os.environ.get("CHIEF_INSTALLER_FROZEN_EXECUTABLE") or sys.executable
+        elif hasattr(paths, "tooling") and (paths.tooling / "Chief-Installer-Windows.exe").exists():
+            target_exe = str(paths.tooling / "Chief-Installer-Windows.exe")
+
+        def _make_shortcut(link_path: Path, args: str, desc: str) -> None:
+            ps_script = (
+                f"$ws = New-Object -ComObject WScript.Shell; "
+                f"$s = $ws.CreateShortcut('{str(link_path).replace(chr(39), chr(39)+chr(39))}'); "
+                f"$s.TargetPath = '{str(target_exe).replace(chr(39), chr(39)+chr(39))}'; "
+                f"$s.Arguments = '{args}'; "
+                f"$s.Description = '{desc}'; "
+                f"$s.Save()"
+            )
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps_script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        if desktop_dir.is_dir():
+            _make_shortcut(desktop_dir / "Chief Console.lnk", "--console", "Chief On-Farm Operations Console")
+
+        _make_shortcut(start_menu_dir / "Chief Console.lnk", "--console", "Chief On-Farm Operations Console")
+        _make_shortcut(start_menu_dir / "Chief Installer.lnk", "--gui", "Install or Repair Chief Deployment")
