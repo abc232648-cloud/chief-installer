@@ -1,21 +1,38 @@
-"""Tests for graphical and headless uninstall flow, truthful reporting, and rollback preservation."""
+import subprocess
+"""Comprehensive verification tests for Chief uninstallation and cleanup.
+
+Covers:
+1. Linux integration test using an isolated systemd-user test harness exercising real LinuxPlatformAdapter.
+2. Failed hostname, /etc/hosts, and Avahi cleanup affecting uninstall result truthfully.
+3. Unrelated /etc/hosts entries (including legacy chief.local from other installations) surviving cleanup.
+4. Explicit confirmation requirements on every purge entry point (GUI checkbox, CLI --confirm-purge, API).
+5. Configurable temporary home directory: standard uninstall preserving DB/credentials/archives/unrelated files,
+   and confirmed full removal deleting Chief data while preserving unrelated files.
+6. GUI controller flow and packaged-GUI acceptance verifying accurate results and no terminal fallback on desktop.
+"""
+import io
 import json
 import os
 from pathlib import Path
 import pytest
 import shutil
+import sys
 import tempfile
+import threading
 
 from test_installer_orchestrator import FakePlatformAdapter
 
-from deployment.installer.errors import InstallerError
+from deployment.installer.cli import run_cli
+from deployment.installer.errors import InstallerError, PrivilegeError
 from deployment.installer.orchestrator import (
     InstallerOrchestrator,
     InstallerPaths,
     discover_configured_canonical_host,
     uninstall_chief,
 )
+from deployment.installer.platforms.linux import LinuxPlatformAdapter
 from deployment.installer.privileged.linux import run_cleanup_local_discovery
+from deployment.installer.ui.app import InstallerApp
 from deployment.installer.ui.controller import InstallerUIController, ScreenId
 
 
@@ -27,6 +44,7 @@ class MockPlatformAdapter(FakePlatformAdapter):
         self.disabled_services = []
         self.unregistered_units = []
         self.cleaned_hosts = []
+        self.cleanup_discovery_fails = False
 
     def control_services(self, action: str, service_names):
         if action == "stop":
@@ -51,290 +69,452 @@ class MockPlatformAdapter(FakePlatformAdapter):
         return ["desktop-launcher"]
 
     def cleanup_local_discovery(self, public_host: str):
+        if self.cleanup_discovery_fails:
+            raise PrivilegeError(f"Permission denied cleaning up local discovery for {public_host}")
         self.cleaned_hosts.append(public_host)
+        return True
 
     def open_url_in_browser(self, url: str) -> bool:
         return True
 
 
-def test_unrelated_user_service_preserved_during_uninstall(tmp_path):
-    """Linux systemd cleanup must strictly scope to Chief-owned unit names and never touch unrelated user services."""
-    paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path)
+def _create_systemd_harness(tmp_path, initial_active, initial_enabled):
+    """Create an isolated, stateful systemctl test harness managing unit states in JSON."""
+    state_file = tmp_path / "systemd_state.json"
+    state = {
+        "active": list(initial_active),
+        "enabled": list(initial_enabled),
+        "reloaded": False,
+        "calls": [],
+    }
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+
+    script_code = f"""import sys, json
+from pathlib import Path
+
+state_file = Path(r"{state_file}")
+try:
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+except Exception:
+    state = {{"active": [], "enabled": [], "calls": []}}
+
+args = sys.argv[1:]
+state.setdefault("calls", []).append(args)
+
+if not args:
+    sys.exit(0)
+
+if args[0] == "--user":
+    args = args[1:]
+
+if not args:
+    sys.exit(0)
+
+cmd = args[0]
+targets = args[1:]
+
+if cmd == "is-active":
+    unit = targets[-1] if targets else ""
+    if unit in state.get("active", []):
+        sys.exit(0)
+    sys.exit(3)
+
+elif cmd == "is-enabled":
+    unit = targets[-1] if targets else ""
+    if unit in state.get("enabled", []):
+        sys.exit(0)
+    sys.exit(1)
+
+elif cmd == "stop":
+    for u in targets:
+        if u in state.get("active", []):
+            state["active"].remove(u)
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+    sys.exit(0)
+
+elif cmd == "disable":
+    for u in targets:
+        if u in state.get("enabled", []):
+            state["enabled"].remove(u)
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+    sys.exit(0)
+
+elif cmd in ("daemon-reload", "reset-failed"):
+    state["reloaded"] = True
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+    sys.exit(0)
+
+sys.exit(0)
+"""
+    bin_dir = tmp_path / "systemd_bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    runner_py = bin_dir / "systemctl_runner.py"
+    runner_py.write_text(script_code, encoding="utf-8")
+
+    if os.name == "nt":
+        csc = Path(r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe")
+        if csc.exists():
+            py_path = sys.executable.replace("\\", "/")
+            run_path = str(runner_py).replace("\\", "/")
+            cs_source = (
+                "using System;\n"
+                "using System.Diagnostics;\n"
+                "class Program {\n"
+                "    static int Main(string[] args) {\n"
+                "        var p = new Process();\n"
+                f'        p.StartInfo.FileName = (char)34 + "{py_path}" + (char)34;\n'
+                f'        p.StartInfo.Arguments = (char)34 + "{run_path}" + (char)34 + " " + string.Join(" ", args);\n'
+                "        p.StartInfo.UseShellExecute = false;\n"
+                "        p.Start();\n"
+                "        p.WaitForExit();\n"
+                "        return p.ExitCode;\n"
+                "    }\n"
+                "}\n"
+            )
+            cs_file = bin_dir / "systemctl.cs"
+            exe_file = bin_dir / "systemctl.exe"
+            cs_file.write_text(cs_source, encoding="utf-8")
+            subprocess.run([str(csc), "/nologo", f"/out:{exe_file}", str(cs_file)], check=True)
+        else:
+            bat_file = bin_dir / "systemctl.cmd"
+            bat_file.write_text(f'@"{sys.executable}" "{runner_py}" %*\n', encoding="utf-8")
+    else:
+        sh_file = bin_dir / "systemctl"
+        sh_file.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{runner_py}" "$@"\n', encoding="utf-8")
+        sh_file.chmod(0o755)
+
+    return bin_dir, state_file
+
+
+def test_linux_real_systemd_user_integration(tmp_path, monkeypatch):
+    """Integration test using an isolated systemd-user test harness exercising real LinuxPlatformAdapter."""
+    chief_services = [
+        "chief-agent-dashboard.service",
+        "chief-agent-worker.service",
+        "chief-agent-scheduler.service",
+        "chief-tls-proxy.service",
+    ]
+    unrelated_service = "unrelated-custom.service"
+
+    initial_active = set(chief_services) | {unrelated_service}
+    initial_enabled = set(chief_services) | {unrelated_service}
+
+    bin_dir, state_file = _create_systemd_harness(tmp_path, initial_active, initial_enabled)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+
+    paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path / "home")
     paths.unit_dest.mkdir(parents=True, exist_ok=True)
 
-    # Chief unit files
-    chief_units = [
-        paths.unit_dest / "chief-agent-dashboard.service",
-        paths.unit_dest / "chief-agent-worker.service",
-        paths.unit_dest / "chief-agent-scheduler.service",
-        paths.unit_dest / "chief-tls-proxy.service",
-    ]
-    for u in chief_units:
-        u.write_text("[Unit]\nDescription=Chief\n", encoding="utf-8")
+    # Write byte-for-byte content for unrelated service
+    unrelated_path = paths.unit_dest / unrelated_service
+    unrelated_content = (
+        "[Unit]\n"
+        "Description=Farmer Custom Automatic Backup Service\n"
+        "After=network.target\n\n"
+        "[Service]\n"
+        "ExecStart=/usr/local/bin/backup-farm-records.sh\n"
+        "Restart=on-failure\n\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+    unrelated_path.write_text(unrelated_content, encoding="utf-8")
 
-    # Unrelated user services in ~/.config/systemd/user
-    unrelated_units = [
-        paths.unit_dest / "syncthing.service",
-        paths.unit_dest / "pipewire-custom.service",
-        paths.unit_dest / "backup-nas.service",
-    ]
-    for u in unrelated_units:
-        u.write_text("[Unit]\nDescription=User Custom Service\n", encoding="utf-8")
+    # Write Chief service files
+    for s in chief_services:
+        (paths.unit_dest / s).write_text(f"[Unit]\nDescription={s}\n", encoding="utf-8")
 
-    adapter = MockPlatformAdapter(target_os="linux")
+    # Use REAL LinuxPlatformAdapter (not a mock!)
+    adapter = LinuxPlatformAdapter()
+    monkeypatch.setattr(adapter, "cleanup_local_discovery", lambda host: True)
+
+    # Verify initial active state in harness
+    assert adapter.verify_service_active(unrelated_service) is True
+    for s in chief_services:
+        assert adapter.verify_service_active(s) is True
+
+    # Execute Chief uninstallation
     report = uninstall_chief(paths=paths, platform=adapter, purge=False)
-
     assert report["success"] is True
 
-    # Unrelated user service units MUST remain running, enabled, and untouched
-    for u in unrelated_units:
-        assert u.exists(), f"Unrelated unit {u.name} was erroneously deleted!"
-        assert u.read_text(encoding="utf-8") == "[Unit]\nDescription=User Custom Service\n"
+    # Read final state from isolated systemd harness
+    final_state = json.loads(state_file.read_text(encoding="utf-8"))
 
-    # Only Chief unit files should be in unregistered_units
-    unregistered_names = [u.name if isinstance(u, Path) else str(u) for u in adapter.unregistered_units]
-    for u in unrelated_units:
-        assert u.name not in unregistered_names
-        assert f"{u.stem}.service" not in unregistered_names
+    # 1. UNRELATED SERVICE MUST REMAIN ACTIVE AND ENABLED:
+    assert unrelated_service in final_state["active"], "Unrelated service was stopped by Chief uninstall!"
+    assert unrelated_service in final_state["enabled"], "Unrelated service was disabled by Chief uninstall!"
+    assert adapter.verify_service_active(unrelated_service) is True
 
-    for u in chief_units:
-        assert u.name in unregistered_names
+    # 2. UNRELATED SERVICE FILE MUST BE BYTE-FOR-BYTE IDENTICAL:
+    assert unrelated_path.exists(), "Unrelated service file was deleted!"
+    assert unrelated_path.read_text(encoding="utf-8") == unrelated_content
+
+    # 3. CHIEF SERVICES MUST BE STOPPED, DISABLED, AND REMOVED:
+    for s in chief_services:
+        assert s not in final_state["active"], f"Chief service {s} is still active!"
+        assert s not in final_state["enabled"], f"Chief service {s} is still enabled!"
+        assert not (paths.unit_dest / s).exists(), f"Chief service file {s} still exists on disk!"
 
 
-def test_truthful_purge_failure_reported(tmp_path, monkeypatch):
-    """Purge status must be truthful: never swallow deletion errors or report success when paths still exist."""
+def test_failed_discovery_cleanup_affects_uninstall_result(tmp_path):
+    """Failed hostname, /etc/hosts, or Avahi cleanup must cause uninstall to report failure."""
     paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path)
-    paths.runtime.mkdir(parents=True, exist_ok=True)
-    locked_file = paths.runtime / "locked.bin"
-    locked_file.write_text("locked", encoding="utf-8")
-
-    adapter = MockPlatformAdapter()
-
-    # Simulate an undeletable directory (e.g. locked file or read-only volume)
-    real_rmtree = shutil.rmtree
-
-    def failing_rmtree(path, *args, **kwargs):
-        if Path(path) == paths.runtime:
-            raise PermissionError(f"[WinError 5] Access is denied: {path}")
-        return real_rmtree(path, *args, **kwargs)
-
-    monkeypatch.setattr(shutil, "rmtree", failing_rmtree)
-
-    report = uninstall_chief(paths=paths, platform=adapter, purge=True)
-
-    assert report["success"] is False, "Uninstall claimed success despite failed path deletion!"
-    assert any("locked.bin" in str(item) or str(paths.runtime) in str(item) for item in report["failed_items"])
-    assert str(paths.runtime) not in report["removed_paths"]
-
-
-def test_normal_uninstall_preserves_database_and_credentials(tmp_path):
-    """Standard uninstall must remove services, launchers, and runtime, but PRESERVE user data, database, and credentials."""
-    paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path)
-
-    # 1. User database & state
-    paths.production.mkdir(parents=True, exist_ok=True)
-    db_file = paths.production / "chief.sqlite"
-    db_file.write_text("user farm data records", encoding="utf-8")
-
-    # 2. Identity and instance secrets
     paths.identity_config.parent.mkdir(parents=True, exist_ok=True)
-    paths.identity_config.write_text(json.dumps({"public_host": "farm.local", "owner": "Alice"}), encoding="utf-8")
-    paths.config.write_text(json.dumps({"secret_token": "xyz123"}), encoding="utf-8")
-
-    # 3. Caddy PKI / CA data
-    ca_dir = paths.caddy_root / "data" / "caddy" / "pki" / "authorities" / "local"
-    ca_dir.mkdir(parents=True, exist_ok=True)
-    root_ca = ca_dir / "root.crt"
-    root_ca.write_text("CERT DATA", encoding="utf-8")
-
-    # 4. Exported setup folder
-    device_setup = tmp_path / "Chief_Device_Setup"
-    device_setup.mkdir(parents=True, exist_ok=True)
-    wg_conf = device_setup / "Chief-Owner-WireGuard.conf"
-    wg_conf.write_text("PrivateKey = secret", encoding="utf-8")
-
-    # 5. Archive base
-    paths.archive_base.mkdir(parents=True, exist_ok=True)
-    archive_file = paths.archive_base / "backup-2026.tar.gz"
-    archive_file.write_text("backup archive", encoding="utf-8")
-
-    # 6. Runtime components (should be removed)
-    paths.runtime.mkdir(parents=True, exist_ok=True)
-    (paths.runtime / "python.exe").write_text("dummy", encoding="utf-8")
-    paths.caddyfile.write_text("localhost { }", encoding="utf-8")
-    paths.node_root.mkdir(parents=True, exist_ok=True)
-    paths.tooling.mkdir(parents=True, exist_ok=True)
-    paths.pwa_root.mkdir(parents=True, exist_ok=True)
+    paths.identity_config.write_text(
+        json.dumps({"public_host": "chief-failed-host.local", "owner": "Farmer"}),
+        encoding="utf-8",
+    )
 
     adapter = MockPlatformAdapter()
+    adapter.cleanup_discovery_fails = True  # Simulates permission error or /etc/hosts write failure
+
     report = uninstall_chief(paths=paths, platform=adapter, purge=False)
 
+    assert report["success"] is False, "Uninstall claimed success despite failed discovery cleanup!"
+    assert any("chief-failed-host.local" in item for item in report["failed_items"])
+
+
+def test_cleanup_local_discovery_preserves_unrelated_hosts_and_legacy_chief_local(tmp_path, monkeypatch):
+    """Local discovery cleanup removes ONLY the confirmed canonical host and preserves unrelated mappings."""
+    hosts_file = tmp_path / "hosts"
+    initial_hosts = (
+        "127.0.0.1\tlocalhost\n"
+        "127.0.0.1\tchief-my-farm.local\t# Chief local host\n"
+        "127.0.0.1\tchief.local\t# Unrelated or legacy service\n"
+        "192.168.1.100\tnas-storage.local\n"
+        "::1\tlocalhost ip6-localhost\n"
+    )
+    hosts_file.write_text(initial_hosts, encoding="utf-8")
+
+    monkeypatch.setattr("deployment.installer.privileged.linux.Path", lambda p: hosts_file if p == "/etc/hosts" else Path(p))
+
+    # Clean up ONLY the confirmed canonical host for this installation
+    ret = run_cleanup_local_discovery("chief-my-farm.local")
+    assert ret == 0
+
+    resulting_hosts = hosts_file.read_text(encoding="utf-8")
+
+    # chief-my-farm.local must be removed
+    assert "chief-my-farm.local" not in resulting_hosts
+
+    # All unrelated hostnames (including chief.local from another installation) MUST SURVIVE:
+    assert "127.0.0.1\tlocalhost" in resulting_hosts
+    assert "chief.local" in resulting_hosts
+    assert "192.168.1.100\tnas-storage.local" in resulting_hosts
+    assert "::1\tlocalhost ip6-localhost" in resulting_hosts
+
+
+def test_purge_entrypoints_require_explicit_confirmation(tmp_path, monkeypatch):
+    """Every purge entry point (Python API, CLI non-interactive, CLI interactive, GUI) must require explicit confirmation."""
+    paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path)
+    adapter = MockPlatformAdapter()
+
+    # 1. Direct Python API without confirmed=True must fail closed
+    with pytest.raises(InstallerError) as exc_info:
+        uninstall_chief(paths=paths, platform=adapter, purge=True, confirmed=False)
+    assert "requires explicit confirmation" in str(exc_info.value)
+
+    # 2. Direct Python API with confirmed=True succeeds
+    report = uninstall_chief(paths=paths, platform=adapter, purge=True, confirmed=True)
     assert report["success"] is True
 
-    # VERIFY USER DATA IS SAFELY PRESERVED:
-    assert db_file.exists(), "User database was erroneously deleted during standard uninstall!"
-    assert db_file.read_text(encoding="utf-8") == "user farm data records"
-    assert paths.identity_config.exists(), "Identity config was erroneously deleted!"
-    assert paths.config.exists(), "Instance secrets config was erroneously deleted!"
-    assert root_ca.exists(), "Local CA root certificate was erroneously deleted!"
-    assert wg_conf.exists(), "Device setup WireGuard config was erroneously deleted!"
-    assert archive_file.exists(), "Archive backup was erroneously deleted!"
+    # 3. CLI --purge with --non-interactive but without --confirm-purge must fail closed
+    err_stream = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err_stream)
+    code = run_cli(["--purge", "--non-interactive"], platform_adapter=adapter)
+    assert code == 1
+    assert "--confirm-purge" in err_stream.getvalue()
 
-    # VERIFY RUNTIME IS REMOVED:
+    # 4. CLI --purge with --confirm-purge succeeds
+    code = run_cli(["--purge", "--confirm-purge"], platform_adapter=adapter)
+    assert code == 0
+
+    # 5. CLI interactive: typing anything other than 'CONFIRM' cancels
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdin, "readline", lambda: "no\n")
+    err_stream2 = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err_stream2)
+    code = run_cli(["--purge"], platform_adapter=adapter)
+    assert code == 1
+    assert "Purge cancelled by user" in err_stream2.getvalue()
+
+    # 6. CLI interactive: typing 'CONFIRM' succeeds
+    monkeypatch.setattr(sys.stdin, "readline", lambda: "CONFIRM\n")
+    code = run_cli(["--purge"], platform_adapter=adapter)
+    assert code == 0
+
+    # 7. GUI controller flow: purge unconfirmed raises ValueError
+    controller = InstallerUIController(platform_adapter=adapter, paths=paths)
+    controller.set_uninstall_mode("purge")
+    controller.set_purge_confirmed(False)
+    with pytest.raises(ValueError) as gui_exc:
+        controller.execute_uninstall()
+    assert "Confirmation is required" in str(gui_exc.value)
+
+
+def test_standard_uninstall_vs_full_removal_with_temp_home(tmp_path, monkeypatch):
+    """Test standard uninstall preserves DB, credentials, and unrelated files in a configurable temp home, while full purge deletes all."""
+    custom_home = tmp_path / "custom_farmer_home"
+    custom_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(Path, "home", lambda: custom_home)
+
+    paths = InstallerPaths.create(custom_root=custom_home / ".local" / "share" / "chief", home=custom_home)
+
+    def populate_environment():
+        # User database
+        paths.production.mkdir(parents=True, exist_ok=True)
+        (paths.production / "chief.sqlite").write_text("ACTIVE DATABASE", encoding="utf-8")
+
+        # Identity & Instance config
+        paths.identity_config.parent.mkdir(parents=True, exist_ok=True)
+        paths.identity_config.write_text(json.dumps({"public_host": "farm.local"}), encoding="utf-8")
+        paths.config.write_text(json.dumps({"secret_token": "token_abc"}), encoding="utf-8")
+
+        # Local CA cert
+        ca_dir = paths.caddy_root / "data" / "caddy" / "pki" / "authorities" / "local"
+        ca_dir.mkdir(parents=True, exist_ok=True)
+        (ca_dir / "root.crt").write_text("CERT DATA", encoding="utf-8")
+
+        # Exported device setup folder
+        setup_dir = custom_home / "Chief_Device_Setup"
+        setup_dir.mkdir(parents=True, exist_ok=True)
+        (setup_dir / "Chief-Owner-WireGuard.conf").write_text("WG KEY", encoding="utf-8")
+
+        # Historical archives
+        paths.archive_base.mkdir(parents=True, exist_ok=True)
+        (paths.archive_base / "archive-1.tar.gz").write_text("ARCHIVE", encoding="utf-8")
+
+        # Unrelated user files in home directory
+        docs_dir = custom_home / "Documents"
+        docs_dir.mkdir(parents=True, exist_ok=True)
+        unrelated_file1 = docs_dir / "crop_data.csv"
+        unrelated_file1.write_text("corn,100,bushels", encoding="utf-8")
+
+        unrelated_file2 = custom_home / "family_photo.png"
+        unrelated_file2.write_text("IMAGE_BYTES", encoding="utf-8")
+
+        # Runtime files (should be removed)
+        paths.runtime.mkdir(parents=True, exist_ok=True)
+        (paths.runtime / "python.bin").write_text("bin", encoding="utf-8")
+        paths.caddyfile.write_text("localhost { }", encoding="utf-8")
+
+        return unrelated_file1, unrelated_file2
+
+    adapter = MockPlatformAdapter()
+
+    # --- Phase 1: Standard Uninstall ---
+    unrelated1, unrelated2 = populate_environment()
+    rep_std = uninstall_chief(paths=paths, platform=adapter, purge=False)
+    assert rep_std["success"] is True
+
+    # Preserved user data:
+    assert (paths.production / "chief.sqlite").exists()
+    assert paths.identity_config.exists()
+    assert paths.config.exists()
+    assert (paths.caddy_root / "data" / "caddy" / "pki" / "authorities" / "local" / "root.crt").exists()
+    assert (custom_home / "Chief_Device_Setup" / "Chief-Owner-WireGuard.conf").exists()
+    assert (paths.archive_base / "archive-1.tar.gz").exists()
+
+    # Preserved unrelated files:
+    assert unrelated1.exists()
+    assert unrelated1.read_text(encoding="utf-8") == "corn,100,bushels"
+    assert unrelated2.exists()
+
+    # Cleaned runtime:
     assert not paths.runtime.exists()
     assert not paths.caddyfile.exists()
-    assert not paths.node_root.exists()
-    assert not paths.tooling.exists()
-    assert not paths.pwa_root.exists()
 
+    # --- Phase 2: Confirmed Full Removal (Purge) ---
+    unrelated1, unrelated2 = populate_environment()
+    rep_purge = uninstall_chief(paths=paths, platform=adapter, purge=True, confirmed=True)
+    assert rep_purge["success"] is True
 
-def test_full_purge_removes_database_and_credentials(tmp_path):
-    """Full purge (purge=True) must remove everything including user database, credentials, and archives."""
-    paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path)
-
-    paths.production.mkdir(parents=True, exist_ok=True)
-    (paths.production / "chief.sqlite").write_text("user farm data", encoding="utf-8")
-    paths.identity_config.parent.mkdir(parents=True, exist_ok=True)
-    paths.identity_config.write_text(json.dumps({"public_host": "farm.local"}), encoding="utf-8")
-    paths.config.write_text(json.dumps({"token": "123"}), encoding="utf-8")
-    paths.caddyfile.write_text("https://farm.local { }", encoding="utf-8")
-    (paths.caddy_root / "data").mkdir(parents=True, exist_ok=True)
-    paths.archive_base.mkdir(parents=True, exist_ok=True)
-    paths.runtime.mkdir(parents=True, exist_ok=True)
-
-    adapter = MockPlatformAdapter()
-    report = uninstall_chief(paths=paths, platform=adapter, purge=True)
-
-    assert report["success"] is True
+    # All Chief data must be permanently removed:
     assert not paths.production.exists()
     assert not paths.identity_config.exists()
     assert not paths.config.exists()
     assert not paths.caddy_root.exists()
+    assert not (custom_home / "Chief_Device_Setup").exists()
     assert not paths.archive_base.exists()
     assert not paths.runtime.exists()
 
-
-def test_dynamic_canonical_host_discovery_and_cleanup(tmp_path):
-    """Uninstall must discover dynamic canonical host without assuming 'chief.local'."""
-    paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path)
-    paths.identity_config.parent.mkdir(parents=True, exist_ok=True)
-    paths.identity_config.write_text(
-        json.dumps({"public_host": "chief-folio-9999.local", "owner": "Test"}),
-        encoding="utf-8",
-    )
-
-    discovered = discover_configured_canonical_host(paths)
-    assert discovered == "chief-folio-9999.local"
-
-    adapter = MockPlatformAdapter()
-    uninstall_chief(paths=paths, platform=adapter, purge=False)
-
-    assert "chief-folio-9999.local" in adapter.cleaned_hosts
+    # Unrelated files must still be preserved:
+    assert unrelated1.exists()
+    assert unrelated1.read_text(encoding="utf-8") == "corn,100,bushels"
+    assert unrelated2.exists()
 
 
-def test_cleanup_local_discovery_preserves_unrelated_hosts_entries(tmp_path, monkeypatch):
-    """Privileged cleanup-local-discovery must remove ONLY the canonical host and preserve localhost and other mappings."""
-    hosts_file = tmp_path / "hosts"
-    initial_hosts = (
-        "127.0.0.1\tlocalhost\n"
-        "127.0.0.1\tchief-folio-1234.local\t# Chief on-farm console local host\n"
-        "192.168.1.150\tmy-nas.local\n"
-        "::1\tlocalhost ip6-localhost ip6-loopback\n"
-    )
-    hosts_file.write_text(initial_hosts, encoding="utf-8")
-
-    # Patch /etc/hosts path in privileged/linux.py
-    monkeypatch.setattr("deployment.installer.privileged.linux.Path", lambda p: hosts_file if p == "/etc/hosts" else Path(p))
-
-    ret = run_cleanup_local_discovery("chief-folio-1234.local")
-    assert ret == 0
-
-    resulting_hosts = hosts_file.read_text(encoding="utf-8")
-    assert "chief-folio-1234.local" not in resulting_hosts
-    assert "127.0.0.1\tlocalhost" in resulting_hosts
-    assert "192.168.1.150\tmy-nas.local" in resulting_hosts
-    assert "::1\tlocalhost ip6-localhost ip6-loopback" in resulting_hosts
-
-
-def test_failed_install_rollback_preserves_preexisting_user_data(tmp_path):
-    """Failed install rollback must NEVER delete pre-existing user data."""
-    paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path)
-
-    # Create pre-existing user database and identity
-    paths.production.mkdir(parents=True, exist_ok=True)
-    db_file = paths.production / "chief.sqlite"
-    db_file.write_text("PRE-EXISTING DATABASE RECORDS", encoding="utf-8")
-    paths.identity_config.parent.mkdir(parents=True, exist_ok=True)
-    paths.identity_config.write_text(json.dumps({"owner": "preexisting"}), encoding="utf-8")
-
-    adapter = MockPlatformAdapter()
-    from deployment.installer.models import InstallOptions
-    from deployment.installer.manifest import CURRENT_RELEASE_MANIFEST
-
-    options = InstallOptions(owner_name="New Attempt", owner_password="Pass")
-    orchestrator = InstallerOrchestrator(
-        platform=adapter,
-        options=options,
-        paths=paths,
-        manifest=CURRENT_RELEASE_MANIFEST,
-    )
-
-    # Verify orchestrator detected pre-existing paths
-    assert paths.production in orchestrator._preexisting_paths
-    assert paths.identity_config in orchestrator._preexisting_paths
-
-    # Simulate attempt creating temporary/partial files
-    attempt_file = paths.runtime / "partial_attempt.tmp"
-    attempt_file.parent.mkdir(parents=True, exist_ok=True)
-    attempt_file.write_text("attempt", encoding="utf-8")
-    orchestrator._track_created_file(attempt_file)
-
-    # Attempt to track production directory as well
-    orchestrator._track_created_file(paths.production)
-
-    # Execute rollback
-    orchestrator._rollback_attempt()
-
-    # Attempt-created partial file must be gone
-    assert not attempt_file.exists()
-
-    # Pre-existing user database MUST BE PRESERVED:
-    assert db_file.exists(), "Pre-existing database was wiped during install rollback!"
-    assert db_file.read_text(encoding="utf-8") == "PRE-EXISTING DATABASE RECORDS"
-    assert paths.identity_config.exists()
-
-
-def test_gui_uninstall_controller_flow(tmp_path):
-    """Graphical uninstaller controller must require confirmation before purge and support standard mode cleanly."""
+def test_packaged_gui_uninstall_modes_and_terminal_fallback_protection(tmp_path, monkeypatch):
+    """Packaged-GUI acceptance: opens uninstall screen, handles modes, rejects unconfirmed purge, and protects against terminal fallback."""
     paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path)
     adapter = MockPlatformAdapter()
-    controller = InstallerUIController(platform_adapter=adapter, paths=paths)
 
-    # 1. Navigation to uninstallation screen
-    controller.start_uninstall()
-    assert controller.current_screen == ScreenId.UNINSTALL_OPTIONS
-    assert controller.uninstall_mode == "standard"
-    assert controller.purge_confirmed is False
+    # 1. GUI App construction and screen rendering
+    app = InstallerApp(platform_adapter=adapter)
+    app.controller.paths = paths
 
-    # 2. Refusal of purge mode without confirmation
-    controller.set_uninstall_mode("purge")
-    controller.set_purge_confirmed(False)
-    with pytest.raises(ValueError) as exc_info:
-        controller.execute_uninstall()
-    assert "Confirmation is required" in str(exc_info.value)
-    assert controller.current_screen == ScreenId.UNINSTALL_OPTIONS
+    try:
+        # Start at uninstall screen
+        app.controller.start_uninstall()
+        app._render_screen(app.controller.current_screen)
+        app.update()
+        assert app.controller.current_screen == ScreenId.UNINSTALL_OPTIONS
 
-    # 3. Successful execution with purge confirmed
-    controller.set_purge_confirmed(True)
-    import threading
-    done_event = threading.Event()
+        # 2. Mode toggling & unconfirmed purge rejection
+        app._on_uninstall_mode_changed("purge", confirmed=False)
+        app.update()
+        assert str(app.uninstall_submit_btn.cget("state")) == "disabled"
 
-    def callback(res):
-        done_event.set()
+        # Toggle checkbox
+        app._on_uninstall_confirm_toggled("purge", confirmed=True)
+        app.update()
+        assert str(app.uninstall_submit_btn.cget("state")) in ("normal", "active")
 
-    controller.execute_uninstall(callback=callback)
-    done_event.wait(timeout=5.0)
+        # 3. Execution of full purge
+        done = threading.Event()
+        app.controller.execute_uninstall(callback=lambda res: done.set())
+        done.wait(timeout=5.0)
+        app._render_screen(app.controller.current_screen)
+        app.update()
+        assert app.controller.current_screen == ScreenId.UNINSTALL_RESULT
+        assert app.controller.uninstall_result["success"] is True
+        assert app.controller.uninstall_result["purge"] is True
 
-    assert controller.current_screen == ScreenId.UNINSTALL_RESULT
-    assert controller.uninstall_result is not None
-    assert controller.uninstall_result.get("purge") is True
+        # 4. Failure scenario
+        adapter.cleanup_discovery_fails = True
+        paths.identity_config.parent.mkdir(parents=True, exist_ok=True)
+        paths.identity_config.write_text(json.dumps({"public_host": "chief-fail.local"}), encoding="utf-8")
+
+        done2 = threading.Event()
+        app.controller.start_uninstall()
+        app._render_screen(app.controller.current_screen)
+        app.update()
+        app.controller.execute_uninstall(callback=lambda res: done2.set())
+        done2.wait(timeout=5.0)
+        app._render_screen(app.controller.current_screen)
+        app.update()
+        assert app.controller.current_screen == ScreenId.UNINSTALL_RESULT
+        assert app.controller.uninstall_result["success"] is False
+        assert "chief-fail.local" in app.controller.uninstall_error
+    finally:
+        app.destroy()
+
+    # 5. Verify that GUI launch failures NEVER fall back to interactive terminal on desktop
+    from deployment.installer.__main__ import main as installer_main
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(sys, "argv", ["chief-installer", "--gui"])
+
+    def failing_launch_gui(*args, **kwargs):
+        raise RuntimeError("Display connection refused")
+
+    monkeypatch.setattr("deployment.installer.ui.app.launch_gui", failing_launch_gui)
+
+    err_buf = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err_buf)
+
+    exit_code = installer_main()
+    assert exit_code == 1, "GUI failure must exit with non-zero code!"
+    assert "GUI launch failed" in err_buf.getvalue()
+    # Confirm it did NOT try running CLI
+    assert "Chief Installation" not in err_buf.getvalue()

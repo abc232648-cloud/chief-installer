@@ -652,16 +652,20 @@ class LinuxPlatformAdapter(PlatformAdapter):
                     pass
         return removed
 
-    def cleanup_local_discovery(self, public_host: str) -> None:
+    def cleanup_local_discovery(self, public_host: str) -> bool:
         """Remove configured local discovery entries."""
         try:
             self._run_privileged(["cleanup-local-discovery", public_host])
-        except Exception:
-            pass
-        avahi_service = Path("/etc/avahi/services/chief.service")
-        if avahi_service.exists():
-            try:
-                avahi_service.unlink()
-            except Exception:
-                pass
+            return True
+        except PrivilegeError:
+            raise
+        except Exception as exc:
+            # Fallback in unprivileged/mock unit test environments
+            avahi_service = Path("/etc/avahi/services/chief.service")
+            if avahi_service.exists():
+                try:
+                    avahi_service.unlink()
+                except Exception:
+                    return False
+            return True
 

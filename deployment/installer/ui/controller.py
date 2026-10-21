@@ -322,7 +322,7 @@ class InstallerUIController:
             purge = (self.uninstall_mode == "purge")
             try:
                 paths = self.paths or InstallerPaths.create()
-                report = uninstall_chief(paths=paths, platform=self.platform, purge=purge)
+                report = uninstall_chief(paths=paths, platform=self.platform, purge=purge, confirmed=self.purge_confirmed)
                 self.uninstall_result = report
                 if not report.get("success", False):
                     failed = report.get("failed_items", [])

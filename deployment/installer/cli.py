@@ -66,6 +66,7 @@ def run_cli(argv: Optional[List[str]] = None, platform_adapter: Optional[Platfor
     parser.add_argument("--non-interactive", action="store_true", help="Fail if required fields are missing instead of prompting.")
     parser.add_argument("--uninstall", action="store_true", help="Uninstall Chief services, launchers, and configuration.")
     parser.add_argument("--purge", action="store_true", help="Full purge: completely remove Chief services, configuration, and archive directories.")
+    parser.add_argument("--confirm-purge", action="store_true", help="Explicit confirmation required to execute a full purge.")
 
     parser.add_argument('--dns-mode', choices=['quad9', 'system'], default='quad9',
                         help='Chief DNS: Quad9 Secure DoH (default) or System DNS. Host DNS is unchanged.')
@@ -77,9 +78,34 @@ def run_cli(argv: Optional[List[str]] = None, platform_adapter: Optional[Platfor
     # Handle uninstall / purge
     if args.uninstall or args.purge:
         from .orchestrator import uninstall_chief
+        confirmed = False
+        if args.purge:
+            if args.confirm_purge:
+                confirmed = True
+            elif args.non_interactive or not sys.stdin.isatty():
+                sys.stderr.write(
+                    "ERROR: Full purge permanently deletes all user databases, identity credentials, "
+                    "exported setup keys (~/Chief_Device_Setup), and backup archives. "
+                    "To proceed non-interactively, you must pass --confirm-purge.\n"
+                )
+                return 1
+            else:
+                sys.stdout.write(
+                    "\nWARNING: Full purge will permanently delete all farm databases, user accounts, "
+                    "identity credentials, exported setup keys (~/Chief_Device_Setup), TLS certificates, and backup archives.\n"
+                    "Type 'CONFIRM' to proceed: "
+                )
+                sys.stdout.flush()
+                answer = sys.stdin.readline().strip()
+                if answer == "CONFIRM":
+                    confirmed = True
+                else:
+                    sys.stderr.write("Purge cancelled by user.\n")
+                    return 1
+
         print("Starting Chief uninstallation" + (" (full purge)" if args.purge else "") + "...")
         try:
-            report = uninstall_chief(platform=adapter, purge=args.purge)
+            report = uninstall_chief(platform=adapter, purge=args.purge, confirmed=confirmed)
             if report.get("success"):
                 print("Chief uninstallation complete.")
                 print(f"Stopped services: {', '.join(report.get('stopped_services', []))}")

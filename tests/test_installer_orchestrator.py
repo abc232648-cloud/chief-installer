@@ -583,8 +583,14 @@ def test_orchestrator_full_purge(tmp_path):
     unrelated_file = unrelated_dir / "crop_data.csv"
     unrelated_file.write_text("corn,wheat,soy", encoding="utf-8")
 
+    import pytest
+    from deployment.installer.errors import InstallerError
     from deployment.installer.orchestrator import uninstall_chief
-    report = uninstall_chief(paths=paths, platform=platform, purge=True, logger=logger, service_stop_timeout=0.1)
+
+    with pytest.raises(InstallerError):
+        uninstall_chief(paths=paths, platform=platform, purge=True, confirmed=False, logger=logger, service_stop_timeout=0.1)
+
+    report = uninstall_chief(paths=paths, platform=platform, purge=True, confirmed=True, logger=logger, service_stop_timeout=0.1)
 
     assert report["success"] is True
     assert "chief-agent-dashboard.service" in report["stopped_services"]

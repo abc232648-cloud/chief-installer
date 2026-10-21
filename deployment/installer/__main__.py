@@ -126,6 +126,9 @@ def main() -> int:
                 from deployment.installer.ui.controller import ScreenId
             return launch_gui(start_screen=ScreenId.UNINSTALL_OPTIONS)
         except Exception as exc:
+            if not sys.stdin.isatty():
+                sys.stderr.write(f"ERROR: GUI uninstaller launch failed: {exc}\n")
+                return 1
             sys.stderr.write(f"GUI uninstall launch failed ({exc}), falling back to terminal uninstaller...\n")
             return run_cli(sys.argv[1:])
 
@@ -141,6 +144,9 @@ def main() -> int:
                 from deployment.installer.ui.app import launch_gui
             return launch_gui()
         except Exception as exc:
+            if not sys.stdin.isatty() or "--gui" in sys.argv:
+                sys.stderr.write(f"ERROR: GUI launch failed: {exc}\n")
+                return 1
             sys.stderr.write(f"GUI launch failed ({exc}), falling back to terminal setup...\n")
             return run_cli([])
     else:

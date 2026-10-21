@@ -404,10 +404,7 @@ def run_cleanup_local_discovery(canonical_host: str) -> int:
             for l in lines:
                 parts = l.strip().split()
                 if len(parts) >= 2 and parts[0] in ("127.0.0.1", "::1"):
-                    remaining_aliases = [
-                        p for p in parts[1:]
-                        if p != canonical_host and not (p.startswith("chief-") and p.endswith(".local")) and p != "chief.local"
-                    ]
+                    remaining_aliases = [p for p in parts[1:] if p != canonical_host]
                     if remaining_aliases:
                         new_lines.append(f"{parts[0]}\t{' '.join(remaining_aliases)}")
                 else:
@@ -427,14 +424,16 @@ def run_cleanup_local_discovery(canonical_host: str) -> int:
                     except OSError:
                         pass
         except Exception as exc:
-            sys.stderr.write(f"WARNING: Could not update /etc/hosts during cleanup: {exc}\n")
+            sys.stderr.write(f"ERROR: Could not update /etc/hosts during cleanup: {exc}\n")
+            return 1
 
     avahi_service = Path("/etc/avahi/services/chief.service")
     if avahi_service.exists():
         try:
             avahi_service.unlink()
         except Exception as exc:
-            sys.stderr.write(f"WARNING: Could not remove {avahi_service}: {exc}\n")
+            sys.stderr.write(f"ERROR: Could not remove {avahi_service}: {exc}\n")
+            return 1
 
     import shutil
     if shutil.which("systemctl"):

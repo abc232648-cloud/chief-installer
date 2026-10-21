@@ -1857,6 +1857,7 @@ def uninstall_chief(
     paths: Optional[InstallerPaths] = None,
     platform: Optional[PlatformAdapter] = None,
     purge: bool = False,
+    confirmed: bool = False,
     logger: Optional[InstallerLogger] = None,
     service_stop_timeout: float = 10.0,
 ) -> Dict[str, Any]:
@@ -1875,6 +1876,7 @@ def uninstall_chief(
     When purge=True (full removal):
     Completely removes Chief root, config directory, user databases, credentials,
     certificates, exported setup packages, and archive directories without retaining backups.
+    Requires confirmed=True before deleting user data.
 
     Fails closed if any Chief task or process remains active, or if any path cannot be removed.
     """
@@ -1883,7 +1885,12 @@ def uninstall_chief(
     p = paths or InstallerPaths.create()
     log = logger or InstallerLogger()
 
-    log.info("Starting Chief uninstallation", purge=purge)
+    if purge and not confirmed:
+        err_msg = "Full purge requires explicit confirmation before deleting user databases and credentials."
+        log.error(err_msg)
+        raise InstallerError(err_msg)
+
+    log.info("Starting Chief uninstallation", purge=purge, confirmed=confirmed)
     services = [
         "chief-agent-dashboard.service",
         "chief-agent-worker.service",
@@ -1984,16 +1991,16 @@ def uninstall_chief(
 
     # 5. Clean up local discovery / hostname dynamically
     canonical_host = discover_configured_canonical_host(p)
-    if hasattr(plat, "cleanup_local_discovery"):
-        hosts_to_clean = set()
-        if canonical_host:
-            hosts_to_clean.add(canonical_host)
-        hosts_to_clean.add("chief.local")
-        for h in hosts_to_clean:
-            try:
-                plat.cleanup_local_discovery(h)
-            except Exception as exc:
-                log.warning(f"Error cleaning up local discovery for {h}: {exc}")
+    if canonical_host and hasattr(plat, "cleanup_local_discovery"):
+        try:
+            res = plat.cleanup_local_discovery(canonical_host)
+            if res is False:
+                msg = f"Failed to clean up local discovery for {canonical_host}"
+                log.error(msg)
+                report["failed_items"].append(msg)
+        except Exception as exc:
+            log.warning(f"Error cleaning up local discovery for {canonical_host}: {exc}")
+            report["failed_items"].append(f"Failed to clean up local discovery for {canonical_host}: {exc}")
 
     # 6. Remove Chief files based on standard vs full purge mode
     runtime_paths_to_remove = [

@@ -399,7 +399,11 @@ def test_windows_uninstall_and_full_purge(tmp_path, monkeypatch):
     monkeypatch.setattr(adapter, "get_task_status", lambda s: None)
 
     from deployment.installer.orchestrator import uninstall_chief
-    report = uninstall_chief(paths=paths, platform=adapter, purge=True)
+    from deployment.installer.errors import InstallerError
+    with pytest.raises(InstallerError):
+        uninstall_chief(paths=paths, platform=adapter, purge=True, confirmed=False)
+
+    report = uninstall_chief(paths=paths, platform=adapter, purge=True, confirmed=True)
 
     assert report["success"] is True
     # Chief files must be gone
