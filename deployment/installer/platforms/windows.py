@@ -7,14 +7,17 @@ Supports Windows 10 and Windows 11 x64 systems using native Windows conventions:
 - Zero console window requirement (GUI-first)
 - Safe archive and partial recovery without destroying user repositories
 """
+import csv
 from datetime import datetime, timezone
 import getpass
+import io
 import json
 import os
 from pathlib import Path
 import platform as py_platform
 import re
 import shutil
+import socket
 import subprocess
 from ..process import run as run_quiet
 import sys
@@ -395,23 +398,113 @@ class WindowsPlatformAdapter(PlatformAdapter):
                 results[s] = False
         return results
 
-    def verify_service_active(self, service_name: str) -> bool:
-        """Query Task Scheduler to determine if a task is running."""
+    def get_task_status(self, service_name: str) -> Optional[str]:
+        """Query Task Scheduler for exact task status string (e.g. 'Running', 'Ready', 'Disabled')."""
         if not shutil.which("schtasks"):
-            return False
+            return None
 
         task = self._normalize_task_name(service_name)
         try:
             cmd = ["schtasks", "/query", "/tn", task, "/fo", "CSV", "/nh"]
             res = run_quiet(cmd, capture_output=True, text=True)
-            if res.returncode == 0:
-                output = res.stdout.strip()
-                # If Status is Running or Ready
-                if "Running" in output or "Ready" in output:
-                    return True
+            if res.returncode != 0:
+                return None
+            output = res.stdout.strip()
+            if not output:
+                return None
+            reader = csv.reader(io.StringIO(output))
+            for row in reader:
+                if row and len(row) >= 3:
+                    return row[2].strip()
         except Exception:
-            pass
+            return None
+        return None
+
+    def _is_port_listening(self, port: int, host: str = "127.0.0.1", timeout: float = 0.5) -> bool:
+        """Check if a TCP socket is listening on the specified port."""
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except (socket.error, OSError):
+            return False
+
+    def verify_service_active(self, service_name: str, timeout: float = 0.0) -> bool:
+        """Query Task Scheduler and listeners to determine if a task is actively running.
+
+        Never treats 'Ready' (idle/scheduled) or 'Disabled' as active.
+        """
+        if not shutil.which("schtasks"):
+            return False
+
+        task = self._normalize_task_name(service_name)
+        task_lower = task.lower()
+        deadline = time.monotonic() + max(0.0, timeout)
+
+        while True:
+            status = self.get_task_status(task)
+            if status and status.lower() == "running":
+                # For listener services, also verify that the network port is listening
+                if "proxy" in task_lower or "caddy" in task_lower or "tls" in task_lower:
+                    if self._is_port_listening(443):
+                        return True
+                    if time.monotonic() >= deadline:
+                        return False
+                elif "dashboard" in task_lower:
+                    if self._is_port_listening(8765):
+                        return True
+                    if time.monotonic() >= deadline:
+                        return False
+                else:
+                    return True
+            elif status and status.lower() in {"ready", "disabled"}:
+                # Explicitly not running
+                if time.monotonic() >= deadline:
+                    return False
+            else:
+                if time.monotonic() >= deadline:
+                    return False
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.2, remaining))
+
         return False
+
+    def unregister_service_units(self, unit_files: List[Any]) -> None:
+        """Unregister Task Scheduler tasks and delete definition XML files."""
+        if not shutil.which("schtasks"):
+            return
+        for unit in unit_files:
+            task_name = self._normalize_task_name(unit.stem if isinstance(unit, Path) else str(unit))
+            try:
+                run_quiet(["schtasks", "/end", "/tn", task_name], capture_output=True, text=True)
+            except Exception:
+                pass
+            try:
+                run_quiet(["schtasks", "/change", "/tn", task_name, "/disable"], capture_output=True, text=True)
+            except Exception:
+                pass
+            try:
+                run_quiet(["schtasks", "/delete", "/tn", task_name, "/f"], capture_output=True, text=True)
+            except Exception:
+                pass
+            if isinstance(unit, Path) and unit.exists():
+                try:
+                    unit.unlink()
+                except Exception:
+                    pass
+
+    def terminate_service_processes(self, service_names: List[str]) -> None:
+        """Terminate active processes associated with specified Chief tasks."""
+        if not shutil.which("schtasks"):
+            return
+        for s in service_names:
+            task = self._normalize_task_name(s)
+            try:
+                run_quiet(["schtasks", "/end", "/tn", task], capture_output=True, text=True)
+            except Exception:
+                pass
 
     def install_wireguard_system_config(self, source_conf: Path) -> None:
         raise UnsupportedPlatformError("WireGuard server hosting is only supported on Linux (Ubuntu systemd on Folio). WireGuard server cannot be hosted on Windows.")
@@ -497,3 +590,38 @@ class WindowsPlatformAdapter(PlatformAdapter):
 
         _make_shortcut(start_menu_dir / "Chief Console.lnk", "--console", "Chief On-Farm Operations Console")
         _make_shortcut(start_menu_dir / "Chief Installer.lnk", "--gui", "Install or Repair Chief Deployment")
+
+    def remove_console_launchers(self, paths: Any) -> List[str]:
+        """Remove Windows desktop and Start Menu shortcuts created by Chief."""
+        removed: List[str] = []
+        desktop_dir = Path(os.environ.get("USERPROFILE") or str(Path.home())) / "Desktop"
+        desktop_shortcut = desktop_dir / "Chief Console.lnk"
+        if desktop_shortcut.exists():
+            try:
+                desktop_shortcut.unlink()
+                removed.append(str(desktop_shortcut))
+            except Exception:
+                pass
+
+        start_menu_dir = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Chief"
+        for name in ("Chief Console.lnk", "Chief Installer.lnk"):
+            p = start_menu_dir / name
+            if p.exists():
+                try:
+                    p.unlink()
+                    removed.append(str(p))
+                except Exception:
+                    pass
+        if start_menu_dir.is_dir():
+            try:
+                if not any(start_menu_dir.iterdir()):
+                    start_menu_dir.rmdir()
+                    removed.append(str(start_menu_dir))
+            except Exception:
+                pass
+        return removed
+
+    def cleanup_local_discovery(self, public_host: str) -> None:
+        """Clean up local discovery on Windows (no-op)."""
+        pass
+

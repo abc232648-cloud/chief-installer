@@ -174,3 +174,258 @@ def test_windows_archive_existing_installation(tmp_path, monkeypatch):
     assert (target / "ARCHIVE_SUMMARY.txt").exists()
     # Original should be moved
     assert not (chief_local / "production").exists()
+
+
+def test_windows_caddy_storage_and_service_cmd(tmp_path):
+    """Verify explicit per-install Caddy storage location, service cmd script, and task XML."""
+    paths = InstallerPaths.create(custom_root=tmp_path / "chief", home=tmp_path)
+    options = InstallOptions(
+        owner_name="Caddy Storage Test",
+        owner_username="admin",
+        owner_password="Password123!",
+        tls_mode="LOCAL",
+    )
+    orchestrator = InstallerOrchestrator(
+        platform=WindowsPlatformAdapter(),
+        options=options,
+        manifest=ACCEPTED_FIRST_RELEASE_MANIFEST,
+        paths=paths,
+    )
+    caddyfile = orchestrator.generate_caddyfile("chief-test.local", "LOCAL")
+    expected_storage = str(paths.caddy_root / "data" / "caddy").replace("\\", "/")
+    assert f'storage file_system "{expected_storage}"' in caddyfile
+
+    # Service cmd script sets explicit environment variables
+    cmd_script = orchestrator.generate_caddy_service_cmd()
+    assert "setlocal" in cmd_script
+    assert f'set "CADDY_DATA_DIR={paths.caddy_root}\\data\\caddy"' in cmd_script
+    assert f'set "XDG_DATA_HOME={paths.caddy_root}\\data"' in cmd_script
+    assert f'set "CADDY_CONFIG_DIR={paths.caddy_root}\\config\\caddy"' in cmd_script
+    assert f'set "XDG_CONFIG_HOME={paths.caddy_root}\\config"' in cmd_script
+    assert "run --config" in cmd_script
+
+    # Task XML executes caddy_service.cmd
+    xml_str = orchestrator.generate_caddy_task_xml("TestUser")
+    root = ET.fromstring(xml_str)
+    exec_node = root.find(".//{http://schemas.microsoft.com/windows/2004/02/mit/task}Exec")
+    assert exec_node is not None
+    cmd_text = exec_node.find("{http://schemas.microsoft.com/windows/2004/02/mit/task}Command").text
+    assert "caddy_service.cmd" in cmd_text
+    assert "caddy" in cmd_text.lower()
+
+
+def test_windows_task_status_parsing(monkeypatch):
+    """Verify get_task_status correctly parses schtasks CSV output or returns None."""
+    adapter = WindowsPlatformAdapter()
+
+    class MockProc:
+        def __init__(self, code, out="", err=""):
+            self.returncode = code
+            self.stdout = out
+            self.stderr = err
+
+    # Running
+    monkeypatch.setattr(
+        "deployment.installer.platforms.windows.run_quiet",
+        lambda *args, **kwargs: MockProc(0, '"\\chief-agent-dashboard","N/A","Running"\n')
+    )
+    assert adapter.get_task_status("chief-agent-dashboard") == "Running"
+
+    # Ready
+    monkeypatch.setattr(
+        "deployment.installer.platforms.windows.run_quiet",
+        lambda *args, **kwargs: MockProc(0, '"\\chief-agent-dashboard","N/A","Ready"\n')
+    )
+    assert adapter.get_task_status("chief-agent-dashboard") == "Ready"
+
+    # Disabled
+    monkeypatch.setattr(
+        "deployment.installer.platforms.windows.run_quiet",
+        lambda *args, **kwargs: MockProc(0, '"\\chief-agent-dashboard","N/A","Disabled"\n')
+    )
+    assert adapter.get_task_status("chief-agent-dashboard") == "Disabled"
+
+    # Missing task
+    monkeypatch.setattr(
+        "deployment.installer.platforms.windows.run_quiet",
+        lambda *args, **kwargs: MockProc(1, "", "ERROR: The system cannot find the file specified.")
+    )
+    assert adapter.get_task_status("nonexistent-task") is None
+
+
+def test_windows_service_readiness_states(monkeypatch):
+    """Verify verify_service_active distinguishes Running from Ready, Disabled, and missing."""
+    adapter = WindowsPlatformAdapter()
+
+    class MockProc:
+        def __init__(self, code, out="", err=""):
+            self.returncode = code
+            self.stdout = out
+            self.stderr = err
+
+    # 1. Ready is NOT active
+    monkeypatch.setattr(
+        "deployment.installer.platforms.windows.run_quiet",
+        lambda *args, **kwargs: MockProc(0, '"\\chief-agent-worker","N/A","Ready"\n')
+    )
+    assert adapter.verify_service_active("chief-agent-worker") is False
+
+    # 2. Disabled is NOT active
+    monkeypatch.setattr(
+        "deployment.installer.platforms.windows.run_quiet",
+        lambda *args, **kwargs: MockProc(0, '"\\chief-agent-worker","N/A","Disabled"\n')
+    )
+    assert adapter.verify_service_active("chief-agent-worker") is False
+
+    # 3. Missing task is NOT active
+    monkeypatch.setattr(
+        "deployment.installer.platforms.windows.run_quiet",
+        lambda *args, **kwargs: MockProc(1, "", "ERROR: Not found")
+    )
+    assert adapter.verify_service_active("chief-agent-worker") is False
+
+    # 4. Running for non-listener task (worker) IS active
+    monkeypatch.setattr(
+        "deployment.installer.platforms.windows.run_quiet",
+        lambda *args, **kwargs: MockProc(0, '"\\chief-agent-worker","N/A","Running"\n')
+    )
+    assert adapter.verify_service_active("chief-agent-worker") is True
+
+    # 5. Running for dashboard listener requires port 8765
+    monkeypatch.setattr(
+        "deployment.installer.platforms.windows.run_quiet",
+        lambda *args, **kwargs: MockProc(0, '"\\chief-agent-dashboard","N/A","Running"\n')
+    )
+    # When port is listening
+    monkeypatch.setattr(adapter, "_is_port_listening", lambda port, **kw: port == 8765)
+    assert adapter.verify_service_active("chief-agent-dashboard") is True
+
+    # When port is not listening
+    monkeypatch.setattr(adapter, "_is_port_listening", lambda port, **kw: False)
+    assert adapter.verify_service_active("chief-agent-dashboard") is False
+
+
+def test_windows_task_unregistration(monkeypatch):
+    """Verify unregister_service_units invokes schtasks delete and removes files."""
+    adapter = WindowsPlatformAdapter()
+    calls = []
+
+    class MockProc:
+        def __init__(self, code):
+            self.returncode = code
+            self.stdout = ""
+            self.stderr = ""
+
+    def mock_run(cmd, **kwargs):
+        calls.append(cmd)
+        return MockProc(0)
+
+    monkeypatch.setattr("deployment.installer.platforms.windows.run_quiet", mock_run)
+
+    adapter.unregister_service_units([
+        Path("chief-agent-dashboard.xml"),
+        Path("chief-tls-proxy.xml"),
+    ])
+
+    cmd_strs = [" ".join(c) for c in calls]
+    assert any("schtasks /end /tn chief-agent-dashboard" in s for s in cmd_strs)
+    assert any("schtasks /delete /tn chief-agent-dashboard /f" in s for s in cmd_strs)
+    assert any("schtasks /end /tn chief-tls-proxy" in s for s in cmd_strs)
+    assert any("schtasks /delete /tn chief-tls-proxy /f" in s for s in cmd_strs)
+
+
+def test_windows_launcher_cleanup(tmp_path, monkeypatch):
+    """Verify remove_console_launchers removes shortcuts and empty directory."""
+    desktop = tmp_path / "Desktop"
+    desktop.mkdir(parents=True)
+    start_menu = tmp_path / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Chief"
+    start_menu.mkdir(parents=True)
+
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("APPDATA", str(tmp_path / "AppData" / "Roaming"))
+
+    # Create dummy shortcuts
+    (desktop / "Chief Console.lnk").write_text("dummy", encoding="utf-8")
+    (start_menu / "Chief Console.lnk").write_text("dummy", encoding="utf-8")
+    (start_menu / "Chief Installer.lnk").write_text("dummy", encoding="utf-8")
+
+    adapter = WindowsPlatformAdapter()
+    removed = adapter.remove_console_launchers(None)
+
+    assert not (desktop / "Chief Console.lnk").exists()
+    assert not (start_menu / "Chief Console.lnk").exists()
+    assert not (start_menu / "Chief Installer.lnk").exists()
+    assert not start_menu.exists()  # Empty folder should be removed
+    assert len(removed) >= 3
+
+
+def test_windows_uninstall_and_full_purge(tmp_path, monkeypatch):
+    """Verify uninstall_chief stops services, removes credentials, and leaves unrelated files untouched."""
+    local_app = tmp_path / "AppData" / "Local"
+    roaming_app = tmp_path / "AppData" / "Roaming"
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app))
+    monkeypatch.setenv("APPDATA", str(roaming_app))
+
+    paths = InstallerPaths.create(home=tmp_path)
+    adapter = WindowsPlatformAdapter()
+
+    # Create Chief files
+    paths.identity_config.parent.mkdir(parents=True, exist_ok=True)
+    paths.identity_config.write_text('{"owner": "admin"}', encoding="utf-8")
+    paths.config.write_text('{"db": "production"}', encoding="utf-8")
+    paths.caddyfile.write_text('localhost { respond "ok" }', encoding="utf-8")
+    (paths.production).mkdir(parents=True, exist_ok=True)
+    (paths.production / "chief.sqlite").write_text("db content", encoding="utf-8")
+    (paths.caddy_root / "data" / "caddy" / "pki" / "authorities" / "local").mkdir(parents=True, exist_ok=True)
+    (paths.caddy_root / "data" / "caddy" / "pki" / "authorities" / "local" / "root.crt").write_text("CA", encoding="utf-8")
+    (paths.archive_base / "Archive-1").mkdir(parents=True, exist_ok=True)
+    (paths.archive_base / "Archive-1" / "saved.txt").write_text("archive", encoding="utf-8")
+
+    # Create unrelated files
+    unrelated_doc = tmp_path / "Desktop" / "farm_tax_return.pdf"
+    unrelated_doc.parent.mkdir(parents=True, exist_ok=True)
+    unrelated_doc.write_text("Tax Return 2026", encoding="utf-8")
+
+    unrelated_proj = tmp_path / "projects" / "other_app" / "config.json"
+    unrelated_proj.parent.mkdir(parents=True, exist_ok=True)
+    unrelated_proj.write_text("{}", encoding="utf-8")
+
+    # Mock services as stopped
+    monkeypatch.setattr(adapter, "verify_service_active", lambda s: False)
+    monkeypatch.setattr(adapter, "get_task_status", lambda s: None)
+
+    from deployment.installer.orchestrator import uninstall_chief
+    report = uninstall_chief(paths=paths, platform=adapter, purge=True)
+
+    assert report["success"] is True
+    # Chief files must be gone
+    assert not paths.identity_config.exists()
+    assert not paths.config.exists()
+    assert not paths.caddyfile.exists()
+    assert not paths.production.exists()
+    assert not paths.caddy_root.exists()
+    assert not paths.archive_base.exists()
+
+    # Unrelated files must remain untouched
+    assert unrelated_doc.exists()
+    assert unrelated_doc.read_text(encoding="utf-8") == "Tax Return 2026"
+    assert unrelated_proj.exists()
+    assert unrelated_proj.read_text(encoding="utf-8") == "{}"
+
+
+def test_windows_uninstall_fails_if_service_cannot_be_stopped(tmp_path, monkeypatch):
+    """Verify uninstall_chief fails closed if a Chief service cannot be stopped."""
+    paths = InstallerPaths.create(home=tmp_path)
+    adapter = WindowsPlatformAdapter()
+
+    # Mock service as persistently active
+    monkeypatch.setattr(adapter, "verify_service_active", lambda s: s == "chief-tls-proxy.service")
+
+    from deployment.installer.errors import InstallerError
+    from deployment.installer.orchestrator import uninstall_chief
+
+    with pytest.raises(InstallerError) as exc_info:
+        uninstall_chief(paths=paths, platform=adapter, purge=False, service_stop_timeout=0.1)
+
+    assert "Chief service(s) failed to stop" in str(exc_info.value)
+

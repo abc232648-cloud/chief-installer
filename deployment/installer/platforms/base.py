@@ -142,3 +142,20 @@ class PlatformAdapter(ABC):
                 return resp.status == 200
         except Exception:
             return False
+
+    def unregister_service_units(self, unit_files: List[Path]) -> None:
+        """Unregister and remove installed service unit definitions."""
+        pass
+
+    def terminate_service_processes(self, service_names: List[str]) -> None:
+        """Terminate active processes associated with specified background services."""
+        pass
+
+    def remove_console_launchers(self, paths: Any) -> List[str]:
+        """Remove desktop launcher/shortcut files for Chief Console desktop application."""
+        return []
+
+    def cleanup_local_discovery(self, public_host: str) -> None:
+        """Remove configured local discovery, mDNS, or hosts file entries."""
+        pass
+

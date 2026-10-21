@@ -64,6 +64,8 @@ def run_cli(argv: Optional[List[str]] = None, platform_adapter: Optional[Platfor
     parser.add_argument("--tls-mode", choices=["LOCAL", "PUBLIC"], default="LOCAL", help="TLS mode.")
     parser.add_argument("--manifest", help="Path to release manifest JSON.")
     parser.add_argument("--non-interactive", action="store_true", help="Fail if required fields are missing instead of prompting.")
+    parser.add_argument("--uninstall", action="store_true", help="Uninstall Chief services, launchers, and configuration.")
+    parser.add_argument("--purge", action="store_true", help="Full purge: completely remove Chief services, configuration, and archive directories.")
 
     parser.add_argument('--dns-mode', choices=['quad9', 'system'], default='quad9',
                         help='Chief DNS: Quad9 Secure DoH (default) or System DNS. Host DNS is unchanged.')
@@ -71,6 +73,24 @@ def run_cli(argv: Optional[List[str]] = None, platform_adapter: Optional[Platfor
 
     # Resolve platform
     adapter = platform_adapter or get_default_platform_adapter()
+
+    # Handle uninstall / purge
+    if args.uninstall or args.purge:
+        from .orchestrator import uninstall_chief
+        print("Starting Chief uninstallation" + (" (full purge)" if args.purge else "") + "...")
+        try:
+            report = uninstall_chief(platform=adapter, purge=args.purge)
+            if report.get("success"):
+                print("Chief uninstallation complete.")
+                print(f"Stopped services: {', '.join(report.get('stopped_services', []))}")
+                print(f"Removed items: {len(report.get('removed_paths', []))} paths removed.")
+                return 0
+            else:
+                print(f"Uninstallation finished with warnings: {report.get('failed_items')}")
+                return 1
+        except Exception as exc:
+            sys.stderr.write(f"ERROR: Uninstallation failed: {exc}\n")
+            return 1
 
     # Resolve manifest
     if args.manifest:

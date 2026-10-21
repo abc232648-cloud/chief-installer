@@ -607,3 +607,61 @@ class LinuxPlatformAdapter(PlatformAdapter):
                 dt_installer.chmod(0o755)
             except OSError:
                 pass
+
+    def unregister_service_units(self, unit_files: List[Any]) -> None:
+        """Stop, disable, and unregister systemd user service units."""
+        names: List[str] = []
+        for unit in unit_files:
+            name = unit.name if isinstance(unit, Path) else str(unit)
+            if not name.endswith(".service"):
+                name = f"{name}.service"
+            names.append(name)
+            if isinstance(unit, Path) and unit.exists():
+                try:
+                    unit.unlink()
+                except Exception:
+                    pass
+
+        if shutil.which("systemctl") and names:
+            subprocess.run(["systemctl", "--user", "stop", *names], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["systemctl", "--user", "disable", *names], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["systemctl", "--user", "daemon-reload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["systemctl", "--user", "reset-failed"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def terminate_service_processes(self, service_names: List[str]) -> None:
+        """Terminate systemd user service processes."""
+        if shutil.which("systemctl"):
+            units = [s if s.endswith(".service") else f"{s}.service" for s in service_names]
+            subprocess.run(["systemctl", "--user", "stop", *units], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def remove_console_launchers(self, paths: Any) -> List[str]:
+        """Remove desktop launcher files for Chief Console and Chief Installer."""
+        removed: List[str] = []
+        home = Path.home()
+        for p in [
+            home / ".local" / "share" / "applications" / "chief-console.desktop",
+            home / ".local" / "share" / "applications" / "chief-installer.desktop",
+            home / "Desktop" / "chief-console.desktop",
+            home / "Desktop" / "chief-installer.desktop",
+        ]:
+            if p.exists():
+                try:
+                    p.unlink()
+                    removed.append(str(p))
+                except Exception:
+                    pass
+        return removed
+
+    def cleanup_local_discovery(self, public_host: str) -> None:
+        """Remove configured local discovery entries."""
+        try:
+            self._run_privileged(["remove-hosts-entry", public_host])
+        except Exception:
+            pass
+        avahi_service = Path("/etc/avahi/services/chief.service")
+        if avahi_service.exists():
+            try:
+                avahi_service.unlink()
+            except Exception:
+                pass
+

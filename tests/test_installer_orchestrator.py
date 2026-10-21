@@ -1,10 +1,10 @@
 """Tests for InstallerOrchestrator running against a fake platform adapter."""
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pytest
 
-from deployment.installer.errors import PreflightError
+from deployment.installer.errors import InstallerError, PreflightError
 from deployment.installer.events import EventBus
 from deployment.installer.logging import InstallerLogger
 from deployment.installer.manifest import ACCEPTED_FIRST_RELEASE_MANIFEST
@@ -113,7 +113,7 @@ class FakePlatformAdapter(PlatformAdapter):
 
     def verify_service_active(self, service_name: str) -> bool:
         self.calls.append(f"verify_service_active:{service_name}")
-        return True
+        return getattr(self, "services_active", True)
 
     def export_device_ca(
         self,
@@ -154,6 +154,19 @@ class FakePlatformAdapter(PlatformAdapter):
     def verify_wireguard_active(self) -> bool:
         self.calls.append("verify_wireguard_active")
         return getattr(self, "wireguard_active_result", True)
+
+    def unregister_service_units(self, unit_files: List[Any]) -> None:
+        self.calls.append("unregister_service_units")
+
+    def terminate_service_processes(self, service_names: List[str]) -> None:
+        self.calls.append("terminate_service_processes")
+
+    def remove_console_launchers(self, paths: Any) -> List[str]:
+        self.calls.append("remove_console_launchers")
+        return []
+
+    def cleanup_local_discovery(self, public_host: str) -> None:
+        self.calls.append(f"cleanup_local_discovery:{public_host}")
 
 
 
@@ -379,4 +392,212 @@ def test_step_browser_fails_closed_when_smoke_test_fails(tmp_path, monkeypatch):
 
     with pytest.raises(InstallerError, match="Chromium browser launch smoke test failed"):
         orchestrator._step_browser()
+
+
+def test_orchestrator_https_failure_diagnostics_sanitized(tmp_path, monkeypatch):
+    """Verify HTTPS verification failure captures route, status/error, CA path without leaking secrets."""
+    paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path / "home")
+    logger = InstallerLogger(log_dir=tmp_path / "logs", session_id="test_https_diag")
+    platform = FakePlatformAdapter()
+    options = InstallOptions(
+        owner_name="Test Owner",
+        owner_password="SuperSecretPassword!",
+        tls_mode="LOCAL",
+        allow_test_mock=True,
+    )
+    orchestrator = InstallerOrchestrator(
+        platform=platform,
+        options=options,
+        paths=paths,
+        logger=logger,
+    )
+    orchestrator._public_host = "test-host.local"
+
+    # Advance clock past deadline and skip sleeps
+    clock = [1000.0]
+    def fake_monotonic():
+        val = clock[0]
+        clock[0] += 10.0
+        return val
+    monkeypatch.setattr("time.monotonic", fake_monotonic)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    # In LOCAL mode, when root.crt does not exist, _verify_https_routes raises FileNotFoundError and includes CA path
+    with pytest.raises(InstallerError) as exc_info:
+        orchestrator._verify_https_routes()
+
+    err_text = str(exc_info.value)
+    assert "Trusted HTTPS route verification failed on route '/login'" in err_text
+    assert "https://test-host.local/login" in err_text
+    assert "Expected root CA:" in err_text
+    assert "root.crt" in err_text
+    assert "(exists: False)" in err_text
+    assert "SuperSecretPassword" not in err_text
+
+
+def test_orchestrator_failure_rollback_cleans_credentials_preserves_logs(tmp_path, monkeypatch):
+    """Verify rollback on failure stops/disables services, cleans credentials, and preserves diagnostic log."""
+    paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path / "home")
+    logger = InstallerLogger(log_dir=tmp_path / "logs", session_id="test_rollback")
+    platform = FakePlatformAdapter(preflight_passes=True, has_existing_install=False)
+    options = InstallOptions(
+        owner_name="Rollback Farm",
+        owner_username="admin",
+        owner_password="SecretPassword123!",
+        farm_operations="ENABLED",
+        organization_name="Acme Org",
+        farm_name="Main Farm",
+        allow_test_mock=True,
+    )
+
+    orchestrator = InstallerOrchestrator(
+        platform=platform,
+        options=options,
+        manifest=ACCEPTED_FIRST_RELEASE_MANIFEST,
+        paths=paths,
+        logger=logger,
+    )
+
+    # Inject failure at health check step
+    def failing_health_check():
+        # Start services and create files first
+        orchestrator._tracked_services_started = [
+            "chief-agent-dashboard.service", "chief-agent-worker.service",
+            "chief-agent-scheduler.service", "chief-tls-proxy.service"
+        ]
+        raise InstallerError("Simulated HTTPS readiness failure")
+
+    monkeypatch.setattr(orchestrator, "_step_health_check", failing_health_check)
+
+    result = orchestrator.execute_all()
+
+    assert result.status == "FAILED"
+    assert "Simulated HTTPS readiness failure" in result.error
+
+    # Verify rollback called stop and disable
+    assert "control_services:stop" in platform.calls
+    assert "control_services:disable" in platform.calls
+
+    # Verify partial credentials and configs are removed
+    assert not paths.identity_config.exists()
+    assert not paths.config.exists()
+
+    # Verify diagnostic log file is preserved!
+    assert Path(result.log_path).exists()
+    assert Path(result.log_path).stat().st_size > 0
+
+
+def test_orchestrator_cancellation_rollback_cleans_credentials(tmp_path, monkeypatch):
+    """Verify user cancellation triggers rollback and leaves no credentials behind."""
+    paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path / "home")
+    logger = InstallerLogger(log_dir=tmp_path / "logs", session_id="test_cancel_rollback")
+    platform = FakePlatformAdapter(preflight_passes=True, has_existing_install=False)
+    options = InstallOptions(
+        owner_name="Cancel Farm",
+        owner_username="admin",
+        owner_password="SecretPassword123!",
+        allow_test_mock=True,
+    )
+
+    orchestrator = InstallerOrchestrator(
+        platform=platform,
+        options=options,
+        manifest=ACCEPTED_FIRST_RELEASE_MANIFEST,
+        paths=paths,
+        logger=logger,
+    )
+
+    # Cancel right after identity step
+    original_step_identity = orchestrator._step_identity
+    def cancelling_identity():
+        original_step_identity()
+        assert paths.identity_config.exists()
+        orchestrator.cancel()
+
+    monkeypatch.setattr(orchestrator, "_step_identity", cancelling_identity)
+
+    result = orchestrator.execute_all()
+
+    assert result.status == "CANCELLED"
+    # Credentials must be cleaned up by rollback
+    assert not paths.identity_config.exists()
+    # Log must exist
+    assert Path(result.log_path).exists()
+
+
+def test_orchestrator_successful_install_preserves_services_and_files(tmp_path):
+    """Verify successful install preserves services and does not roll back."""
+    paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path / "home")
+    logger = InstallerLogger(log_dir=tmp_path / "logs", session_id="test_success_preserves")
+    platform = FakePlatformAdapter(preflight_passes=True, has_existing_install=False)
+    options = InstallOptions(
+        owner_name="Success Farm",
+        owner_username="admin",
+        owner_password="SecretPassword123!",
+        farm_operations="ENABLED",
+        organization_name="Acme Org",
+        farm_name="Main Farm",
+        allow_test_mock=True,
+    )
+
+    orchestrator = InstallerOrchestrator(
+        platform=platform,
+        options=options,
+        manifest=ACCEPTED_FIRST_RELEASE_MANIFEST,
+        paths=paths,
+        logger=logger,
+    )
+
+    result = orchestrator.execute_all()
+
+    assert result.status == "SUCCESS"
+    # Rollback must NOT have been called
+    assert "unregister_service_units" not in platform.calls
+    # Services were enabled and started
+    assert "control_services:start" in platform.calls
+    # Files remain intact
+    assert paths.identity_config.exists()
+    assert paths.config.exists()
+
+
+def test_orchestrator_full_purge(tmp_path):
+    """Verify uninstall_chief with purge=True cleans all Chief paths while preserving unrelated files."""
+    paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path / "home")
+    logger = InstallerLogger(log_dir=tmp_path / "logs", session_id="test_purge")
+    platform = FakePlatformAdapter()
+    platform.services_active = False
+
+    # Create dummy Chief files
+    paths.identity_config.parent.mkdir(parents=True, exist_ok=True)
+    paths.identity_config.write_text('{"owner": "admin"}', encoding="utf-8")
+    paths.config.write_text('{"db": "production"}', encoding="utf-8")
+    paths.caddyfile.write_text('localhost { respond "ok" }', encoding="utf-8")
+    paths.production.mkdir(parents=True, exist_ok=True)
+    (paths.production / "chief.sqlite").write_text("database content", encoding="utf-8")
+    paths.archive_base.mkdir(parents=True, exist_ok=True)
+    (paths.archive_base / "old_backup.tar.gz").write_text("backup content", encoding="utf-8")
+
+    # Create unrelated files
+    unrelated_dir = tmp_path / "unrelated_user_dir"
+    unrelated_dir.mkdir(parents=True, exist_ok=True)
+    unrelated_file = unrelated_dir / "crop_data.csv"
+    unrelated_file.write_text("corn,wheat,soy", encoding="utf-8")
+
+    from deployment.installer.orchestrator import uninstall_chief
+    report = uninstall_chief(paths=paths, platform=platform, purge=True, logger=logger, service_stop_timeout=0.1)
+
+    assert report["success"] is True
+    assert "chief-agent-dashboard.service" in report["stopped_services"]
+
+    # Chief files must be removed
+    assert not paths.identity_config.exists()
+    assert not paths.config.exists()
+    assert not paths.caddyfile.exists()
+    assert not paths.production.exists()
+    assert not paths.archive_base.exists()
+
+    # Unrelated files must be preserved!
+    assert unrelated_file.exists()
+    assert unrelated_file.read_text(encoding="utf-8") == "corn,wheat,soy"
+
 
