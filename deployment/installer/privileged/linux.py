@@ -27,6 +27,8 @@ _ALLOWED_PACKAGES = {
     "wireguard",
     "wireguard-tools",
     "iptables",
+    "chromium",
+    "chromium-browser",
 }
 
 _USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
@@ -112,7 +114,8 @@ def _update_hosts_file(hosts_path: Path, canonical_host: str) -> None:
                 except OSError:
                     pass
     except Exception as exc:
-        sys.stderr.write(f"WARNING: Could not update hosts file {hosts_path}: {exc}\n")
+        sys.stderr.write(f"ERROR: Could not update hosts file {hosts_path}: {exc}\n")
+        raise OSError(f"Failed to update hosts file {hosts_path}: {exc}") from exc
 
 
 def _update_nsswitch_file(nss_path: Path) -> None:
@@ -215,7 +218,11 @@ def run_configure_avahi(
 
     # Update loopback hosts mapping so local getent / socket resolution works without relying on mDNS multicast
     hosts_path = hosts_path_override or Path("/etc/hosts")
-    _update_hosts_file(hosts_path, f"{label}.local")
+    try:
+        _update_hosts_file(hosts_path, f"{label}.local")
+    except Exception as exc:
+        sys.stderr.write(f"ERROR: Failed to update hosts file {hosts_path}: {exc}\n")
+        return 1
 
     # Update nsswitch.conf so libnss-mdns is active if installed
     nss_path = nsswitch_path_override or Path("/etc/nsswitch.conf")

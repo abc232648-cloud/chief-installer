@@ -30,6 +30,7 @@ class ConsoleState(Enum):
     TLS_UNTRUSTED = "TLS_UNTRUSTED"
     SETUP_REQUIRED = "SETUP_REQUIRED"
     ENDPOINT_UNAVAILABLE = "ENDPOINT_UNAVAILABLE"
+    NO_RUNNER = "NO_RUNNER"
 
 
 @dataclass
@@ -47,8 +48,22 @@ class ConsoleDiagnostic:
     remediation: str
 
 
-def find_desktop_runner() -> Optional[str]:
+def find_desktop_runner(paths: Optional[InstallerPaths] = None) -> Optional[str]:
     """Discover a maintained desktop application runner supporting dedicated window mode (--app)."""
+    # 1. Check browser runtime provisioned by Chief Installer if present
+    resolved_paths = paths or InstallerPaths.create()
+    if resolved_paths.browser_config.exists():
+        try:
+            browser_info = json.loads(resolved_paths.browser_config.read_text(encoding="utf-8"))
+            exe_str = browser_info.get("executable")
+            if exe_str:
+                exe_path = Path(exe_str)
+                if exe_path.is_file() and os.access(exe_path, os.X_OK):
+                    return str(exe_path)
+        except Exception:
+            pass
+
+    # 2. Check platform-specific maintained runners
     if os.name == "nt":
         candidates = [
             Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
@@ -65,7 +80,7 @@ def find_desktop_runner() -> Optional[str]:
             if w:
                 return w
     else:
-        for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable"):
+        for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "microsoft-edge", "msedge", "brave-browser"):
             w = shutil.which(name)
             if w:
                 return w
@@ -73,6 +88,8 @@ def find_desktop_runner() -> Optional[str]:
             Path("/usr/bin/chromium"),
             Path("/usr/bin/chromium-browser"),
             Path("/usr/bin/google-chrome"),
+            Path("/usr/bin/google-chrome-stable"),
+            Path("/usr/bin/microsoft-edge"),
             Path("/snap/bin/chromium"),
         ]
         for p in fallback_paths:
@@ -149,20 +166,25 @@ def probe_local_console(paths: Optional[InstallerPaths] = None) -> ConsoleDiagno
             local_ca = resolved_paths.caddy_root / "data" / "caddy" / "pki" / "authorities" / "local" / "root.crt"
             if local_ca.exists():
                 ca_file = str(local_ca)
+            else:
+                cert_error = "Local Caddy root CA certificate file not found."
 
-        try:
-            ctx = ssl.create_default_context(cafile=ca_file)
-            raw_sock = socket.create_connection(("127.0.0.1", 443), timeout=2.0)
-            with ctx.wrap_socket(raw_sock, server_hostname=public_host) as ssock:
-                cert = ssock.getpeercert()
-                if cert:
-                    cert_valid = True
-        except ssl.SSLCertVerificationError as exc:
+        if tls_mode == "LOCAL" and not ca_file:
             cert_valid = False
-            cert_error = f"Certificate verification error: {exc}"
-        except Exception as exc:
-            cert_valid = False
-            cert_error = f"TLS handshake error: {exc}"
+        else:
+            try:
+                ctx = ssl.create_default_context(cafile=ca_file)
+                raw_sock = socket.create_connection(("127.0.0.1", 443), timeout=2.0)
+                with ctx.wrap_socket(raw_sock, server_hostname=public_host) as ssock:
+                    cert = ssock.getpeercert()
+                    if cert:
+                        cert_valid = True
+            except ssl.SSLCertVerificationError as exc:
+                cert_valid = False
+                cert_error = f"Certificate verification error: {exc}"
+            except Exception as exc:
+                cert_valid = False
+                cert_error = f"TLS handshake error: {exc}"
 
     # Analyze overall health
     if not backend_active and not tls_proxy_active:
@@ -207,7 +229,13 @@ def probe_local_console(paths: Optional[InstallerPaths] = None) -> ConsoleDiagno
             remediation="Ensure chief-tls-proxy.service is running and Caddy has permission to bind port 443.",
         )
 
-    if not cert_valid and tls_mode == "LOCAL":
+    if not cert_valid:
+        # Fail closed for EVERY TLS mode: never report HEALTHY when certificate check failed
+        remediation = (
+            "Ensure the local Caddy root CA certificate is installed into the system trust store."
+            if tls_mode == "LOCAL"
+            else f"Verify public TLS certificate chain and hostname for {public_host}."
+        )
         return ConsoleDiagnostic(
             state=ConsoleState.TLS_UNTRUSTED,
             public_host=public_host,
@@ -217,8 +245,23 @@ def probe_local_console(paths: Optional[InstallerPaths] = None) -> ConsoleDiagno
             backend_active=backend_active,
             tls_proxy_active=tls_proxy_active,
             cert_valid=False,
-            message=f"Local HTTPS certificate is not trusted ({cert_error or 'unverified certificate authority'}).",
-            remediation="Ensure the local Caddy root CA certificate is installed into the system trust store.",
+            message=f"HTTPS certificate validation failed ({cert_error or 'unverified certificate'}).",
+            remediation=remediation,
+        )
+
+    runner = find_desktop_runner(resolved_paths)
+    if not runner:
+        return ConsoleDiagnostic(
+            state=ConsoleState.NO_RUNNER,
+            public_host=public_host,
+            dashboard_port=dashboard_port,
+            tls_mode=tls_mode,
+            console_url=console_url,
+            backend_active=backend_active,
+            tls_proxy_active=tls_proxy_active,
+            cert_valid=cert_valid,
+            message="No supported desktop application runner found (Chromium, Edge, or Chrome).",
+            remediation="Install Chromium ('sudo apt install chromium-browser') or run Chief Installer to provision the browser runtime.",
         )
 
     return ConsoleDiagnostic(
@@ -229,7 +272,7 @@ def probe_local_console(paths: Optional[InstallerPaths] = None) -> ConsoleDiagno
         console_url=console_url,
         backend_active=True,
         tls_proxy_active=True,
-        cert_valid=cert_valid,
+        cert_valid=True,
         message="Chief on-farm services are active and verified over local loopback.",
         remediation="",
     )
@@ -252,7 +295,7 @@ def build_app_mode_command(runner: str, console_url: str, public_host: str, prof
 
 def launch_console_window(diagnostic: ConsoleDiagnostic, paths: InstallerPaths) -> bool:
     """Launch the Chief Console in a dedicated application window."""
-    runner = find_desktop_runner()
+    runner = find_desktop_runner(paths)
     if not runner:
         return False
 
@@ -261,12 +304,19 @@ def launch_console_window(diagnostic: ConsoleDiagnostic, paths: InstallerPaths) 
 
     cmd = build_app_mode_command(runner, diagnostic.console_url, diagnostic.public_host, profile_dir)
     try:
-        subprocess.Popen(
+        proc = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True if os.name != "nt" else False,
         )
+        # Verify process started and did not fail immediately
+        try:
+            res = proc.wait(timeout=0.3)
+            if res != 0:
+                return False
+        except subprocess.TimeoutExpired:
+            pass  # Process is running normally
         return True
     except Exception:
         return False
@@ -440,8 +490,10 @@ def console_smoke_test() -> int:
     diagnostic = probe_local_console(paths)
     assert diagnostic.public_host != ""
     assert diagnostic.console_url.startswith("https://")
-    runner = find_desktop_runner()
-    cmd = build_app_mode_command(runner or "dummy-browser", diagnostic.console_url, diagnostic.public_host, paths.state_root / "console_profile")
+    runner = find_desktop_runner(paths)
+    if not runner:
+        raise RuntimeError("Chief Console smoke test failed: no supported desktop application runner found. Please install Chromium, Google Chrome, or Microsoft Edge.")
+    cmd = build_app_mode_command(runner, diagnostic.console_url, diagnostic.public_host, paths.state_root / "console_profile")
     assert "--app=" in cmd[1]
     assert "--host-resolver-rules=" in cmd[3]
     assert "--class=ChiefConsole" in cmd[5]

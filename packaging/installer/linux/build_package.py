@@ -52,6 +52,7 @@ def build_desktop_package(executable: Path) -> Path:
             "Package: chief-installer\nVersion: 0.1.1\nArchitecture: amd64\n"
             "Maintainer: Chief Installer maintainers\nSection: admin\nPriority: optional\n"
             f"Depends: libc6 (>= {platform.libc_ver()[1]}), libx11-6, libxext6, libxrender1, libxft2, libfontconfig1\n"
+            "Recommends: chromium | chromium-browser\n"
             "Description: Chief graphical setup application\n"
             " Opens the Chief setup wizard. Installing this package does not deploy Chief.\n",
             encoding="utf-8")
