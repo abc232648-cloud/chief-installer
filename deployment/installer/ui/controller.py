@@ -130,8 +130,9 @@ class InstallerUIController:
             if callback:
                 callback(report)
 
-        t = threading.Thread(target=worker, daemon=True)
+        t = threading.Thread(target=worker, daemon=False)
         t.start()
+        return t
 
     def next_from_preflight(self) -> None:
         if not self.preflight_report or not self.preflight_report.passed:
@@ -243,8 +244,9 @@ class InstallerUIController:
                 )
                 self.set_screen(ScreenId.FAILURE)
 
-        t = threading.Thread(target=worker, daemon=True)
+        t = threading.Thread(target=worker, daemon=False)
         t.start()
+        return t
 
     def cancel_installation(self) -> None:
         if self._active_orchestrator:
@@ -309,7 +311,7 @@ class InstallerUIController:
     def set_purge_confirmed(self, confirmed: bool) -> None:
         self.purge_confirmed = bool(confirmed)
 
-    def execute_uninstall(self, callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> None:
+    def execute_uninstall(self, callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> threading.Thread:
         """Run uninstallation or purge asynchronously."""
         if self.uninstall_mode == "purge" and not self.purge_confirmed:
             raise ValueError("Confirmation is required before full removal of user data and credentials.")
@@ -343,6 +345,7 @@ class InstallerUIController:
             if callback and self.uninstall_result:
                 callback(self.uninstall_result)
 
-        t = threading.Thread(target=worker, daemon=True)
+        t = threading.Thread(target=worker, daemon=False)
         t.start()
+        return t
 

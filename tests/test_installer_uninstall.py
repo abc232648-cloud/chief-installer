@@ -449,55 +449,88 @@ def test_packaged_gui_uninstall_modes_and_terminal_fallback_protection(tmp_path,
     paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path)
     adapter = MockPlatformAdapter()
 
-    # 1. GUI App construction and screen rendering
-    app = InstallerApp(platform_adapter=adapter)
-    app.controller.paths = paths
+    has_display = True
+    if sys.platform != "win32" and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        has_display = False
 
-    try:
-        # Start at uninstall screen
-        app.controller.start_uninstall()
-        app._render_screen(app.controller.current_screen)
-        app.update()
-        assert app.controller.current_screen == ScreenId.UNINSTALL_OPTIONS
+    if has_display:
+        # 1. GUI App construction and screen rendering
+        app = InstallerApp(platform_adapter=adapter)
+        app.controller.paths = paths
 
-        # 2. Mode toggling & unconfirmed purge rejection
-        app._on_uninstall_mode_changed("purge", confirmed=False)
-        app.update()
-        assert str(app.uninstall_submit_btn.cget("state")) == "disabled"
+        try:
+            # Start at uninstall screen
+            app.controller.start_uninstall()
+            app._render_screen(app.controller.current_screen)
+            app.update()
+            assert app.controller.current_screen == ScreenId.UNINSTALL_OPTIONS
 
-        # Toggle checkbox
-        app._on_uninstall_confirm_toggled("purge", confirmed=True)
-        app.update()
-        assert str(app.uninstall_submit_btn.cget("state")) in ("normal", "active")
+            # 2. Mode toggling & unconfirmed purge rejection
+            app._on_uninstall_mode_changed("purge", confirmed=False)
+            app.update()
+            assert str(app.uninstall_submit_btn.cget("state")) == "disabled"
 
-        # 3. Execution of full purge
-        done = threading.Event()
-        app.controller.execute_uninstall(callback=lambda res: done.set())
-        done.wait(timeout=5.0)
-        app._render_screen(app.controller.current_screen)
-        app.update()
-        assert app.controller.current_screen == ScreenId.UNINSTALL_RESULT
-        assert app.controller.uninstall_result["success"] is True
-        assert app.controller.uninstall_result["purge"] is True
+            # Toggle checkbox
+            app._on_uninstall_confirm_toggled("purge", confirmed=True)
+            app.update()
+            assert str(app.uninstall_submit_btn.cget("state")) in ("normal", "active")
 
-        # 4. Failure scenario
+            # 3. Execution of full purge
+            t1 = app.controller.execute_uninstall()
+            t1.join(timeout=5.0)
+            app._render_screen(app.controller.current_screen)
+            app.update()
+            assert app.controller.current_screen == ScreenId.UNINSTALL_RESULT
+            assert app.controller.uninstall_result["success"] is True
+            assert app.controller.uninstall_result["purge"] is True
+
+            # 4. Failure scenario
+            adapter.cleanup_discovery_fails = True
+            paths.identity_config.parent.mkdir(parents=True, exist_ok=True)
+            paths.identity_config.write_text(json.dumps({"public_host": "chief-fail.local"}), encoding="utf-8")
+
+            app.controller.start_uninstall()
+            app._render_screen(app.controller.current_screen)
+            app.update()
+            t2 = app.controller.execute_uninstall()
+            t2.join(timeout=5.0)
+            app._render_screen(app.controller.current_screen)
+            app.update()
+            assert app.controller.current_screen == ScreenId.UNINSTALL_RESULT
+            assert app.controller.uninstall_result["success"] is False
+            assert "chief-fail.local" in app.controller.uninstall_error
+        finally:
+            app.destroy()
+    else:
+        # Headless controller flow verification
+        controller = InstallerUIController(platform_adapter=adapter, paths=paths)
+        controller.start_uninstall()
+        assert controller.current_screen == ScreenId.UNINSTALL_OPTIONS
+
+        # Mode selection and purge confirmation rejection
+        controller.set_uninstall_mode("purge")
+        controller.set_purge_confirmed(False)
+        with pytest.raises(ValueError):
+            controller.execute_uninstall()
+
+        # Confirmed purge execution
+        controller.set_purge_confirmed(True)
+        t1 = controller.execute_uninstall()
+        t1.join(timeout=5.0)
+        assert controller.current_screen == ScreenId.UNINSTALL_RESULT
+        assert controller.uninstall_result["success"] is True
+        assert controller.uninstall_result["purge"] is True
+
+        # Failure scenario
         adapter.cleanup_discovery_fails = True
         paths.identity_config.parent.mkdir(parents=True, exist_ok=True)
         paths.identity_config.write_text(json.dumps({"public_host": "chief-fail.local"}), encoding="utf-8")
-
-        done2 = threading.Event()
-        app.controller.start_uninstall()
-        app._render_screen(app.controller.current_screen)
-        app.update()
-        app.controller.execute_uninstall(callback=lambda res: done2.set())
-        done2.wait(timeout=5.0)
-        app._render_screen(app.controller.current_screen)
-        app.update()
-        assert app.controller.current_screen == ScreenId.UNINSTALL_RESULT
-        assert app.controller.uninstall_result["success"] is False
-        assert "chief-fail.local" in app.controller.uninstall_error
-    finally:
-        app.destroy()
+        controller.start_uninstall()
+        t2 = controller.execute_uninstall()
+        t2.join(timeout=5.0)
+        assert controller.current_screen == ScreenId.UNINSTALL_RESULT
+        assert controller.uninstall_result["success"] is False
+        assert "chief-fail.local" in controller.uninstall_error
 
     # 5. Verify that GUI launch failures NEVER fall back to interactive terminal on desktop
     from deployment.installer.__main__ import main as installer_main
