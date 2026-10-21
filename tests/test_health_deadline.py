@@ -231,6 +231,8 @@ def test_loopback_https_connection_uses_loopback_socket_and_hostname_sni(monkeyp
         return raw_socket
 
     class Context:
+        verify_mode = orchestrator_module.ssl.CERT_REQUIRED
+        check_hostname = True
         def wrap_socket(self, sock, *, server_hostname):
             calls["raw_socket"] = sock
             calls["server_hostname"] = server_hostname
