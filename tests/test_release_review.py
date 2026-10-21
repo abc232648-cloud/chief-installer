@@ -30,6 +30,7 @@ def test_incompatible_client_engine_stops_before_build(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, '_is_test_fixture', lambda: False)
     monkeypatch.setattr(runner, '_acquire_node_runtime', lambda: (tmp_path/'node', tmp_path/'npm'))
     monkeypatch.setattr(runner, '_acquire_repository', lambda **kwargs: None)
+    monkeypatch.setattr(runner, '_verify_pwa_install_inputs', lambda *args: None)
     for step in ORDERED_INSTALL_STEPS:
         if step == StepId.PWA_BUILDS:
             break

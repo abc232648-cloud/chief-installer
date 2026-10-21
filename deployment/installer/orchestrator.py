@@ -365,26 +365,44 @@ class InstallerOrchestrator:
                     local_override = cand
 
         clone_source = str(local_override) if local_override else repo_url
+        preserved_dir: Optional[Path] = None
+        if target_dir.exists() and any(target_dir.iterdir()) and not git_dir.exists():
+            # A previous interrupted clone or pre-existing unmanaged directory can
+            # otherwise fall through to npm ci with no lockfile. Preserve it beside
+            # the staging path, then acquire the exact pinned checkout from scratch.
+            preserved_dir = target_dir.with_name(
+                f"{target_dir.name}.preserved-{time.time_ns()}"
+            )
+            target_dir.rename(preserved_dir)
+            self.logger.warning(
+                f"Preserved non-Git {component} staging at {preserved_dir}; "
+                "recreating the pinned checkout."
+            )
 
-        if not target_dir.exists() or not any(target_dir.iterdir()):
-            target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-            self.logger.info(f"Cloning {component} from {clone_source} at commit {commit}")
-            res = run_quiet(
-                ["git", "clone", clone_source, str(target_dir)],
-                capture_output=True,
-                text=True,
-            )
-            if res.returncode != 0:
-                raise InstallerError(f"Failed to clone {component} from {clone_source}: {res.stderr.strip()}")
-            res = run_quiet(
-                ["git", "-C", str(target_dir), "checkout", commit],
-                capture_output=True,
-                text=True,
-            )
-            if res.returncode != 0:
-                raise InstallerError(f"Failed to checkout {component} commit {commit}: {res.stderr.strip()}")
-        else:
-            if git_dir.exists():
+        try:
+            if not target_dir.exists() or not any(target_dir.iterdir()):
+                target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                self.logger.info(f"Cloning {component} from {clone_source} at commit {commit}")
+                res = run_quiet(
+                    ["git", "clone", clone_source, str(target_dir)],
+                    capture_output=True,
+                    text=True,
+                )
+                if res.returncode != 0:
+                    raise InstallerError(f"Failed to clone {component} from {clone_source}: {res.stderr.strip()}")
+                res = run_quiet(
+                    ["git", "-C", str(target_dir), "checkout", commit],
+                    capture_output=True,
+                    text=True,
+                )
+                if res.returncode != 0:
+                    raise InstallerError(f"Failed to checkout {component} commit {commit}: {res.stderr.strip()}")
+            else:
+                if not git_dir.exists():
+                    raise InstallerError(
+                        f"Cannot verify {component} staging at {target_dir}: "
+                        "the directory is not a Git checkout."
+                    )
                 status = run_quiet(
                     ["git", "-C", str(target_dir), "status", "--porcelain"],
                     capture_output=True, text=True,
@@ -422,14 +440,59 @@ class InstallerOrchestrator:
                         if res2.returncode != 0:
                             raise InstallerError(f"Failed to checkout {component} commit {commit}: {res2.stderr.strip()}")
 
-        if git_dir.exists():
+            if not git_dir.exists():
+                raise InstallerError(f"Acquired {component} at {target_dir} is not a Git checkout.")
             res = run_quiet(
                 ["git", "-C", str(target_dir), "rev-parse", "HEAD"],
                 capture_output=True,
                 text=True,
             )
-            if res.returncode == 0:
-                self.manifest.verify_component_commit(component, res.stdout.strip())
+            if res.returncode != 0:
+                raise InstallerError(f"Could not verify acquired {component} commit at {target_dir}.")
+            self.manifest.verify_component_commit(component, res.stdout.strip())
+        except Exception:
+            if preserved_dir and preserved_dir.exists():
+                if target_dir.exists():
+                    failed_dir = target_dir.with_name(
+                        f"{target_dir.name}.failed-{time.time_ns()}"
+                    )
+                    target_dir.rename(failed_dir)
+                preserved_dir.rename(target_dir)
+            raise
+
+    @staticmethod
+    def _verify_pwa_install_inputs(app_dir: Path, name: str) -> None:
+        """Fail clearly before npm ci when a pinned PWA checkout is incomplete."""
+        package_json = app_dir / "package.json"
+        lockfile = next(
+            (candidate for candidate in (app_dir / "npm-shrinkwrap.json", app_dir / "package-lock.json") if candidate.is_file()),
+            None,
+        )
+        if not package_json.is_file() or lockfile is None:
+            missing = []
+            if not package_json.is_file():
+                missing.append("package.json")
+            if lockfile is None:
+                missing.append("package-lock.json or npm-shrinkwrap.json")
+            raise InstallerError(
+                f"Pinned {name} PWA checkout at {app_dir} is incomplete; missing "
+                f"{', '.join(missing)}. Refusing to run npm ci."
+            )
+        try:
+            package_data = json.loads(package_json.read_text(encoding="utf-8"))
+            lock_data = json.loads(lockfile.read_text(encoding="utf-8"))
+            if not isinstance(package_data, dict) or not isinstance(lock_data, dict):
+                raise ValueError("package metadata must be JSON objects")
+            lock_version = int(lock_data.get("lockfileVersion", 0))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise InstallerError(
+                f"Pinned {name} PWA package metadata or lockfile at {app_dir} is unreadable or invalid; "
+                "refusing to run npm ci."
+            ) from exc
+        if lock_version < 1:
+            raise InstallerError(
+                f"Pinned {name} PWA lockfile at {lockfile} has no supported lockfileVersion; refusing to run npm ci."
+            )
 
     def _acquire_node_runtime(self) -> Tuple[Path, Path]:
         """Verify or acquire pinned Node.js runtime and npm binary."""
@@ -960,6 +1023,7 @@ class InstallerOrchestrator:
                 repo_url = getattr(self.manifest, f"{comp}_repo", default_repo)
                 commit = getattr(self.manifest, f"{comp}_commit")
                 self._acquire_repository(target_dir=app_dir, repo_url=repo_url, commit=commit, component=comp)
+                self._verify_pwa_install_inputs(app_dir, name)
 
                 self.logger.info(f"Building {name} PWA with npm...")
                 npm_env = os.environ.copy()
