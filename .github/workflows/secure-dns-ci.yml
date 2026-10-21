@@ -1,0 +1,41 @@
+name: Chief Installer scoped DNS review
+
+on:
+  push:
+    branches: ['security/chief-scoped-dns']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dns-installer:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: Checkout chief-installer DNS review branch
+        uses: actions/checkout@v4
+
+      - name: Checkout exact chief-agent DNS review commit
+        run: |
+          git clone https://github.com/abc232648-cloud/chief-agent.git ../chief-agent
+          git -C ../chief-agent checkout 86862585ab8be5b8ce620cf9bfa39e4d5d056205
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install argon2-cffi cryptography
+
+      - name: Run full installer suite
+        run: pytest -v

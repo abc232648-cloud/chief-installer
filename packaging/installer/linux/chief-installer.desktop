@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Chief Installer
+GenericName=Chief Installation Setup
+Comment=Install Chief with local discovery and TLS
+Exec=/opt/chief-installer/chief-installer --gui
+Icon=system-software-install
+Terminal=false
+StartupNotify=true
+Categories=System;Setup;
