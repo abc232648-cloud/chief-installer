@@ -319,9 +319,12 @@ def test_cleanup_local_discovery_preserves_unrelated_hosts_and_legacy_chief_loca
     hosts_file.write_text(initial_hosts, encoding="utf-8")
 
     monkeypatch.setattr("deployment.installer.privileged.linux.Path", lambda p: hosts_file if p == "/etc/hosts" else Path(p))
+    mock_run = lambda *args, **kwargs: subprocess.CompletedProcess(args=args[0] if args else [], returncode=0, stdout="", stderr="")
+    monkeypatch.setattr("subprocess.run", mock_run)
+    monkeypatch.setattr("deployment.installer.privileged.linux.subprocess.run", mock_run)
 
     # Clean up ONLY the confirmed canonical host for this installation
-    ret = run_cleanup_local_discovery("chief-my-farm.local")
+    ret = run_cleanup_local_discovery("chief-my-farm.local", hosts_path_override=hosts_file)
     assert ret == 0
 
     resulting_hosts = hosts_file.read_text(encoding="utf-8")
