@@ -165,6 +165,10 @@ def test_windows_archive_existing_installation(tmp_path, monkeypatch):
     (chief_local / "production" / "chief.sqlite").write_text("data", encoding="utf-8")
 
     adapter = WindowsPlatformAdapter()
+    monkeypatch.setattr(
+        "deployment.installer.platforms.windows.run_quiet",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args=args[0] if args else [], returncode=0, stdout="", stderr=""),
+    )
     has_existing, candidates = adapter.detect_existing_installation()
     assert has_existing is True
 
@@ -397,6 +401,10 @@ def test_windows_uninstall_and_full_purge(tmp_path, monkeypatch):
     # Mock services as stopped
     monkeypatch.setattr(adapter, "verify_service_active", lambda s: False)
     monkeypatch.setattr(adapter, "get_task_status", lambda s: None)
+    monkeypatch.setattr(
+        "deployment.installer.platforms.windows.run_quiet",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args=args[0] if args else [], returncode=0, stdout="", stderr=""),
+    )
 
     from deployment.installer.orchestrator import uninstall_chief
     from deployment.installer.errors import InstallerError
