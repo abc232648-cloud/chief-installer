@@ -4,7 +4,7 @@ from pathlib import Path
 import sys
 import tkinter as tk
 from tkinter import messagebox, ttk
-from typing import Optional
+from typing import Optional, Any
 
 from .controller import InstallerUIController, ScreenId
 from ..events import InstallEvent
@@ -22,6 +22,7 @@ class InstallerApp(tk.Tk):
         platform_adapter: Optional[PlatformAdapter] = None,
         manifest: Optional[ReleaseManifest] = None,
         controller: Optional[InstallerUIController] = None,
+        paths: Optional[Any] = None,
     ):
         super().__init__()
         self.title("Chief Installer")
@@ -45,6 +46,7 @@ class InstallerApp(tk.Tk):
         self.controller = controller or InstallerUIController(
             platform_adapter=platform_adapter,
             manifest=manifest or CURRENT_RELEASE_MANIFEST,
+            paths=paths,
         )
 
         self.container = ttk.Frame(self, padding="24 20 24 20")

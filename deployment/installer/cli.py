@@ -49,7 +49,11 @@ def print_cli_progress(event: InstallEvent) -> None:
         sys.stdout.flush()
 
 
-def run_cli(argv: Optional[List[str]] = None, platform_adapter: Optional[PlatformAdapter] = None) -> int:
+def run_cli(
+    argv: Optional[List[str]] = None,
+    platform_adapter: Optional[PlatformAdapter] = None,
+    paths: Optional[InstallerPaths] = None,
+) -> int:
     parser = argparse.ArgumentParser(
         prog="chief-installer",
         description="Chief Unified Installer — installs Chief and built PWAs with local discovery and TLS.",
@@ -105,7 +109,7 @@ def run_cli(argv: Optional[List[str]] = None, platform_adapter: Optional[Platfor
 
         print("Starting Chief uninstallation" + (" (full purge)" if args.purge else "") + "...")
         try:
-            report = uninstall_chief(platform=adapter, purge=args.purge, confirmed=confirmed)
+            report = uninstall_chief(platform=adapter, paths=paths, purge=args.purge, confirmed=confirmed)
             if report.get("success"):
                 print("Chief uninstallation complete.")
                 print(f"Stopped services: {', '.join(report.get('stopped_services', []))}")

@@ -88,6 +88,20 @@ class InstallerPaths:
     unit_stage: Path
     unit_dest: Path
     archive_base: Path
+    home: Optional[Path] = None
+    device_setup_dir: Optional[Path] = None
+
+    def __post_init__(self) -> None:
+        if self.home is None:
+            self.home = Path.home()
+        if self.device_setup_dir is None:
+            self.device_setup_dir = self.home / "Chief_Device_Setup"
+
+    def get_home(self) -> Path:
+        return self.home or Path.home()
+
+    def get_device_setup_dir(self) -> Path:
+        return self.device_setup_dir or (self.get_home() / "Chief_Device_Setup")
 
     @classmethod
     def create(cls, custom_root: Optional[Path] = None, home: Optional[Path] = None) -> "InstallerPaths":
@@ -95,8 +109,23 @@ class InstallerPaths:
         is_windows = os.name == "nt"
 
         if is_windows and not custom_root:
-            local_app = Path(os.environ.get("LOCALAPPDATA") or (home_dir / "AppData" / "Local"))
-            roaming_app = Path(os.environ.get("APPDATA") or (home_dir / "AppData" / "Roaming"))
+            if home is not None:
+                # When custom home is supplied on Windows, confine local/roaming app data to home_dir
+                # unless environment variables explicitly point inside that custom home.
+                env_local = os.environ.get("LOCALAPPDATA")
+                env_roam = os.environ.get("APPDATA")
+                if env_local and Path(env_local).is_relative_to(home_dir):
+                    local_app = Path(env_local)
+                else:
+                    local_app = home_dir / "AppData" / "Local"
+
+                if env_roam and Path(env_roam).is_relative_to(home_dir):
+                    roaming_app = Path(env_roam)
+                else:
+                    roaming_app = home_dir / "AppData" / "Roaming"
+            else:
+                local_app = Path(os.environ.get("LOCALAPPDATA") or (home_dir / "AppData" / "Local"))
+                roaming_app = Path(os.environ.get("APPDATA") or (home_dir / "AppData" / "Roaming"))
             root = local_app / "chief"
             config_root = roaming_app / "chief"
             state_root = local_app / "chief" / "state"
@@ -132,6 +161,8 @@ class InstallerPaths:
             unit_stage=state_root / "service-units" / "initial",
             unit_dest=unit_dest,
             archive_base=home_dir / "Chief_Previous_Installations",
+            home=home_dir,
+            device_setup_dir=home_dir / "Chief_Device_Setup",
         )
 
 
@@ -183,7 +214,7 @@ class InstallerOrchestrator:
             self.paths.caddy_root / "data",
             self.paths.caddy_root / "config",
             self.paths.archive_base,
-            Path.home() / "Chief_Device_Setup",
+            self.paths.device_setup_dir,
         ]:
             if p_check.exists():
                 self._preexisting_paths.add(p_check)
@@ -1740,7 +1771,7 @@ class InstallerOrchestrator:
     def _step_device_setup(self) -> None:
         self.state_machine.transition(StepId.DEVICE_SETUP, StepStatus.RUNNING, message="Exporting mobile setup certificates...")
         if self.options.tls_mode == "LOCAL":
-            device_setup_dir = Path.home() / "Chief_Device_Setup"
+            device_setup_dir = self.paths.device_setup_dir
             ca_root = self.paths.caddy_root / "data" / "caddy" / "pki" / "authorities" / "local" / "root.crt"
             if ca_root.exists():
                 self.platform.export_device_ca(ca_root, device_setup_dir, self.options.owner_name, self._public_host or "chief.local")
@@ -1759,7 +1790,7 @@ class InstallerOrchestrator:
                 self.platform.export_device_ca(ca_root, device_setup_dir, self.options.owner_name, self._public_host or "chief.local")
 
         if self._wireguard_configured and self._wireguard_client_conf:
-            dest = Path.home() / "Chief_Device_Setup"
+            dest = self.paths.device_setup_dir
             dest.mkdir(parents=True, exist_ok=True, mode=0o700)
             wg_file = dest / "Chief-Owner-WireGuard.conf"
             wg_file.write_text(self._wireguard_client_conf, encoding="utf-8")
@@ -2015,24 +2046,67 @@ def uninstall_chief(
         p.release_source,
     ]
 
+    purge_targets = [
+        p.identity_config,
+        p.config,
+        p.production,
+        p.state_root,
+        p.caddy_root / "data",
+        p.caddy_root / "config",
+        p.caddy_root,
+        p.device_setup_dir,
+        p.archive_base,
+        p.config_root,
+        p.root,
+    ] if purge else []
+
+    # Safety guard: Ensure all removal targets are strictly confined to supplied boundaries
+    # and never target the real home directory when a custom temporary home/root is supplied.
+    all_targets_to_remove = runtime_paths_to_remove + purge_targets
+
+    # 1. Guard against targeting the real user home when custom temporary home was supplied
+    real_home = Path.home().resolve()
+    if p.home.resolve() != real_home:
+        real_forbidden = [
+            real_home / "Chief_Device_Setup",
+            real_home / "Chief_Previous_Installations",
+        ]
+        for target in all_targets_to_remove:
+            t_res = target.resolve()
+            for forb in real_forbidden:
+                if t_res == forb.resolve():
+                    err_msg = (
+                        f"Safety guard violation: target '{target}' targets real user home '{real_home}' "
+                        f"while custom temporary home '{p.home}' was supplied."
+                    )
+                    log.error(err_msg)
+                    raise InstallerError(err_msg)
+
+    # 2. Guard: All targets to remove MUST strictly resolve inside the primary root boundaries
+    allowed_roots = [
+        p.home.resolve(),
+        p.root.resolve(),
+        p.config_root.resolve(),
+    ]
+    for target in all_targets_to_remove:
+        t_res = target.resolve()
+        is_inside_allowed = False
+        for allowed in allowed_roots:
+            try:
+                t_res.relative_to(allowed)
+                is_inside_allowed = True
+                break
+            except ValueError:
+                continue
+        if not is_inside_allowed:
+            err_msg = f"Safety guard violation: path '{target}' resolves outside supplied boundaries ({p.home}, {p.root}, {p.config_root})"
+            log.error(err_msg)
+            raise InstallerError(err_msg)
+
     for item in runtime_paths_to_remove:
         _safe_remove_path(item, report["removed_paths"], report["failed_items"], log)
 
     if purge:
-        # Full purge mode: remove database, credentials, exported setup keys, state, PKI, archives, roots
-        purge_targets = [
-            p.identity_config,
-            p.config,
-            p.production,
-            p.state_root,
-            p.caddy_root / "data",
-            p.caddy_root / "config",
-            p.caddy_root,
-            Path.home() / "Chief_Device_Setup",
-            p.archive_base,
-            p.config_root,
-            p.root,
-        ]
         for purge_target in purge_targets:
             _safe_remove_path(purge_target, report["removed_paths"], report["failed_items"], log)
     else:

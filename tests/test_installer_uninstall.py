@@ -186,8 +186,40 @@ sys.exit(0)
     return bin_dir, state_file
 
 
+def _is_live_systemd_user_available() -> bool:
+    """Check if a live systemd --user manager is running and reachable."""
+    if os.name == "nt" or sys.platform != "linux":
+        return False
+    import shutil
+    if not shutil.which("systemctl"):
+        return False
+    try:
+        res = subprocess.run(["systemctl", "--user", "is-system-running"], capture_output=True, text=True, timeout=2.0)
+        return res.returncode == 0 or res.stdout.strip() in ("running", "degraded", "starting")
+    except Exception:
+        return False
+
+
+def test_real_systemd_user_query_safe():
+    """Safe test against a live systemd --user manager on a systemd-enabled runner.
+
+    Queries status of a nonexistent unit to verify live systemctl interaction without
+    modifying host services or changing files. Skips cleanly if live systemd is not present.
+    """
+    if not _is_live_systemd_user_available():
+        pytest.skip("Live systemd --user manager not available in this environment")
+
+    adapter = LinuxPlatformAdapter()
+    assert adapter.verify_service_active("chief-nonexistent-sentinel-unit.service") is False
+
+
 def test_linux_real_systemd_user_integration(tmp_path, monkeypatch):
-    """Integration test using an isolated systemd-user test harness exercising real LinuxPlatformAdapter."""
+    """Integration test invoking real LinuxPlatformAdapter with an isolated stateful fake
+
+    systemctl harness (not a live systemd manager) to prove that uninstallation stops,
+    disables, and deletes only Chief services while leaving unrelated services running,
+    enabled, and byte-for-byte unchanged.
+    """
     chief_services = [
         "chief-agent-dashboard.service",
         "chief-agent-worker.service",
@@ -306,6 +338,10 @@ def test_cleanup_local_discovery_preserves_unrelated_hosts_and_legacy_chief_loca
 
 def test_purge_entrypoints_require_explicit_confirmation(tmp_path, monkeypatch):
     """Every purge entry point (Python API, CLI non-interactive, CLI interactive, GUI) must require explicit confirmation."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData" / "Local"))
+    monkeypatch.setenv("APPDATA", str(tmp_path / "AppData" / "Roaming"))
+
     paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path)
     adapter = MockPlatformAdapter()
 
@@ -321,12 +357,12 @@ def test_purge_entrypoints_require_explicit_confirmation(tmp_path, monkeypatch):
     # 3. CLI --purge with --non-interactive but without --confirm-purge must fail closed
     err_stream = io.StringIO()
     monkeypatch.setattr(sys, "stderr", err_stream)
-    code = run_cli(["--purge", "--non-interactive"], platform_adapter=adapter)
+    code = run_cli(["--purge", "--non-interactive"], platform_adapter=adapter, paths=paths)
     assert code == 1
     assert "--confirm-purge" in err_stream.getvalue()
 
     # 4. CLI --purge with --confirm-purge succeeds
-    code = run_cli(["--purge", "--confirm-purge"], platform_adapter=adapter)
+    code = run_cli(["--purge", "--confirm-purge"], platform_adapter=adapter, paths=paths)
     assert code == 0
 
     # 5. CLI interactive: typing anything other than 'CONFIRM' cancels
@@ -334,13 +370,13 @@ def test_purge_entrypoints_require_explicit_confirmation(tmp_path, monkeypatch):
     monkeypatch.setattr(sys.stdin, "readline", lambda: "no\n")
     err_stream2 = io.StringIO()
     monkeypatch.setattr(sys, "stderr", err_stream2)
-    code = run_cli(["--purge"], platform_adapter=adapter)
+    code = run_cli(["--purge"], platform_adapter=adapter, paths=paths)
     assert code == 1
     assert "Purge cancelled by user" in err_stream2.getvalue()
 
     # 6. CLI interactive: typing 'CONFIRM' succeeds
     monkeypatch.setattr(sys.stdin, "readline", lambda: "CONFIRM\n")
-    code = run_cli(["--purge"], platform_adapter=adapter)
+    code = run_cli(["--purge"], platform_adapter=adapter, paths=paths)
     assert code == 0
 
     # 7. GUI controller flow: purge unconfirmed raises ValueError
@@ -564,3 +600,169 @@ def test_packaged_gui_uninstall_modes_and_terminal_fallback_protection(tmp_path,
     assert exit_code2 == 1
     assert ("Graphical interface requested" in err_buf2.getvalue() or "GUI launch failed" in err_buf2.getvalue())
     assert "Chief Installation" not in err_buf2.getvalue()
+
+
+def test_purge_preserves_real_home_sentinel_with_temporary_home(tmp_path):
+    """Prove that running full purge against a temporary home directory removes temporary
+
+    setup files while leaving real home's Chief_Device_Setup directory and sentinel untouched.
+    """
+    real_setup_dir = Path.home() / "Chief_Device_Setup"
+    real_setup_dir.mkdir(parents=True, exist_ok=True)
+    real_sentinel = real_setup_dir / "real_sentinel_do_not_delete.txt"
+    real_sentinel.write_text("ACTIVE_FARM_REAL_SENTINEL", encoding="utf-8")
+
+    try:
+        temp_home = tmp_path / "temp_farmer_home"
+        temp_root = tmp_path / "temp_chief_root"
+        temp_paths = InstallerPaths.create(custom_root=temp_root, home=temp_home)
+
+        # Create temporary device setup files and database in temp paths
+        temp_paths.device_setup_dir.mkdir(parents=True, exist_ok=True)
+        temp_wg_file = temp_paths.device_setup_dir / "Chief-Owner-WireGuard.conf"
+        temp_wg_file.write_text("TEMP_WIREGUARD_CONFIG", encoding="utf-8")
+
+        temp_paths.production.mkdir(parents=True, exist_ok=True)
+        (temp_paths.production / "chief.sqlite").write_text("TEMP_DATABASE", encoding="utf-8")
+
+        temp_paths.config_root.mkdir(parents=True, exist_ok=True)
+        (temp_paths.config_root / "production-instance.json").write_text("{}", encoding="utf-8")
+
+        adapter = MockPlatformAdapter()
+
+        # Run full confirmed purge targeting temp_paths
+        report = uninstall_chief(paths=temp_paths, platform=adapter, purge=True, confirmed=True)
+        assert report["success"] is True
+
+        # 1. Temporary setup files must be deleted
+        assert not temp_wg_file.exists()
+        assert not temp_paths.device_setup_dir.exists()
+        assert not temp_paths.production.exists()
+
+        # 2. Real home sentinel MUST be completely untouched!
+        assert real_sentinel.exists()
+        assert real_sentinel.read_text(encoding="utf-8") == "ACTIVE_FARM_REAL_SENTINEL"
+    finally:
+        if real_sentinel.exists():
+            real_sentinel.unlink()
+        try:
+            if real_setup_dir.exists() and not any(real_setup_dir.iterdir()):
+                real_setup_dir.rmdir()
+        except Exception:
+            pass
+
+
+def test_purge_safety_guard_rejects_targets_outside_temp_home(tmp_path):
+    """Verify that if a purge target resolves outside supplied boundaries or to real home,
+
+    uninstall_chief fails closed immediately before touching any files.
+    """
+    temp_home = tmp_path / "temp_home"
+    temp_root = tmp_path / "temp_root"
+    temp_paths = InstallerPaths.create(custom_root=temp_root, home=temp_home)
+
+    adapter = MockPlatformAdapter()
+
+    # Case A: An external target outside temp boundaries
+    rogue_paths = InstallerPaths.create(custom_root=temp_root, home=temp_home)
+    rogue_paths.device_setup_dir = Path("/etc/unrelated_system_path")
+
+    with pytest.raises(InstallerError) as exc_info:
+        uninstall_chief(paths=rogue_paths, platform=adapter, purge=True, confirmed=True)
+    assert "Safety guard violation" in str(exc_info.value)
+
+    # Case B: When custom temp home is supplied, target pointing to real home setup dir must fail
+    rogue_paths_real = InstallerPaths.create(custom_root=temp_root, home=temp_home)
+    rogue_paths_real.device_setup_dir = Path.home() / "Chief_Device_Setup"
+
+    with pytest.raises(InstallerError) as exc_info2:
+        uninstall_chief(paths=rogue_paths_real, platform=adapter, purge=True, confirmed=True)
+    assert "Safety guard violation" in str(exc_info2.value)
+
+
+def test_avahi_and_hosts_cleanup_preserves_unrelated_settings_and_services(tmp_path, monkeypatch):
+    """Verify Avahi and hosts cleanup only removes the installation's configured hostname
+
+    while preserving unrelated hosts aliases, Avahi settings, other service files, and propagates restart errors.
+    """
+    from deployment.installer.privileged.linux import run_cleanup_local_discovery
+
+    # 1. Setup isolated /etc/hosts with Chief and unrelated entries
+    hosts_path = tmp_path / "hosts"
+    hosts_path.write_text(
+        "127.0.0.1\tlocalhost my-farm.local unrelated-host.local\n"
+        "::1\tlocalhost ip6-localhost my-farm.local other-alias.local\n"
+        "192.168.1.50\tnas.farm.local\n",
+        encoding="utf-8",
+    )
+
+    # 2. Setup isolated avahi-daemon.conf with Chief hostname, unrelated settings, and sections
+    conf_path = tmp_path / "avahi-daemon.conf"
+    initial_conf = (
+        "# Avahi daemon configuration\n"
+        "[server]\n"
+        "host-name=my-farm\n"
+        "use-ipv4=yes\n"
+        "ratelimit-interval-usec=1000000\n"
+        "\n"
+        "[publish]\n"
+        "publish-addresses=yes\n"
+        "publish-hinfo=no\n"
+    )
+    conf_path.write_text(initial_conf, encoding="utf-8")
+
+    # 3. Setup Avahi services directory with chief.service and unrelated service
+    services_dir = tmp_path / "services"
+    services_dir.mkdir(parents=True, exist_ok=True)
+    chief_service = services_dir / "chief.service"
+    chief_service.write_text("<service-group><name>Chief</name></service-group>", encoding="utf-8")
+    unrelated_service = services_dir / "ssh.service"
+    unrelated_service.write_text("<service-group><name>SSH</name></service-group>", encoding="utf-8")
+
+    # Mock systemctl try-restart avahi-daemon succeeding
+    import shutil
+    monkeypatch.setattr(shutil, "which", lambda cmd: f"/bin/{cmd}")
+    mock_run = lambda *args, **kwargs: subprocess.CompletedProcess(args=args[0] if args else [], returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(subprocess, "run", mock_run)
+
+    # Run cleanup for "my-farm.local"
+    rc = run_cleanup_local_discovery(
+        "my-farm.local",
+        hosts_path_override=hosts_path,
+        conf_path_override=conf_path,
+        avahi_service_override=chief_service,
+    )
+    assert rc == 0
+
+    # Verify hosts cleanup: only my-farm.local removed from loopback lines
+    hosts_lines = hosts_path.read_text(encoding="utf-8").splitlines()
+    assert "127.0.0.1\tlocalhost unrelated-host.local" in hosts_lines
+    assert "::1\tlocalhost ip6-localhost other-alias.local" in hosts_lines
+    assert "192.168.1.50\tnas.farm.local" in hosts_lines
+    assert "my-farm.local" not in hosts_path.read_text(encoding="utf-8")
+
+    # Verify avahi-daemon.conf cleanup: host-name=my-farm removed, other settings and sections intact
+    conf_result = conf_path.read_text(encoding="utf-8")
+    assert "host-name=my-farm" not in conf_result
+    assert "[server]" in conf_result
+    assert "use-ipv4=yes" in conf_result
+    assert "ratelimit-interval-usec=1000000" in conf_result
+    assert "[publish]" in conf_result
+    assert "publish-addresses=yes" in conf_result
+    assert "publish-hinfo=no" in conf_result
+
+    # Verify Avahi services cleanup: chief.service unlinked, unrelated ssh.service untouched
+    assert not chief_service.exists()
+    assert unrelated_service.exists()
+    assert "SSH" in unrelated_service.read_text(encoding="utf-8")
+
+    # Verify restart error propagation: if systemctl try-restart fails, returncode 1 is returned
+    mock_fail_run = lambda *args, **kwargs: subprocess.CompletedProcess(args=args[0] if args else [], returncode=1, stdout="", stderr="failed to restart")
+    monkeypatch.setattr(subprocess, "run", mock_fail_run)
+    err_rc = run_cleanup_local_discovery(
+        "my-farm.local",
+        hosts_path_override=hosts_path,
+        conf_path_override=conf_path,
+        avahi_service_override=chief_service,
+    )
+    assert err_rc == 1

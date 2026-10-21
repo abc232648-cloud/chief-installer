@@ -389,13 +389,21 @@ def run_rollback_wireguard_firewall() -> int:
 
 
 
-def run_cleanup_local_discovery(canonical_host: str) -> int:
-    """Safely clean up /etc/hosts mapping and Avahi service for the canonical hostname."""
+def run_cleanup_local_discovery(
+    canonical_host: str,
+    *,
+    hosts_path_override: Optional[Path] = None,
+    conf_path_override: Optional[Path] = None,
+    avahi_service_override: Optional[Path] = None,
+) -> int:
+    """Safely clean up /etc/hosts mapping, Avahi host-name configuration, and Avahi service for the canonical hostname."""
+    canonical_host = canonical_host.strip()
     if not re.match(r"^[a-zA-Z0-9.-]+$", canonical_host):
         sys.stderr.write(f"ERROR: Invalid canonical hostname format: {canonical_host!r}\n")
         return 2
 
-    hosts_path = Path("/etc/hosts")
+    # 1. Update loopback hosts mapping
+    hosts_path = hosts_path_override or Path("/etc/hosts")
     if hosts_path.exists():
         try:
             hosts_text = hosts_path.read_text(encoding="utf-8")
@@ -404,7 +412,7 @@ def run_cleanup_local_discovery(canonical_host: str) -> int:
             for l in lines:
                 parts = l.strip().split()
                 if len(parts) >= 2 and parts[0] in ("127.0.0.1", "::1"):
-                    remaining_aliases = [p for p in parts[1:] if p != canonical_host]
+                    remaining_aliases = [p for p in parts[1:] if p.lower() != canonical_host.lower()]
                     if remaining_aliases:
                         new_lines.append(f"{parts[0]}\t{' '.join(remaining_aliases)}")
                 else:
@@ -427,7 +435,53 @@ def run_cleanup_local_discovery(canonical_host: str) -> int:
             sys.stderr.write(f"ERROR: Could not update /etc/hosts during cleanup: {exc}\n")
             return 1
 
-    avahi_service = Path("/etc/avahi/services/chief.service")
+    # 2. Update /etc/avahi/avahi-daemon.conf by removing Chief-owned host-name setting
+    label = canonical_host[:-6].lower() if canonical_host.lower().endswith(".local") else canonical_host.lower()
+    conf_path = conf_path_override or Path("/etc/avahi/avahi-daemon.conf")
+    if conf_path.exists():
+        try:
+            existing_text = conf_path.read_text(encoding="utf-8")
+            lines = existing_text.splitlines(keepends=True)
+            out: List[str] = []
+            in_server = False
+            modified = False
+
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("[") and stripped.endswith("]"):
+                    in_server = (stripped.lower() == "[server]")
+                    out.append(line)
+                    continue
+
+                if in_server and stripped.lower().startswith("host-name="):
+                    _, val = stripped.split("=", 1)
+                    if val.strip().lower() == label:
+                        # Remove only this Chief-configured host-name line
+                        modified = True
+                        continue
+
+                out.append(line)
+
+            if modified:
+                payload = "".join(out)
+                fd, tmp = tempfile.mkstemp(prefix=".avahi-daemon.conf.", dir=str(conf_path.parent if conf_path.parent.exists() else "/tmp"))
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                        handle.write(payload)
+                    os.chmod(tmp, conf_path.stat().st_mode & 0o777)
+                    os.replace(tmp, conf_path)
+                finally:
+                    if os.path.exists(tmp):
+                        try:
+                            os.unlink(tmp)
+                        except OSError:
+                            pass
+        except Exception as exc:
+            sys.stderr.write(f"ERROR: Could not update /etc/avahi/avahi-daemon.conf during cleanup: {exc}\n")
+            return 1
+
+    # 3. Remove Chief Avahi service file if present
+    avahi_service = avahi_service_override or Path("/etc/avahi/services/chief.service")
     if avahi_service.exists():
         try:
             avahi_service.unlink()
@@ -435,9 +489,13 @@ def run_cleanup_local_discovery(canonical_host: str) -> int:
             sys.stderr.write(f"ERROR: Could not remove {avahi_service}: {exc}\n")
             return 1
 
+    # 4. Refresh avahi-daemon service and propagate any failure
     import shutil
     if shutil.which("systemctl"):
-        subprocess.run(["systemctl", "try-restart", "avahi-daemon"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.run(["systemctl", "try-restart", "avahi-daemon"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if proc.returncode != 0:
+            sys.stderr.write(f"ERROR: Failed to restart avahi-daemon service (exit code {proc.returncode})\n")
+            return 1
 
     sys.stdout.write(f"Local discovery cleaned up for {canonical_host}\n")
     return 0
