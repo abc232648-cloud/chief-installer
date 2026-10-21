@@ -535,6 +535,8 @@ def test_packaged_gui_uninstall_modes_and_terminal_fallback_protection(tmp_path,
     # 5. Verify that GUI launch failures NEVER fall back to interactive terminal on desktop
     from deployment.installer.__main__ import main as installer_main
 
+    # Case A: Display present but launch fails -> must exit 1 without terminal fallback
+    monkeypatch.setenv("DISPLAY", ":0")
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
     monkeypatch.setattr(sys, "argv", ["chief-installer", "--gui"])
 
@@ -549,5 +551,16 @@ def test_packaged_gui_uninstall_modes_and_terminal_fallback_protection(tmp_path,
     exit_code = installer_main()
     assert exit_code == 1, "GUI failure must exit with non-zero code!"
     assert "GUI launch failed" in err_buf.getvalue()
-    # Confirm it did NOT try running CLI
     assert "Chief Installation" not in err_buf.getvalue()
+
+    # Case B: No display present with non-tty stdin -> must exit 1 without terminal fallback
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    err_buf2 = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err_buf2)
+    monkeypatch.setattr(sys, "argv", ["chief-installer", "--gui"])
+
+    exit_code2 = installer_main()
+    assert exit_code2 == 1
+    assert ("Graphical interface requested" in err_buf2.getvalue() or "GUI launch failed" in err_buf2.getvalue())
+    assert "Chief Installation" not in err_buf2.getvalue()

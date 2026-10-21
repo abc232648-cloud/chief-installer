@@ -136,6 +136,20 @@ def main() -> int:
     if len(sys.argv) > 1 and not (len(sys.argv) == 2 and sys.argv[1] == "--gui"):
         return run_cli(sys.argv[1:])
 
+    if "--gui" in sys.argv:
+        if not has_display:
+            sys.stderr.write("ERROR: Graphical interface requested (--gui) but no graphical display is available.\n")
+            return 1
+        try:
+            try:
+                from .ui.app import launch_gui
+            except ImportError:
+                from deployment.installer.ui.app import launch_gui
+            return launch_gui()
+        except Exception as exc:
+            sys.stderr.write(f"ERROR: GUI launch failed: {exc}\n")
+            return 1
+
     if has_display:
         try:
             try:
@@ -144,12 +158,15 @@ def main() -> int:
                 from deployment.installer.ui.app import launch_gui
             return launch_gui()
         except Exception as exc:
-            if not sys.stdin.isatty() or "--gui" in sys.argv:
+            if not sys.stdin.isatty():
                 sys.stderr.write(f"ERROR: GUI launch failed: {exc}\n")
                 return 1
             sys.stderr.write(f"GUI launch failed ({exc}), falling back to terminal setup...\n")
             return run_cli([])
     else:
+        if not sys.stdin.isatty():
+            sys.stderr.write("ERROR: No graphical display available and standard input is not a terminal.\n")
+            return 1
         return run_cli([])
 
 
