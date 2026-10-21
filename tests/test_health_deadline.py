@@ -193,17 +193,23 @@ def test_https_routes_require_trust_and_expected_pages(tmp_path, monkeypatch, fa
         return trusted_context
     visited = []
     class Response:
-        status = 404 if failure == "missing" else 200
-        def __enter__(self): return self
-        def __exit__(self, *args): pass
-        def geturl(self): return "https://unexpected.example/" if failure == "redirect" else visited[-1]
-    def open_url(url, *, context, timeout):
-        assert context is trusted_context
-        assert 0 < timeout <= 5
-        visited.append(url)
-        return Response()
+        status = 404 if failure == "missing" else 302 if failure == "redirect" else 200
+        def read(self): return b"ok"
+    class Connection:
+        def __init__(self, host, *, context, timeout):
+            assert host == "chief-test.local"
+            assert context is trusted_context
+            assert 0 < timeout <= 5
+            self.route = None
+        def request(self, method, route, *, headers):
+            assert method == "GET"
+            assert headers == {"Host": "chief-test.local", "Connection": "close"}
+            self.route = route
+            visited.append(f"https://chief-test.local{route}")
+        def getresponse(self): return Response()
+        def close(self): pass
     monkeypatch.setattr(orchestrator_module.ssl, "create_default_context", context)
-    monkeypatch.setattr(orchestrator_module.urllib.request, "urlopen", open_url)
+    monkeypatch.setattr(orchestrator_module, "_LoopbackHTTPSConnection", Connection)
     if failure and failure != "starting":
         with pytest.raises(InstallerError, match="not ready"):
             engine._verify_https_routes()
@@ -212,3 +218,33 @@ def test_https_routes_require_trust_and_expected_pages(tmp_path, monkeypatch, fa
         engine._verify_https_routes()
         assert visited == ["https://chief-test.local" + p for p in ("/login", "/owner/", "/staff/", "/jobs/")]
         assert clock.now == (2 if failure == "starting" else 0)
+
+
+def test_loopback_https_connection_uses_loopback_socket_and_hostname_sni(monkeypatch):
+    raw_socket = object()
+    wrapped_socket = object()
+    calls = {}
+
+    def create_connection(address, *, timeout, source_address):
+        calls["address"] = address
+        calls["timeout"] = timeout
+        return raw_socket
+
+    class Context:
+        def wrap_socket(self, sock, *, server_hostname):
+            calls["raw_socket"] = sock
+            calls["server_hostname"] = server_hostname
+            return wrapped_socket
+
+    monkeypatch.setattr(orchestrator_module.socket, "create_connection", create_connection)
+    connection = orchestrator_module._LoopbackHTTPSConnection(
+        "chief-test.local", context=Context(), timeout=3
+    )
+    connection.connect()
+    assert calls == {
+        "address": ("127.0.0.1", 443),
+        "timeout": 3,
+        "raw_socket": raw_socket,
+        "server_hostname": "chief-test.local",
+    }
+    assert connection.sock is wrapped_socket

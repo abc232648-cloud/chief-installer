@@ -4,6 +4,7 @@ Executes the installation state machine using existing Chief deployment APIs
 and a thin PlatformAdapter.
 """
 from dataclasses import dataclass
+import http.client
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ from pathlib import Path
 import platform as py_platform
 import re
 import shutil
+import socket
 import ssl
 import subprocess
 from .process import run as run_quiet
@@ -43,6 +45,22 @@ from .models import (
 )
 from .platforms.base import PlatformAdapter
 from .state import ORDERED_INSTALL_STEPS, StateMachine
+
+
+class _LoopbackHTTPSConnection(http.client.HTTPSConnection):
+    """Connect to local Caddy while retaining the canonical TLS hostname."""
+
+    def connect(self) -> None:
+        raw_socket = socket.create_connection(
+            ("127.0.0.1", self.port),
+            timeout=self.timeout,
+            source_address=self.source_address,
+        )
+        try:
+            self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
+        except Exception:
+            raw_socket.close()
+            raise
 
 
 @dataclass
@@ -1523,10 +1541,21 @@ class InstallerOrchestrator:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError("HTTPS readiness deadline exceeded")
-                    url = f"https://{host}{route}"
-                    with urllib.request.urlopen(url, context=context, timeout=min(5.0, remaining)) as response:
-                        if response.status != 200 or response.geturl() != url:
+                    # Resolve no hostname here: mDNS names ending in .local are
+                    # often not resolvable by the server itself. Dial loopback,
+                    # but keep SNI and certificate hostname verification bound
+                    # to the exact user-facing host.
+                    connection = _LoopbackHTTPSConnection(
+                        host, context=context, timeout=min(5.0, remaining)
+                    )
+                    try:
+                        connection.request("GET", route, headers={"Host": host, "Connection": "close"})
+                        response = connection.getresponse()
+                        if response.status != 200:
                             raise InstallerError(f"HTTPS route {route} did not return its expected page")
+                        response.read()
+                    finally:
+                        connection.close()
                 return
             except Exception as exc:
                 last_error = exc
