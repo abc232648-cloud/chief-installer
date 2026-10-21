@@ -198,10 +198,14 @@ def test_windows_caddy_storage_and_service_cmd(tmp_path):
     # Service cmd script sets explicit environment variables
     cmd_script = orchestrator.generate_caddy_service_cmd()
     assert "setlocal" in cmd_script
-    assert f'set "CADDY_DATA_DIR={paths.caddy_root}\\data\\caddy"' in cmd_script
-    assert f'set "XDG_DATA_HOME={paths.caddy_root}\\data"' in cmd_script
-    assert f'set "CADDY_CONFIG_DIR={paths.caddy_root}\\config\\caddy"' in cmd_script
-    assert f'set "XDG_CONFIG_HOME={paths.caddy_root}\\config"' in cmd_script
+    data_dir = str(paths.caddy_root / "data" / "caddy")
+    data_home = str(paths.caddy_root / "data")
+    config_dir = str(paths.caddy_root / "config" / "caddy")
+    config_home = str(paths.caddy_root / "config")
+    assert f'set "CADDY_DATA_DIR={data_dir}"' in cmd_script
+    assert f'set "XDG_DATA_HOME={data_home}"' in cmd_script
+    assert f'set "CADDY_CONFIG_DIR={config_dir}"' in cmd_script
+    assert f'set "XDG_CONFIG_HOME={config_home}"' in cmd_script
     assert "run --config" in cmd_script
 
     # Task XML executes caddy_service.cmd

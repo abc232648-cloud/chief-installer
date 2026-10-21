@@ -400,9 +400,6 @@ class WindowsPlatformAdapter(PlatformAdapter):
 
     def get_task_status(self, service_name: str) -> Optional[str]:
         """Query Task Scheduler for exact task status string (e.g. 'Running', 'Ready', 'Disabled')."""
-        if not shutil.which("schtasks"):
-            return None
-
         task = self._normalize_task_name(service_name)
         try:
             cmd = ["schtasks", "/query", "/tn", task, "/fo", "CSV", "/nh"]
@@ -433,9 +430,6 @@ class WindowsPlatformAdapter(PlatformAdapter):
 
         Never treats 'Ready' (idle/scheduled) or 'Disabled' as active.
         """
-        if not shutil.which("schtasks"):
-            return False
-
         task = self._normalize_task_name(service_name)
         task_lower = task.lower()
         deadline = time.monotonic() + max(0.0, timeout)
@@ -473,8 +467,6 @@ class WindowsPlatformAdapter(PlatformAdapter):
 
     def unregister_service_units(self, unit_files: List[Any]) -> None:
         """Unregister Task Scheduler tasks and delete definition XML files."""
-        if not shutil.which("schtasks"):
-            return
         for unit in unit_files:
             task_name = self._normalize_task_name(unit.stem if isinstance(unit, Path) else str(unit))
             try:
@@ -497,8 +489,6 @@ class WindowsPlatformAdapter(PlatformAdapter):
 
     def terminate_service_processes(self, service_names: List[str]) -> None:
         """Terminate active processes associated with specified Chief tasks."""
-        if not shutil.which("schtasks"):
-            return
         for s in service_names:
             task = self._normalize_task_name(s)
             try:
