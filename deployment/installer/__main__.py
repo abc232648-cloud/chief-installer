@@ -112,12 +112,26 @@ def main() -> int:
         print("Chief installer GUI smoke test passed")
         return 0
 
+    # Check for graphical environment
+    has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY") or os.name == "nt")
+
+    # If --uninstall is requested without explicit non-interactive flag in a GUI environment, open GUI uninstaller
+    if "--uninstall" in sys.argv and "--non-interactive" not in sys.argv and has_display:
+        try:
+            try:
+                from .ui.app import launch_gui
+                from .ui.controller import ScreenId
+            except ImportError:
+                from deployment.installer.ui.app import launch_gui
+                from deployment.installer.ui.controller import ScreenId
+            return launch_gui(start_screen=ScreenId.UNINSTALL_OPTIONS)
+        except Exception as exc:
+            sys.stderr.write(f"GUI uninstall launch failed ({exc}), falling back to terminal uninstaller...\n")
+            return run_cli(sys.argv[1:])
+
     # If explicit CLI arguments or help flags were provided, run CLI
     if len(sys.argv) > 1 and not (len(sys.argv) == 2 and sys.argv[1] == "--gui"):
         return run_cli(sys.argv[1:])
-
-    # Check for graphical environment
-    has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY") or os.name == "nt")
 
     if has_display:
         try:

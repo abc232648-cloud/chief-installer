@@ -387,10 +387,67 @@ def run_rollback_wireguard_firewall() -> int:
     return 0
 
 
+
+
+def run_cleanup_local_discovery(canonical_host: str) -> int:
+    """Safely clean up /etc/hosts mapping and Avahi service for the canonical hostname."""
+    if not re.match(r"^[a-zA-Z0-9.-]+$", canonical_host):
+        sys.stderr.write(f"ERROR: Invalid canonical hostname format: {canonical_host!r}\n")
+        return 2
+
+    hosts_path = Path("/etc/hosts")
+    if hosts_path.exists():
+        try:
+            hosts_text = hosts_path.read_text(encoding="utf-8")
+            lines = hosts_text.splitlines()
+            new_lines: List[str] = []
+            for l in lines:
+                parts = l.strip().split()
+                if len(parts) >= 2 and parts[0] in ("127.0.0.1", "::1"):
+                    remaining_aliases = [
+                        p for p in parts[1:]
+                        if p != canonical_host and not (p.startswith("chief-") and p.endswith(".local")) and p != "chief.local"
+                    ]
+                    if remaining_aliases:
+                        new_lines.append(f"{parts[0]}\t{' '.join(remaining_aliases)}")
+                else:
+                    new_lines.append(l)
+
+            payload = "\n".join(new_lines) + "\n"
+            fd, tmp = tempfile.mkstemp(prefix=".hosts.", dir=str(hosts_path.parent if hosts_path.parent.exists() else "/tmp"))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+                os.chmod(tmp, hosts_path.stat().st_mode & 0o777)
+                os.replace(tmp, hosts_path)
+            finally:
+                if os.path.exists(tmp):
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+        except Exception as exc:
+            sys.stderr.write(f"WARNING: Could not update /etc/hosts during cleanup: {exc}\n")
+
+    avahi_service = Path("/etc/avahi/services/chief.service")
+    if avahi_service.exists():
+        try:
+            avahi_service.unlink()
+        except Exception as exc:
+            sys.stderr.write(f"WARNING: Could not remove {avahi_service}: {exc}\n")
+
+    import shutil
+    if shutil.which("systemctl"):
+        subprocess.run(["systemctl", "try-restart", "avahi-daemon"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    sys.stdout.write(f"Local discovery cleaned up for {canonical_host}\n")
+    return 0
+
+
 def main(argv: List[str]) -> int:
     if len(argv) < 2:
         sys.stderr.write("Usage: chief-installer-helper <command> [<args>...]\n")
-        sys.stderr.write("Allowed commands: install-packages, enable-linger, configure-avahi, set-caddy-capability, install-wireguard-config, control-wireguard-service, apply-wireguard-firewall, rollback-wireguard-firewall\n")
+        sys.stderr.write("Allowed commands: install-packages, enable-linger, configure-avahi, cleanup-local-discovery, set-caddy-capability, install-wireguard-config, control-wireguard-service, apply-wireguard-firewall, rollback-wireguard-firewall\n")
         return 2
 
     command = argv[1]
@@ -408,6 +465,11 @@ def main(argv: List[str]) -> int:
             sys.stderr.write("Usage: chief-installer-helper configure-avahi <hostname_label>\n")
             return 2
         return run_configure_avahi(args[0])
+    elif command == "cleanup-local-discovery":
+        if len(args) != 1:
+            sys.stderr.write("Usage: chief-installer-helper cleanup-local-discovery <canonical_host>\n")
+            return 2
+        return run_cleanup_local_discovery(args[0])
     elif command == "set-caddy-capability":
         if len(args) != 1:
             sys.stderr.write("Usage: chief-installer-helper set-caddy-capability <executable_path>\n")

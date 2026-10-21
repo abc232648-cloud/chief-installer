@@ -573,13 +573,14 @@ class WindowsPlatformAdapter(PlatformAdapter):
                 f"$s.Description = '{desc}'; "
                 f"$s.Save()"
             )
-            subprocess.run(["powershell", "-NoProfile", "-Command", ps_script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            run_quiet(["powershell", "-NoProfile", "-Command", ps_script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         if desktop_dir.is_dir():
             _make_shortcut(desktop_dir / "Chief Console.lnk", "--console", "Chief On-Farm Operations Console")
 
         _make_shortcut(start_menu_dir / "Chief Console.lnk", "--console", "Chief On-Farm Operations Console")
         _make_shortcut(start_menu_dir / "Chief Installer.lnk", "--gui", "Install or Repair Chief Deployment")
+        _make_shortcut(start_menu_dir / "Chief Uninstaller.lnk", "--uninstall", "Uninstall Chief Deployment")
 
     def remove_console_launchers(self, paths: Any) -> List[str]:
         """Remove Windows desktop and Start Menu shortcuts created by Chief."""
@@ -594,7 +595,7 @@ class WindowsPlatformAdapter(PlatformAdapter):
                 pass
 
         start_menu_dir = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Chief"
-        for name in ("Chief Console.lnk", "Chief Installer.lnk"):
+        for name in ("Chief Console.lnk", "Chief Installer.lnk", "Chief Uninstaller.lnk"):
             p = start_menu_dir / name
             if p.exists():
                 try:

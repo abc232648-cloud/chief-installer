@@ -19,7 +19,7 @@ from .process import run as run_quiet
 import sys
 import tarfile
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
@@ -174,6 +174,24 @@ class InstallerOrchestrator:
         self._tracked_services_started: List[str] = []
         self._tracked_units_created: List[Path] = []
         self._tracked_files_created: List[Path] = []
+        self._preexisting_paths: Set[Path] = set()
+        for p_check in [
+            self.paths.production,
+            self.paths.identity_config,
+            self.paths.config,
+            self.paths.state_root,
+            self.paths.caddy_root / "data",
+            self.paths.caddy_root / "config",
+            self.paths.archive_base,
+            Path.home() / "Chief_Device_Setup",
+        ]:
+            if p_check.exists():
+                self._preexisting_paths.add(p_check)
+
+    def _track_created_file(self, path: Path) -> None:
+        """Track a newly created file or directory for rollback, preserving pre-existing user data."""
+        if path not in self._preexisting_paths and path not in self._tracked_files_created:
+            self._tracked_files_created.append(path)
 
     @property
     def current_step(self) -> StepId:
@@ -401,6 +419,13 @@ class InstallerOrchestrator:
 
         # 5. Clean up partial files and credentials created by this attempt
         for f in self._tracked_files_created:
+            if f in self._preexisting_paths:
+                self.logger.info("Rollback: skipping pre-existing path", path=str(f))
+                continue
+            # NEVER delete production user database directory or user data during rollback
+            if f == self.paths.production or (self.paths.production in f.parents):
+                self.logger.info("Rollback: preserving production user database", path=str(f))
+                continue
             try:
                 if f.is_file() or f.is_symlink():
                     f.unlink(missing_ok=True)
@@ -876,6 +901,7 @@ class InstallerOrchestrator:
             ("StartWhenAvailable", "true"),
             ("Enabled", "true"),
             ("ExecutionTimeLimit", "PT0S"),
+            ("Hidden", "true"),
         ]:
             child(settings, tag, value)
         restart = child(settings, "RestartOnFailure")
@@ -1163,8 +1189,7 @@ class InstallerOrchestrator:
         }
         with open(self.paths.identity_config, "w", encoding="utf-8") as f:
             json.dump(identity_data, f, indent=2)
-        if self.paths.identity_config not in self._tracked_files_created:
-            self._tracked_files_created.append(self.paths.identity_config)
+        self._track_created_file(self.paths.identity_config)
         self.state_machine.transition(StepId.IDENTITY, StepStatus.SUCCESS, message=f"Identity configured: {self._public_host}")
 
     def _step_production_instance(self) -> None:
@@ -1183,12 +1208,9 @@ class InstallerOrchestrator:
                 with open(self.paths.config, "w", encoding="utf-8") as f:
                     json.dump({"schema_sha256": "mock_schema_sha256", "dashboard_port": 8765, "dns_mode": self.options.dns_mode}, f)
             self._expected_schema_sha256 = "mock_schema_sha256"
-            if self.paths.config not in self._tracked_files_created:
-                self._tracked_files_created.append(self.paths.config)
-            if self.paths.production not in self._tracked_files_created:
-                self._tracked_files_created.append(self.paths.production)
-            if self.paths.source_manifest not in self._tracked_files_created:
-                self._tracked_files_created.append(self.paths.source_manifest)
+            self._track_created_file(self.paths.config)
+            self._track_created_file(self.paths.production)
+            self._track_created_file(self.paths.source_manifest)
             self.state_machine.transition(StepId.PRODUCTION_INSTANCE, StepStatus.SUCCESS, message="Production database prepared (mock).")
             return
 
@@ -1223,12 +1245,9 @@ class InstallerOrchestrator:
         if not self._expected_schema_sha256:
             raise InstallerError("Chief prepare_production did not return schema_sha256")
 
-        if self.paths.config not in self._tracked_files_created:
-            self._tracked_files_created.append(self.paths.config)
-        if self.paths.production not in self._tracked_files_created:
-            self._tracked_files_created.append(self.paths.production)
-        if self.paths.source_manifest not in self._tracked_files_created:
-            self._tracked_files_created.append(self.paths.source_manifest)
+        self._track_created_file(self.paths.config)
+        self._track_created_file(self.paths.production)
+        self._track_created_file(self.paths.source_manifest)
 
         self.state_machine.transition(StepId.PRODUCTION_INSTANCE, StepStatus.SUCCESS, message="Production database prepared.")
 
@@ -1345,9 +1364,10 @@ class InstallerOrchestrator:
             managed_installation=str(self.paths.managed),
         )
         self.platform.install_service_units(self.paths.unit_stage, self.paths.unit_dest)
-        unit_glob = "*.xml" if target_platform == "windows" else "*.service"
-        for s_file in self.paths.unit_dest.glob(unit_glob):
-            if s_file not in self._tracked_units_created:
+        unit_ext = ".xml" if target_platform == "windows" else ".service"
+        for s_name in ("chief-agent-dashboard", "chief-agent-worker", "chief-agent-scheduler"):
+            s_file = self.paths.unit_dest / f"{s_name}{unit_ext}"
+            if s_file.exists() and s_file not in self._tracked_units_created:
                 self._tracked_units_created.append(s_file)
         self.state_machine.transition(StepId.SERVICES, StepStatus.SUCCESS, message="User background services installed.")
 
@@ -1373,8 +1393,7 @@ class InstallerOrchestrator:
         caddyfile_content = self.generate_caddyfile(self._public_host, self.options.tls_mode)
         self.paths.caddyfile.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.paths.caddyfile.write_text(caddyfile_content, encoding="utf-8")
-        if self.paths.caddyfile not in self._tracked_files_created:
-            self._tracked_files_created.append(self.paths.caddyfile)
+        self._track_created_file(self.paths.caddyfile)
 
         target_platform = getattr(self.platform, "os_name", "windows" if os.name == "nt" else "linux")
         if target_platform == "linux" and os.name != "nt" and shutil.which(str(caddy_bin)):
@@ -1400,8 +1419,7 @@ class InstallerOrchestrator:
             cmd_file = self.paths.caddy_root / "bin" / "caddy_service.cmd"
             cmd_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             cmd_file.write_text(cmd_script, encoding="utf-8")
-            if cmd_file not in self._tracked_files_created:
-                self._tracked_files_created.append(cmd_file)
+            self._track_created_file(cmd_file)
 
             task_xml = self.generate_caddy_task_xml(user)
             task_file = self.paths.unit_dest / "chief-tls-proxy.xml"
@@ -1758,6 +1776,83 @@ class InstallerOrchestrator:
         self.state_machine.transition(StepId.DEVICE_SETUP, StepStatus.SUCCESS, message="Mobile setup instructions exported.")
 
 
+def discover_configured_canonical_host(paths: InstallerPaths) -> Optional[str]:
+    """Dynamically discover the configured canonical hostname from Chief installation artifacts."""
+    if paths.identity_config.exists():
+        try:
+            data = json.loads(paths.identity_config.read_text(encoding="utf-8"))
+            host = data.get("public_host") or data.get("canonical_hostname")
+            if host:
+                return str(host).strip()
+        except Exception:
+            pass
+
+    if paths.config.exists():
+        try:
+            data = json.loads(paths.config.read_text(encoding="utf-8"))
+            host = data.get("public_host") or data.get("canonical_hostname") or data.get("domain")
+            if host:
+                return str(host).strip()
+        except Exception:
+            pass
+
+    if paths.caddyfile.exists():
+        try:
+            text = paths.caddyfile.read_text(encoding="utf-8")
+            m = re.search(r"https://([a-zA-Z0-9.-]+)", text)
+            if m:
+                return m.group(1).strip()
+        except Exception:
+            pass
+
+    return None
+
+
+def _safe_remove_path(
+    target: Path,
+    removed_paths: List[str],
+    failed_items: List[str],
+    log: Optional[InstallerLogger] = None,
+) -> bool:
+    """Safely remove a file or directory tree and truthfully verify its deletion."""
+    if not target.exists() and not target.is_symlink():
+        return True
+
+    def _handle_readonly(func, path, exc_info):
+        import stat
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except Exception:
+            pass
+
+    try:
+        if target.is_file() or target.is_symlink():
+            try:
+                target.unlink()
+            except PermissionError:
+                import stat
+                os.chmod(target, stat.S_IWRITE)
+                target.unlink()
+        elif target.is_dir():
+            shutil.rmtree(target, onerror=_handle_readonly)
+    except Exception as exc:
+        if log:
+            log.warning(f"Exception removing {target}: {exc}")
+        failed_items.append(f"Failed to remove {target}: {exc}")
+        return False
+
+    if target.exists():
+        msg = f"Path {target} still exists after attempted removal"
+        if log:
+            log.error(msg)
+        failed_items.append(msg)
+        return False
+
+    removed_paths.append(str(target))
+    return True
+
+
 def uninstall_chief(
     paths: Optional[InstallerPaths] = None,
     platform: Optional[PlatformAdapter] = None,
@@ -1769,11 +1864,19 @@ def uninstall_chief(
 
     Stops and disables all Chief background services, unregisters scheduled tasks or
     systemd units, removes launchers and hostname mappings, and cleans up Chief
-    credentials, certificates, databases, and runtime files.
-    When purge=True, completely removes Chief root, config directory, and archive directories
-    without silently creating archives or retaining backups.
+    runtime and configuration files.
 
-    Fails closed if any Chief task or process remains active.
+    When purge=False (standard uninstall):
+    Removes background services, launchers, runtime environment, node, tooling, and PWAs.
+    Safely PRESERVES user databases (production/chief.sqlite), identity credentials,
+    instance secrets, Caddy PKI/certificates, exported setup packages (~/Chief_Device_Setup),
+    and historical archives.
+
+    When purge=True (full removal):
+    Completely removes Chief root, config directory, user databases, credentials,
+    certificates, exported setup packages, and archive directories without retaining backups.
+
+    Fails closed if any Chief task or process remains active, or if any path cannot be removed.
     """
     from .cli import get_default_platform_adapter
     plat = platform or get_default_platform_adapter()
@@ -1788,7 +1891,7 @@ def uninstall_chief(
         "chief-tls-proxy.service",
     ]
 
-    report = {
+    report: Dict[str, Any] = {
         "success": False,
         "stopped_services": [],
         "unregistered_tasks": [],
@@ -1828,14 +1931,19 @@ def uninstall_chief(
         log.error(err_msg)
         raise InstallerError(err_msg)
 
-    # 3. Unregister Task Scheduler tasks or systemd units
+    # 3. Unregister Task Scheduler tasks or systemd units strictly scoped to Chief services
     target_platform = getattr(plat, "os_name", "windows" if os.name == "nt" else "linux")
+    unit_ext = ".xml" if target_platform == "windows" else ".service"
     unit_files = []
     if p.unit_dest.exists():
-        if target_platform == "windows":
-            unit_files = list(p.unit_dest.glob("*.xml"))
-        else:
-            unit_files = list(p.unit_dest.glob("*.service"))
+        for s in services:
+            task_name = plat._normalize_task_name(s) if hasattr(plat, "_normalize_task_name") else s.replace(".service", "")
+            cand = p.unit_dest / f"{task_name}{unit_ext}"
+            if cand.exists():
+                unit_files.append(cand)
+            cand2 = p.unit_dest / f"{s.replace('.service', '')}{unit_ext}"
+            if cand2.exists() and cand2 not in unit_files:
+                unit_files.append(cand2)
 
     if not unit_files:
         unit_files = [p.unit_dest / (f"{plat._normalize_task_name(s)}.xml" if hasattr(plat, "_normalize_task_name") else s) for s in services]
@@ -1874,62 +1982,54 @@ def uninstall_chief(
         except Exception as exc:
             log.warning(f"Error removing launchers: {exc}")
 
-    # 5. Clean up local discovery / hostname
+    # 5. Clean up local discovery / hostname dynamically
+    canonical_host = discover_configured_canonical_host(p)
     if hasattr(plat, "cleanup_local_discovery"):
-        try:
-            plat.cleanup_local_discovery("chief.local")
-        except Exception as exc:
-            log.warning(f"Error cleaning up local discovery: {exc}")
+        hosts_to_clean = set()
+        if canonical_host:
+            hosts_to_clean.add(canonical_host)
+        hosts_to_clean.add("chief.local")
+        for h in hosts_to_clean:
+            try:
+                plat.cleanup_local_discovery(h)
+            except Exception as exc:
+                log.warning(f"Error cleaning up local discovery for {h}: {exc}")
 
-    # 6. Remove Chief installation, configuration, credentials, certificates, runtime, database
-    paths_to_remove = [
-        # Credentials & configs
-        p.identity_config,
-        p.config,
+    # 6. Remove Chief files based on standard vs full purge mode
+    runtime_paths_to_remove = [
         p.browser_config,
         p.caddyfile,
-        # Caddy CA, data, config, bin
-        p.caddy_root / "data",
-        p.caddy_root / "config",
         p.caddy_root / "bin",
-        # Runtime, production DB, managed, PWAs, tooling, release_source, state
-        p.production,
         p.managed,
         p.runtime,
         p.node_root,
         p.pwa_root,
         p.tooling,
         p.release_source,
-        p.state_root,
     ]
 
-    for item in paths_to_remove:
-        if item.exists():
-            try:
-                if item.is_file() or item.is_symlink():
-                    item.unlink()
-                elif item.is_dir():
-                    shutil.rmtree(item, ignore_errors=True)
-                report["removed_paths"].append(str(item))
-            except Exception as exc:
-                log.warning(f"Failed to remove {item}: {exc}")
-                report["failed_items"].append(f"Failed to remove {item}: {exc}")
+    for item in runtime_paths_to_remove:
+        _safe_remove_path(item, report["removed_paths"], report["failed_items"], log)
 
-    # Full purge mode: remove all archives, caddy_root, config_root, root
     if purge:
-        for purge_target in [p.archive_base, p.caddy_root, p.config_root, p.root]:
-            if purge_target.exists():
-                try:
-                    if purge_target.is_file() or purge_target.is_symlink():
-                        purge_target.unlink()
-                    elif purge_target.is_dir():
-                        shutil.rmtree(purge_target, ignore_errors=True)
-                    report["removed_paths"].append(str(purge_target))
-                except Exception as exc:
-                    log.warning(f"Failed to purge {purge_target}: {exc}")
-                    report["failed_items"].append(f"Failed to purge {purge_target}: {exc}")
+        # Full purge mode: remove database, credentials, exported setup keys, state, PKI, archives, roots
+        purge_targets = [
+            p.identity_config,
+            p.config,
+            p.production,
+            p.state_root,
+            p.caddy_root / "data",
+            p.caddy_root / "config",
+            p.caddy_root,
+            Path.home() / "Chief_Device_Setup",
+            p.archive_base,
+            p.config_root,
+            p.root,
+        ]
+        for purge_target in purge_targets:
+            _safe_remove_path(purge_target, report["removed_paths"], report["failed_items"], log)
     else:
-        # Standard uninstall: remove empty chief directories if they contain no other files
+        # Standard uninstall: only clean up empty parent directories if no preserved data remains
         for parent_dir in [p.caddy_root, p.config_root, p.root]:
             if parent_dir.is_dir():
                 try:
@@ -1939,7 +2039,7 @@ def uninstall_chief(
                 except Exception:
                     pass
 
-    report["success"] = len(report["failed_items"]) == 0
+    report["success"] = (len(report["failed_items"]) == 0)
     log.info("Chief uninstallation completed", success=report["success"], removed_paths_count=len(report["removed_paths"]))
     return report
 

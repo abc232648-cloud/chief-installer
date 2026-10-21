@@ -655,7 +655,7 @@ class LinuxPlatformAdapter(PlatformAdapter):
     def cleanup_local_discovery(self, public_host: str) -> None:
         """Remove configured local discovery entries."""
         try:
-            self._run_privileged(["remove-hosts-entry", public_host])
+            self._run_privileged(["cleanup-local-discovery", public_host])
         except Exception:
             pass
         avahi_service = Path("/etc/avahi/services/chief.service")

@@ -6,7 +6,7 @@ operating system or deployment business logic. Can be tested headlessly.
 from enum import Enum
 import re
 import threading
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ..errors import InstallerError
 from ..events import EventBus, InstallEvent
@@ -27,6 +27,9 @@ class ScreenId(str, Enum):
     PROGRESS = "PROGRESS"
     FAILURE = "FAILURE"
     COMPLETION = "COMPLETION"
+    UNINSTALL_OPTIONS = "UNINSTALL_OPTIONS"
+    UNINSTALL_PROGRESS = "UNINSTALL_PROGRESS"
+    UNINSTALL_RESULT = "UNINSTALL_RESULT"
 
 
 _USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
@@ -40,10 +43,12 @@ class InstallerUIController:
         platform_adapter: PlatformAdapter,
         manifest: Optional[ReleaseManifest] = None,
         orchestrator_factory: Optional[Callable[[InstallOptions], InstallerOrchestrator]] = None,
+        paths: Optional[Any] = None,
     ):
         self.platform = platform_adapter
         self.manifest = manifest or CURRENT_RELEASE_MANIFEST
         self._orchestrator_factory = orchestrator_factory
+        self.paths = paths
 
         self.current_screen: ScreenId = ScreenId.WELCOME
         self.screen_history: List[ScreenId] = []
@@ -69,6 +74,13 @@ class InstallerUIController:
         self.failed_reason: str = ""
         self.failed_step: str = ""
         self.diagnostic_report: str = ""
+
+        # Uninstall state
+        self.uninstall_mode: str = "standard"
+        self.purge_confirmed: bool = False
+        self.uninstall_result: Optional[Dict[str, Any]] = None
+        self.uninstall_error: str = ""
+        self.uninstall_message: str = ""
 
         # Event bus & listeners
         self.event_bus = EventBus()
@@ -279,3 +291,58 @@ class InstallerUIController:
         if url:
             return self.platform.open_url_in_browser(url)
         return False
+
+    def start_uninstall(self) -> None:
+        """Navigate to uninstallation mode selection screen."""
+        self.uninstall_mode = "standard"
+        self.purge_confirmed = False
+        self.uninstall_result = None
+        self.uninstall_error = ""
+        self.uninstall_message = ""
+        self.set_screen(ScreenId.UNINSTALL_OPTIONS)
+
+    def set_uninstall_mode(self, mode: str) -> None:
+        if mode not in ("standard", "purge"):
+            raise ValueError(f"Invalid uninstall mode: {mode}")
+        self.uninstall_mode = mode
+
+    def set_purge_confirmed(self, confirmed: bool) -> None:
+        self.purge_confirmed = bool(confirmed)
+
+    def execute_uninstall(self, callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> None:
+        """Run uninstallation or purge asynchronously."""
+        if self.uninstall_mode == "purge" and not self.purge_confirmed:
+            raise ValueError("Confirmation is required before full removal of user data and credentials.")
+
+        self.set_screen(ScreenId.UNINSTALL_PROGRESS)
+        self.uninstall_message = "Stopping services and removing components..."
+
+        def worker():
+            from ..orchestrator import uninstall_chief, InstallerPaths
+            purge = (self.uninstall_mode == "purge")
+            try:
+                paths = self.paths or InstallerPaths.create()
+                report = uninstall_chief(paths=paths, platform=self.platform, purge=purge)
+                self.uninstall_result = report
+                if not report.get("success", False):
+                    failed = report.get("failed_items", [])
+                    self.uninstall_error = "; ".join(failed) if failed else "Uninstallation encountered errors."
+                self.set_screen(ScreenId.UNINSTALL_RESULT)
+            except Exception as exc:
+                self.uninstall_error = str(exc)
+                self.uninstall_result = {
+                    "success": False,
+                    "failed_items": [str(exc)],
+                    "stopped_services": [],
+                    "unregistered_tasks": [],
+                    "removed_launchers": [],
+                    "removed_paths": [],
+                    "purge": purge,
+                }
+                self.set_screen(ScreenId.UNINSTALL_RESULT)
+            if callback and self.uninstall_result:
+                callback(self.uninstall_result)
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+

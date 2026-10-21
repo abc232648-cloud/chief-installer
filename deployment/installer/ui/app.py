@@ -94,6 +94,12 @@ class InstallerApp(tk.Tk):
             self._build_failure(frame)
         elif screen_id == ScreenId.COMPLETION:
             self._build_completion(frame)
+        elif screen_id == ScreenId.UNINSTALL_OPTIONS:
+            self._build_uninstall_options(frame)
+        elif screen_id == ScreenId.UNINSTALL_PROGRESS:
+            self._build_uninstall_progress(frame)
+        elif screen_id == ScreenId.UNINSTALL_RESULT:
+            self._build_uninstall_result(frame)
 
     # 1. Welcome Screen
     def _build_welcome(self, parent: ttk.Frame) -> None:
@@ -126,6 +132,9 @@ class InstallerApp(tk.Tk):
 
         cancel_btn = ttk.Button(btn_bar, text="Cancel", command=self.destroy)
         cancel_btn.pack(side=tk.LEFT)
+
+        uninstall_btn = ttk.Button(btn_bar, text="Uninstall Chief...", command=self.controller.start_uninstall)
+        uninstall_btn.pack(side=tk.LEFT, padx=(8, 0))
 
         install_btn = ttk.Button(btn_bar, text="Install Chief", command=self.controller.next_from_welcome)
         install_btn.pack(side=tk.RIGHT)
@@ -204,6 +213,9 @@ class InstallerApp(tk.Tk):
         back_btn = ttk.Button(btn_bar, text="Back", command=self.controller.go_back)
         back_btn.pack(side=tk.LEFT)
 
+        uninstall_btn = ttk.Button(btn_bar, text="Uninstall Chief...", command=self.controller.start_uninstall)
+        uninstall_btn.pack(side=tk.LEFT, padx=(8, 0))
+
         def on_next():
             try:
                 self.controller.next_from_existing_install(ack_var.get())
@@ -243,6 +255,9 @@ class InstallerApp(tk.Tk):
         back_btn = ttk.Button(btn_bar, text="Back", command=self.controller.go_back)
         back_btn.pack(side=tk.LEFT)
 
+        uninstall_btn = ttk.Button(btn_bar, text="Uninstall Chief...", command=self.controller.start_uninstall)
+        uninstall_btn.pack(side=tk.LEFT, padx=(8, 0))
+
         def on_next():
             try:
                 self.controller.dns_mode = dns_choice.get()
@@ -280,6 +295,9 @@ class InstallerApp(tk.Tk):
 
         back_btn = ttk.Button(btn_bar, text="Back", command=self.controller.go_back)
         back_btn.pack(side=tk.LEFT)
+
+        uninstall_btn = ttk.Button(btn_bar, text="Uninstall Chief...", command=self.controller.start_uninstall)
+        uninstall_btn.pack(side=tk.LEFT, padx=(8, 0))
 
         def on_next():
             try:
@@ -330,6 +348,9 @@ class InstallerApp(tk.Tk):
 
         back_btn = ttk.Button(btn_bar, text="Back", command=self.controller.go_back)
         back_btn.pack(side=tk.LEFT)
+
+        uninstall_btn = ttk.Button(btn_bar, text="Uninstall Chief...", command=self.controller.start_uninstall)
+        uninstall_btn.pack(side=tk.LEFT, padx=(8, 0))
 
         def on_next():
             enabled = farm_choice.get() == "YES"
@@ -471,10 +492,204 @@ class InstallerApp(tk.Tk):
         close_btn.pack(side=tk.RIGHT)
 
 
-def launch_gui(platform_adapter: Optional[PlatformAdapter] = None) -> int:
+    # 11. Uninstall Options Screen
+    def _build_uninstall_options(self, parent: ttk.Frame) -> None:
+        title = ttk.Label(parent, text="Uninstall Chief", font=("Helvetica", 18, "bold"))
+        title.pack(anchor=tk.W, pady=(0, 6))
+
+        subtitle = ttk.Label(
+            parent,
+            text="Choose uninstallation mode.",
+            font=("Helvetica", 10),
+            foreground="#555555",
+        )
+        subtitle.pack(anchor=tk.W, pady=(0, 14))
+
+        mode_var = tk.StringVar(value=self.controller.uninstall_mode)
+        confirm_var = tk.BooleanVar(value=self.controller.purge_confirmed)
+
+        options_frame = ttk.Frame(parent)
+        options_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        # Radio 1: Standard Uninstall
+        std_rb = ttk.Radiobutton(
+            options_frame,
+            text="Standard Uninstall (Recommended)",
+            variable=mode_var,
+            value="standard",
+            command=lambda: self._on_uninstall_mode_changed(mode_var.get(), confirm_var.get()),
+        )
+        std_rb.pack(anchor=tk.W, pady=(0, 2))
+
+        std_desc = ttk.Label(
+            options_frame,
+            text=(
+                "- Stops and unregisters background services and scheduled tasks\n"
+                "- Removes application launchers and desktop shortcuts\n"
+                "- Removes runtime files, Node.js, Caddy binary, and web applications\n"
+                "- PRESERVES: Farm database (chief.sqlite), user identities, authentication\n"
+                "  tokens, WireGuard setup files (~/Chief_Device_Setup), and backup archives."
+            ),
+            font=("Helvetica", 9),
+            foreground="#333333",
+            wraplength=540,
+            justify=tk.LEFT,
+        )
+        std_desc.pack(anchor=tk.W, padx=(24, 0), pady=(0, 14))
+
+        # Radio 2: Full Removal (Purge)
+        purge_rb = ttk.Radiobutton(
+            options_frame,
+            text="Full Removal (Purge Everything)",
+            variable=mode_var,
+            value="purge",
+            command=lambda: self._on_uninstall_mode_changed(mode_var.get(), confirm_var.get()),
+        )
+        purge_rb.pack(anchor=tk.W, pady=(0, 2))
+
+        purge_desc = ttk.Label(
+            options_frame,
+            text=(
+                "- Completely removes all Chief background services and launchers\n"
+                "- Removes runtime, web applications, and proxy configuration\n"
+                "- PERMANENTLY DELETES farm database, user accounts, authentication tokens,\n"
+                "  exported setup keys (~/Chief_Device_Setup), TLS certificates, and archives."
+            ),
+            font=("Helvetica", 9),
+            foreground="#990000",
+            wraplength=540,
+            justify=tk.LEFT,
+        )
+        purge_desc.pack(anchor=tk.W, padx=(24, 0), pady=(0, 10))
+
+        # Confirmation checkbox for Full Removal
+        self.purge_confirm_chk = ttk.Checkbutton(
+            options_frame,
+            text="I understand this will permanently delete all farm data, databases, and setup credentials.",
+            variable=confirm_var,
+            command=lambda: self._on_uninstall_confirm_toggled(mode_var.get(), confirm_var.get()),
+        )
+        self.purge_confirm_chk.pack(anchor=tk.W, padx=(24, 0), pady=(0, 10))
+
+        # Button Bar
+        btn_bar = ttk.Frame(parent)
+        btn_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        back_btn = ttk.Button(btn_bar, text="Back", command=self.controller.go_back)
+        back_btn.pack(side=tk.LEFT)
+
+        self.uninstall_submit_btn = ttk.Button(
+            btn_bar,
+            text="Uninstall Chief",
+            command=lambda: self._on_uninstall_submit(mode_var.get(), confirm_var.get()),
+        )
+        self.uninstall_submit_btn.pack(side=tk.RIGHT)
+
+        self._update_uninstall_mode_ui(mode_var.get(), confirm_var.get())
+
+    def _on_uninstall_mode_changed(self, mode: str, confirmed: bool) -> None:
+        self.controller.set_uninstall_mode(mode)
+        self._update_uninstall_mode_ui(mode, confirmed)
+
+    def _on_uninstall_confirm_toggled(self, mode: str, confirmed: bool) -> None:
+        self.controller.set_purge_confirmed(confirmed)
+        self._update_uninstall_mode_ui(mode, confirmed)
+
+    def _update_uninstall_mode_ui(self, mode: str, confirmed: bool) -> None:
+        if not hasattr(self, "uninstall_submit_btn") or not self.uninstall_submit_btn.winfo_exists():
+            return
+        if mode == "purge":
+            self.purge_confirm_chk.configure(state="normal")
+            if confirmed:
+                self.uninstall_submit_btn.configure(state="normal", text="Permanently Purge Chief")
+            else:
+                self.uninstall_submit_btn.configure(state="disabled", text="Permanently Purge Chief")
+        else:
+            self.purge_confirm_chk.configure(state="disabled")
+            self.uninstall_submit_btn.configure(state="normal", text="Uninstall Chief")
+
+    def _on_uninstall_submit(self, mode: str, confirmed: bool) -> None:
+        self.controller.set_uninstall_mode(mode)
+        self.controller.set_purge_confirmed(confirmed)
+        try:
+            self.controller.execute_uninstall()
+        except ValueError as exc:
+            messagebox.showerror("Confirmation Required", str(exc))
+
+    # 12. Uninstall Progress Screen
+    def _build_uninstall_progress(self, parent: ttk.Frame) -> None:
+        title = ttk.Label(parent, text="Uninstalling Chief...", font=("Helvetica", 18, "bold"))
+        title.pack(anchor=tk.W, pady=(0, 12))
+
+        prog = ttk.Progressbar(parent, mode="indeterminate")
+        prog.pack(fill=tk.X, pady=(0, 16))
+        prog.start(15)
+
+        msg = ttk.Label(
+            parent,
+            text=self.controller.uninstall_message or "Stopping services and removing components...",
+            font=("Helvetica", 10),
+            foreground="#555555",
+        )
+        msg.pack(anchor=tk.W, pady=(0, 20))
+
+    # 13. Uninstall Result Screen
+    def _build_uninstall_result(self, parent: ttk.Frame) -> None:
+        res = self.controller.uninstall_result or {}
+        success = res.get("success", False)
+
+        if success:
+            title = ttk.Label(parent, text="Chief Uninstalled Successfully", font=("Helvetica", 18, "bold"), foreground="green")
+            title.pack(anchor=tk.W, pady=(0, 12))
+
+            mode_text = "Full Removal (Purged)" if res.get("purge") else "Standard Uninstall"
+            stopped = len(res.get("stopped_services", []))
+            unregistered = len(res.get("unregistered_tasks", []))
+            launchers = len(res.get("removed_launchers", []))
+            paths = len(res.get("removed_paths", []))
+
+            summary = (
+                f"Mode: {mode_text}\n\n"
+                f"• Stopped background services: {stopped}\n"
+                f"• Unregistered background tasks: {unregistered}\n"
+                f"• Removed desktop launchers: {launchers}\n"
+                f"• Removed component paths: {paths}\n\n"
+            )
+            if not res.get("purge"):
+                summary += "Your farm database, configuration, credentials, and backups were safely preserved on this computer."
+            else:
+                summary += "All farm data, credentials, and archives were completely removed."
+
+            desc = ttk.Label(parent, text=summary, font=("Helvetica", 10), wraplength=540, justify=tk.LEFT)
+            desc.pack(anchor=tk.W, pady=(0, 24))
+        else:
+            title = ttk.Label(parent, text="Uninstallation Incomplete", font=("Helvetica", 18, "bold"), foreground="red")
+            title.pack(anchor=tk.W, pady=(0, 12))
+
+            err = self.controller.uninstall_error or "; ".join(res.get("failed_items", ["Unknown error"]))
+            desc = ttk.Label(
+                parent,
+                text=f"The uninstaller encountered issues:\n\n{err}\n\nPlease close any programs that might have Chief files open and retry.",
+                font=("Helvetica", 10),
+                foreground="#333333",
+                wraplength=540,
+                justify=tk.LEFT,
+            )
+            desc.pack(anchor=tk.W, pady=(0, 24))
+
+        btn_bar = ttk.Frame(parent)
+        btn_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        close_btn = ttk.Button(btn_bar, text="Close", command=self.destroy)
+        close_btn.pack(side=tk.RIGHT)
+
+
+def launch_gui(platform_adapter: Optional[PlatformAdapter] = None, start_screen: Optional[ScreenId] = None) -> int:
     """Entrypoint to launch the graphical installer window."""
     try:
         app = InstallerApp(platform_adapter=platform_adapter)
+        if start_screen:
+            app.controller.set_screen(start_screen)
         app.mainloop()
         return 0
     except Exception as exc:
