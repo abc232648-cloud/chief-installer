@@ -1294,8 +1294,10 @@ class InstallerOrchestrator:
                 res = self.run_command_streaming(
                     install_cmd,
                     substep="Installing Chief dependencies into private runtime...",
-                    timeout=300.0,
-                    inactivity_timeout=90.0,
+                    # Wheel extraction and bytecode generation can be silent
+                    # on Windows. Silence is not proof that pip has stalled.
+                    # Keep progress heartbeats, cancellation and a hard bound.
+                    timeout=900.0,
                 )
                 if res.returncode != 0:
                     raise InstallerError(f"Failed to install requirements: {res.stderr.strip()}")

@@ -170,6 +170,29 @@ class FakePlatformAdapter(PlatformAdapter):
 
 
 
+def test_dependency_install_allows_silent_wheel_installation(tmp_path, monkeypatch):
+    import subprocess
+    paths = InstallerPaths.create(custom_root=tmp_path / "root", home=tmp_path / "home")
+    paths.tooling.mkdir(parents=True)
+    (paths.tooling / "requirements.txt").write_text("example==1.0\n")
+    instance = InstallerOrchestrator(
+        platform=FakePlatformAdapter(), paths=paths,
+        options=InstallOptions(owner_name="Test", owner_password="Synthetic-only"),
+        logger=InstallerLogger(log_dir=tmp_path / "logs"),
+    )
+    calls = []
+    def command(args, **kwargs):
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0, "", "")
+    monkeypatch.setattr(instance, "run_command_streaming", command)
+    monkeypatch.setattr(instance, "_is_test_fixture", lambda: False)
+    instance.state_machine.current_step = StepId.SYSTEM_DEPENDENCIES
+    instance._step_runtime()
+    install = next(kw for args, kw in calls if "-r" in args)
+    assert install.get("inactivity_timeout") is None
+    assert 0 < install["timeout"] <= 900
+
+
 def test_orchestrator_clean_host_install(tmp_path):
     paths = InstallerPaths.create(custom_root=tmp_path / "chief_root", home=tmp_path / "home")
     logger = InstallerLogger(log_dir=tmp_path / "logs", session_id="test_clean_install")
