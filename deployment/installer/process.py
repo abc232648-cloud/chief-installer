@@ -23,6 +23,7 @@ if sys.platform == "win32":
     _JobObjectExtendedLimitInformation = 9
     _JobObjectBasicProcessIdList = 3
     _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    _JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x1000
     _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     _PROCESS_TERMINATE = 0x0001
     _STILL_ACTIVE = 259
@@ -82,7 +83,22 @@ if sys.platform == "win32":
             ("szExeFile", ctypes.c_char * 260),
         ]
 
-    def _win_create_job() -> Optional[int]:
+    class _JobWrapper:
+        """Encapsulates a Win32 Job Object handle ensuring single-close semantics."""
+
+        def __init__(self, handle: int):
+            self.handle = handle
+
+        def close(self) -> None:
+            h = self.handle
+            self.handle = 0
+            if h:
+                try:
+                    _kernel32.CloseHandle(h)
+                except Exception:
+                    pass
+
+    def _win_create_job() -> Optional[_JobWrapper]:
         try:
             h_job = _kernel32.CreateJobObjectW(None, None)
             if not h_job:
@@ -98,7 +114,7 @@ if sys.platform == "win32":
             if not success:
                 _kernel32.CloseHandle(h_job)
                 return None
-            return h_job
+            return _JobWrapper(h_job)
         except Exception:
             return None
 
@@ -127,12 +143,13 @@ if sys.platform == "win32":
         finally:
             _kernel32.CloseHandle(h)
 
-    def _win_get_job_pids(job_handle: int) -> List[int]:
-        if not job_handle:
+    def _win_get_job_pids(job: Union[_JobWrapper, int]) -> List[int]:
+        h_job = job.handle if isinstance(job, _JobWrapper) else job
+        if not h_job:
             return []
         pid_list = _JOBOBJECT_BASIC_PROCESS_ID_LIST()
         res = _kernel32.QueryInformationJobObject(
-            job_handle,
+            h_job,
             _JobObjectBasicProcessIdList,
             ctypes.byref(pid_list),
             ctypes.sizeof(pid_list),
@@ -177,10 +194,14 @@ if sys.platform == "win32":
                     stack.append(child)
         return [p for p in descendants if _win_is_pid_alive(p)]
 
-    def _win_close_job(job_handle: Optional[int]) -> None:
-        if job_handle:
+    def _win_close_job(job: Optional[Union[_JobWrapper, int]]) -> None:
+        if job is None:
+            return
+        if isinstance(job, _JobWrapper):
+            job.close()
+        elif job:
             try:
-                _kernel32.CloseHandle(job_handle)
+                _kernel32.CloseHandle(job)
             except Exception:
                 pass
 
@@ -283,20 +304,20 @@ def popen(*args, **kwargs) -> subprocess.Popen:
     proc = subprocess.Popen(*args, **opts)
     if proc is not None and getattr(proc, "pid", None) is not None:
         if sys.platform == "win32":
-            h_job = _win_create_job()
-            if h_job:
+            job = _win_create_job()
+            if job:
                 proc_handle = getattr(proc, "_handle", None)
                 if proc_handle is not None:
                     try:
-                        if _kernel32.AssignProcessToJobObject(h_job, int(proc_handle)):
-                            proc._chief_job = h_job
-                            weakref.finalize(proc, _win_close_job, h_job)
+                        if _kernel32.AssignProcessToJobObject(job.handle, int(proc_handle)):
+                            proc._chief_job = job
+                            weakref.finalize(proc, job.close)
                         else:
-                            _win_close_job(h_job)
+                            job.close()
                     except Exception:
-                        _win_close_job(h_job)
+                        job.close()
                 else:
-                    _win_close_job(h_job)
+                    job.close()
         else:
             proc._chief_pgid = proc.pid
     return proc
@@ -313,11 +334,11 @@ def terminate_process_tree(proc: subprocess.Popen, timeout: float = 3.0) -> None
 
     # Check if process and all descendants are already dead
     if sys.platform == "win32":
-        job_handle = getattr(proc, "_chief_job", None)
-        if job_handle:
-            active_pids = _win_get_job_pids(job_handle)
+        job = getattr(proc, "_chief_job", None)
+        if job:
+            active_pids = _win_get_job_pids(job)
             if not active_pids and proc.poll() is not None:
-                _win_close_job(job_handle)
+                _win_close_job(job)
                 proc._chief_job = None
                 return
         elif proc.poll() is not None:
@@ -355,10 +376,10 @@ def terminate_process_tree(proc: subprocess.Popen, timeout: float = 3.0) -> None
     grace_deadline = time.monotonic() + grace_timeout
     while time.monotonic() < grace_deadline:
         if sys.platform == "win32":
-            job_handle = getattr(proc, "_chief_job", None)
-            if job_handle:
-                if not _win_get_job_pids(job_handle) and proc.poll() is not None:
-                    _win_close_job(job_handle)
+            job = getattr(proc, "_chief_job", None)
+            if job:
+                if not _win_get_job_pids(job) and proc.poll() is not None:
+                    _win_close_job(job)
                     proc._chief_job = None
                     return
             elif proc.poll() is not None and not _win_find_descendant_pids(proc.pid):
@@ -371,10 +392,11 @@ def terminate_process_tree(proc: subprocess.Popen, timeout: float = 3.0) -> None
 
     # 2. Forceful phase
     if sys.platform == "win32":
-        job_handle = getattr(proc, "_chief_job", None)
-        if job_handle:
+        job = getattr(proc, "_chief_job", None)
+        h_job = job.handle if isinstance(job, _JobWrapper) else job
+        if h_job:
             try:
-                _kernel32.TerminateJobObject(job_handle, 1)
+                _kernel32.TerminateJobObject(h_job, 1)
             except Exception:
                 pass
         else:
@@ -416,9 +438,9 @@ def terminate_process_tree(proc: subprocess.Popen, timeout: float = 3.0) -> None
     force_deadline = time.monotonic() + force_timeout
     while time.monotonic() < force_deadline:
         if sys.platform == "win32":
-            job_handle = getattr(proc, "_chief_job", None)
-            if job_handle:
-                if not _win_get_job_pids(job_handle) and proc.poll() is not None:
+            job = getattr(proc, "_chief_job", None)
+            if job:
+                if not _win_get_job_pids(job) and proc.poll() is not None:
                     break
             elif proc.poll() is not None and not _win_find_descendant_pids(proc.pid):
                 break
@@ -436,10 +458,10 @@ def terminate_process_tree(proc: subprocess.Popen, timeout: float = 3.0) -> None
     # 3. Verification phase: ensure zero surviving processes
     surviving: List[int] = []
     if sys.platform == "win32":
-        job_handle = getattr(proc, "_chief_job", None)
-        if job_handle:
-            surviving = _win_get_job_pids(job_handle)
-            _win_close_job(job_handle)
+        job = getattr(proc, "_chief_job", None)
+        if job:
+            surviving = _win_get_job_pids(job)
+            _win_close_job(job)
             proc._chief_job = None
         else:
             surviving = _win_find_descendant_pids(proc.pid)
@@ -621,9 +643,9 @@ def run_streaming(
         _drain_queue()
 
         if sys.platform == "win32":
-            job_handle = getattr(proc, "_chief_job", None)
-            if job_handle:
-                _win_close_job(job_handle)
+            job = getattr(proc, "_chief_job", None)
+            if job:
+                _win_close_job(job)
                 proc._chief_job = None
 
         return subprocess.CompletedProcess(
