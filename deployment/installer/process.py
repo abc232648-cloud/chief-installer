@@ -110,11 +110,26 @@ def run_streaming(
     open_readers = 2
     quiet_signalled = False
 
+    def _drain_queue():
+        while not q.empty():
+            try:
+                name, line = q.get_nowait()
+                if line is not None:
+                    if name == "out":
+                        captured_stdout.append(line)
+                    else:
+                        captured_stderr.append(line)
+                    if on_line:
+                        on_line(line)
+            except queue.Empty:
+                break
+
     while open_readers > 0 or proc.poll() is None:
         if check_cancelled and check_cancelled():
             terminate_process_tree(proc)
             t_out.join(timeout=1.0)
             t_err.join(timeout=1.0)
+            _drain_queue()
             from .errors import CancelledError
             raise CancelledError("Process execution was cancelled by user.")
 
@@ -123,12 +138,14 @@ def run_streaming(
             terminate_process_tree(proc)
             t_out.join(timeout=1.0)
             t_err.join(timeout=1.0)
+            _drain_queue()
             raise TimeoutError(f"Process timed out after {timeout:.1f} seconds.")
 
         if inactivity_timeout and (now - last_activity_time) > inactivity_timeout:
             terminate_process_tree(proc)
             t_out.join(timeout=1.0)
             t_err.join(timeout=1.0)
+            _drain_queue()
             raise TimeoutError(f"Process stalled: no activity observed for {inactivity_timeout:.1f} seconds.")
 
         if quiet_threshold and (now - last_activity_time) >= quiet_threshold and not quiet_signalled:

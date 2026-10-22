@@ -68,7 +68,7 @@ def test_run_streaming_inactivity_timeout():
     ]
     lines = []
     with pytest.raises(TimeoutError) as exc_info:
-        process.run_streaming(command, inactivity_timeout=0.3, on_line=lines.append)
+        process.run_streaming(command, inactivity_timeout=1.5, on_line=lines.append)
     assert "stalled: no activity observed" in str(exc_info.value)
     assert "init\n" in lines
 
@@ -87,7 +87,7 @@ def test_run_streaming_cancellation():
 
     # Use on_activity or timer to trigger cancel
     import threading
-    t = threading.Timer(0.2, lambda: cancelled.__setitem__(0, True))
+    t = threading.Timer(0.4, lambda: cancelled.__setitem__(0, True))
     t.start()
     try:
         with pytest.raises(CancelledError) as exc_info:
