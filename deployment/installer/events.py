@@ -18,6 +18,11 @@ class InstallEvent:
     retryable: bool = False
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
+    substep: Optional[str] = None
+    bytes_downloaded: Optional[int] = None
+    bytes_total: Optional[int] = None
+    phase_state: Optional[str] = None
+    activity_time: Optional[str] = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -58,12 +63,19 @@ class EventBus:
         retryable: bool = False,
         started_at: Optional[str] = None,
         finished_at: Optional[str] = None,
+        substep: Optional[str] = None,
+        bytes_downloaded: Optional[int] = None,
+        bytes_total: Optional[int] = None,
+        phase_state: Optional[str] = None,
+        activity_time: Optional[str] = None,
     ) -> InstallEvent:
         now_iso = datetime.now(timezone.utc).isoformat()
         if status == StepStatus.RUNNING and not started_at:
             started_at = now_iso
         elif status in (StepStatus.SUCCESS, StepStatus.FAILED, StepStatus.SKIPPED) and not finished_at:
             finished_at = now_iso
+        if not activity_time:
+            activity_time = now_iso
 
         event = InstallEvent(
             step_id=step_id,
@@ -75,6 +87,11 @@ class EventBus:
             retryable=retryable,
             started_at=started_at,
             finished_at=finished_at,
+            substep=substep,
+            bytes_downloaded=bytes_downloaded,
+            bytes_total=bytes_total,
+            phase_state=phase_state or ("WORKING" if status == StepStatus.RUNNING else ("COMPLETED" if status == StepStatus.SUCCESS else ("FAILED" if status == StepStatus.FAILED else None))),
+            activity_time=activity_time,
         )
         for listener in list(self._listeners):
             try:

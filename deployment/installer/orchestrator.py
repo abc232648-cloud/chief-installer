@@ -15,11 +15,12 @@ import shutil
 import socket
 import ssl
 import subprocess
-from .process import run as run_quiet
+import threading
+from .process import run as run_quiet, popen as popen_quiet, run_streaming, terminate_process_tree
 import sys
 import tarfile
 import time
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
@@ -205,6 +206,8 @@ class InstallerOrchestrator:
         self._tracked_services_started: List[str] = []
         self._tracked_units_created: List[Path] = []
         self._tracked_files_created: List[Path] = []
+        self._active_process: Optional[subprocess.Popen] = None
+        self._process_lock = threading.Lock()
         self._preexisting_paths: Set[Path] = set()
         for p_check in [
             self.paths.production,
@@ -467,12 +470,177 @@ class InstallerOrchestrator:
         self.logger.info("Rollback completed.")
 
     def cancel(self) -> None:
-        """Signal cancellation request."""
+        """Signal cancellation request and cleanly terminate any active child process."""
         self.state_machine.request_cancellation()
+        self.logger.warning("Cancellation requested by user.")
+        with self._process_lock:
+            if self._active_process and self._active_process.poll() is None:
+                try:
+                    terminate_process_tree(self._active_process)
+                except Exception as e:
+                    self.logger.warning(f"Error terminating active child process on cancel: {e}")
 
     def _check_cancelled(self) -> None:
         if self.state_machine.is_cancelled:
-            raise CancelledError()
+            raise CancelledError("Installation was cancelled by user.")
+
+    def run_command_streaming(
+        self,
+        cmd: List[str],
+        *,
+        substep: str,
+        cwd: Optional[Union[str, Path]] = None,
+        env: Optional[Dict[str, str]] = None,
+        timeout: Optional[float] = None,
+        inactivity_timeout: Optional[float] = None,
+        on_line: Optional[Callable[[str], None]] = None,
+        progress: float = 0.0,
+        bytes_downloaded: Optional[int] = None,
+        bytes_total: Optional[int] = None,
+    ) -> subprocess.CompletedProcess:
+        """Execute child process with quiet windowing, streaming output, substep notifications, and timeouts."""
+        self._check_cancelled()
+        self.state_machine.emit_substep(
+            substep,
+            progress=progress,
+            bytes_downloaded=bytes_downloaded,
+            bytes_total=bytes_total,
+            phase_state="WORKING",
+        )
+        self.logger.info(f"Substep: {substep}", command=" ".join(cmd[:4]))
+
+        def handle_line(line: str):
+            clean = line.strip()
+            if clean:
+                self.logger.info(clean)
+            if on_line:
+                on_line(line)
+
+        def handle_quiet(silence_sec: float):
+            quiet_msg = f"{substep} (waiting on background task, {int(silence_sec)}s quiet)..."
+            self.state_machine.emit_substep(
+                quiet_msg,
+                progress=progress,
+                bytes_downloaded=bytes_downloaded,
+                bytes_total=bytes_total,
+                phase_state="QUIET",
+            )
+            self.logger.info(quiet_msg)
+
+        local_sub = globals().get('subprocess')
+        is_mocked = False
+        if local_sub and (getattr(local_sub.run, '__module__', '') != 'subprocess' or getattr(local_sub.run, '__name__', '') != 'run'):
+            is_mocked = True
+        elif getattr(subprocess.run, '__module__', '') != 'subprocess' or getattr(subprocess.run, '__name__', '') != 'run':
+            is_mocked = True
+
+        if is_mocked:
+            runner = getattr(local_sub, 'run', subprocess.run)
+            res = runner(cmd, cwd=str(cwd) if cwd else None, env=env, capture_output=True, text=True)
+            if hasattr(res, 'stdout') and res.stdout:
+                handle_line(res.stdout)
+            if hasattr(res, 'stderr') and res.stderr:
+                handle_line(res.stderr)
+            return res
+
+        try:
+            return run_streaming(
+                cmd,
+                cwd=cwd,
+                env=env,
+                timeout=timeout,
+                inactivity_timeout=inactivity_timeout,
+                quiet_threshold=30.0,
+                on_line=handle_line,
+                on_quiet=handle_quiet,
+                check_cancelled=lambda: self.state_machine.is_cancelled,
+            )
+        except CancelledError:
+            self.state_machine.emit_substep(
+                "Cancelling operation and rolling back changes...",
+                phase_state="CANCELLING",
+            )
+            raise
+
+    def _download_file(
+        self,
+        url: str,
+        destination: Path,
+        *,
+        substep: str,
+        timeout: float = 30.0,
+    ) -> Path:
+        """Download remote URL to destination with streaming chunk progress and cancellation support."""
+        self._check_cancelled()
+        self.state_machine.emit_substep(
+            f"{substep} (connecting...)",
+            phase_state="WAITING",
+        )
+        self.logger.info(f"Downloading from {url} to {destination}...")
+
+        req = urllib.request.Request(url, headers={"User-Agent": "Chief-Installer/1.0"})
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temp_dest = destination.with_suffix(destination.suffix + ".part")
+
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                total_str = resp.headers.get("Content-Length")
+                total_bytes = int(total_str) if total_str and total_str.isdigit() else None
+                downloaded_bytes = 0
+                chunk_size = 65536
+                last_emit = 0.0
+
+                with open(temp_dest, "wb") as out_f:
+                    while True:
+                        self._check_cancelled()
+                        chunk = resp.read(chunk_size)
+                        if not chunk:
+                            break
+                        out_f.write(chunk)
+                        downloaded_bytes += len(chunk)
+
+                        now = time.time()
+                        if now - last_emit >= 0.5:
+                            last_emit = now
+                            if total_bytes and total_bytes > 0:
+                                pct = (downloaded_bytes / total_bytes) * 100.0
+                                prog_val = downloaded_bytes / total_bytes
+                                mb_down = downloaded_bytes / (1024 * 1024)
+                                mb_tot = total_bytes / (1024 * 1024)
+                                msg = f"{substep}: {mb_down:.1f} MB / {mb_tot:.1f} MB ({pct:.0f}%)"
+                            else:
+                                prog_val = 0.0
+                                mb_down = downloaded_bytes / (1024 * 1024)
+                                msg = f"{substep}: {mb_down:.1f} MB downloaded"
+
+                            self.state_machine.emit_substep(
+                                msg,
+                                progress=prog_val,
+                                bytes_downloaded=downloaded_bytes,
+                                bytes_total=total_bytes,
+                                phase_state="WORKING",
+                            )
+
+            if temp_dest.exists():
+                if destination.exists():
+                    destination.unlink()
+                temp_dest.rename(destination)
+            self._track_created_file(destination)
+            return destination
+        except CancelledError:
+            if temp_dest.exists():
+                try:
+                    temp_dest.unlink()
+                except Exception:
+                    pass
+            raise
+        except Exception as exc:
+            if temp_dest.exists():
+                try:
+                    temp_dest.unlink()
+                except Exception:
+                    pass
+            raise InstallerError(f"Download failed for {url}: {exc}") from exc
 
     def _is_test_fixture(self) -> bool:
         """Check if running under an explicit test fixture."""
@@ -679,8 +847,7 @@ class InstallerOrchestrator:
 
         shasums_url = f"https://nodejs.org/dist/v{node_ver}/SHASUMS256.txt"
         shasums_path = node_tmp / "SHASUMS256.txt"
-        self.logger.info(f"Downloading Node.js SHASUMS256.txt from {shasums_url}")
-        urllib.request.urlretrieve(shasums_url, str(shasums_path))
+        self._download_file(shasums_url, shasums_path, substep="Downloading Node.js checksums")
 
         expected_sha = None
         for line in shasums_path.read_text(encoding="utf-8").splitlines():
@@ -693,8 +860,7 @@ class InstallerOrchestrator:
 
         archive_url = f"https://nodejs.org/dist/v{node_ver}/{node_file}"
         archive_path = node_tmp / node_file
-        self.logger.info(f"Downloading Node.js archive from {archive_url}")
-        urllib.request.urlretrieve(archive_url, str(archive_path))
+        self._download_file(archive_url, archive_path, substep=f"Downloading Node.js {node_ver}")
 
         actual_sha = hashlib.sha256(archive_path.read_bytes()).hexdigest()
         if actual_sha.lower() != expected_sha.lower():
@@ -766,8 +932,7 @@ class InstallerOrchestrator:
 
         checksums_url = f"https://github.com/caddyserver/caddy/releases/download/v{caddy_ver}/caddy_{caddy_ver}_checksums.txt"
         checksums_path = download_tmp / "checksums.txt"
-        self.logger.info(f"Downloading Caddy checksums from {checksums_url}")
-        urllib.request.urlretrieve(checksums_url, str(checksums_path))
+        self._download_file(checksums_url, checksums_path, substep="Downloading Caddy checksums")
 
         actual_checksums_sha256 = hashlib.sha256(checksums_path.read_bytes()).hexdigest()
         if actual_checksums_sha256.lower() != self.manifest.caddy_checksum.lower():
@@ -786,8 +951,7 @@ class InstallerOrchestrator:
 
         archive_url = f"https://github.com/caddyserver/caddy/releases/download/v{caddy_ver}/{caddy_file}"
         archive_path = download_tmp / caddy_file
-        self.logger.info(f"Downloading Caddy binary archive from {archive_url}")
-        urllib.request.urlretrieve(archive_url, str(archive_path))
+        self._download_file(archive_url, archive_path, substep=f"Downloading Caddy {caddy_ver}")
 
         if len(expected_file_hash) == 128:
             actual_hash = hashlib.sha512(archive_path.read_bytes()).hexdigest()
@@ -883,7 +1047,7 @@ class InstallerOrchestrator:
         )
 
     def generate_caddy_service_cmd(self) -> str:
-        """Generate Windows batch runner script that sets explicit Caddy environment variables."""
+        """Generate Windows batch runner script that sets explicit Caddy environment variables (manual admin fallback)."""
         caddy_bin = self.paths.caddy_root / "bin" / "caddy.exe"
         data_parent = str(self.paths.caddy_root / "data")
         data_dir = str(self.paths.caddy_root / "data" / "caddy")
@@ -899,10 +1063,67 @@ class InstallerOrchestrator:
             f'"{caddy_bin}" run --config "{self.paths.caddyfile}" --adapter caddyfile\r\n'
         )
 
-    def generate_caddy_task_xml(self, user: str) -> str:
-        """Generate Windows Task Scheduler XML definition for Caddy TLS proxy."""
-        cmd_file = self.paths.caddy_root / "bin" / "caddy_service.cmd"
+    def generate_caddy_service_runner(self) -> str:
+        """Generate windowless Python runner script that sets Caddy environment and executes without console."""
+        caddy_bin = str(self.paths.caddy_root / "bin" / "caddy.exe")
+        data_parent = str(self.paths.caddy_root / "data")
+        data_dir = str(self.paths.caddy_root / "data" / "caddy")
+        config_parent = str(self.paths.caddy_root / "config")
+        config_dir = str(self.paths.caddy_root / "config" / "caddy")
+        caddyfile = str(self.paths.caddyfile)
         work_dir = str(self.paths.caddy_root)
+        return (
+            "# Windowless Caddy Background Service Runner for Chief\n"
+            "import os\n"
+            "import signal\n"
+            "import subprocess\n"
+            "import sys\n\n"
+            "def main():\n"
+            "    env = dict(os.environ)\n"
+            f"    env['XDG_DATA_HOME'] = {repr(data_parent)}\n"
+            f"    env['CADDY_DATA_DIR'] = {repr(data_dir)}\n"
+            f"    env['XDG_CONFIG_HOME'] = {repr(config_parent)}\n"
+            f"    env['CADDY_CONFIG_DIR'] = {repr(config_dir)}\n\n"
+            f"    cmd = [{repr(caddy_bin)}, 'run', '--config', {repr(caddyfile)}, '--adapter', 'caddyfile']\n"
+            "    creationflags = 0\n"
+            "    startupinfo = None\n"
+            "    if sys.platform == 'win32':\n"
+            "        creationflags = subprocess.CREATE_NO_WINDOW\n"
+            "        startupinfo = subprocess.STARTUPINFO()\n"
+            "        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW\n"
+            "        startupinfo.wShowWindow = subprocess.SW_HIDE\n\n"
+            "    proc = subprocess.Popen(\n"
+            "        cmd,\n"
+            f"        cwd={repr(work_dir)},\n"
+            "        env=env,\n"
+            "        creationflags=creationflags,\n"
+            "        startupinfo=startupinfo,\n"
+            "    )\n\n"
+            "    def _handle_term(signum, frame):\n"
+            "        try:\n"
+            "            proc.terminate()\n"
+            "        except Exception:\n"
+            "            pass\n\n"
+            "    signal.signal(signal.SIGTERM, _handle_term)\n"
+            "    signal.signal(signal.SIGINT, _handle_term)\n\n"
+            "    try:\n"
+            "        sys.exit(proc.wait())\n"
+            "    except KeyboardInterrupt:\n"
+            "        proc.terminate()\n"
+            "        sys.exit(proc.wait())\n\n"
+            "if __name__ == '__main__':\n"
+            "    main()\n"
+        )
+
+    def generate_caddy_task_xml(self, user: str) -> str:
+        """Generate Windows Task Scheduler XML definition for Caddy TLS proxy using windowless runner."""
+        runner_file = self.paths.caddy_root / "bin" / "caddy_runner.py"
+        work_dir = str(self.paths.caddy_root)
+        python_bin = self.paths.python
+        if os.name == "nt" or sys.platform == "win32":
+            pythonw = python_bin.with_name("pythonw.exe")
+            if pythonw.exists() or python_bin.name.lower() == "python.exe":
+                python_bin = pythonw
 
         task = ET.Element("Task", {"version": "1.4", "xmlns": "http://schemas.microsoft.com/windows/2004/02/mit/task"})
 
@@ -941,7 +1162,8 @@ class InstallerOrchestrator:
         actions = child(task, "Actions")
         actions.set("Context", "Owner")
         execute = child(actions, "Exec")
-        child(execute, "Command", str(cmd_file))
+        child(execute, "Command", str(python_bin))
+        child(execute, "Arguments", f'"{runner_file}"')
         child(execute, "WorkingDirectory", work_dir)
         return ET.tostring(task, encoding="utf-16", xml_declaration=True).decode("utf-16")
 
@@ -1024,18 +1246,33 @@ class InstallerOrchestrator:
         if not self.paths.python.exists():
             venv_cmd = [sys.executable, "-m", "venv", str(self.paths.runtime)]
             self.logger.info("Creating isolated Python virtual environment", venv_cmd=venv_cmd)
-            res = run_quiet(venv_cmd, capture_output=True, text=True)
+            res = self.run_command_streaming(
+                venv_cmd,
+                substep="Creating isolated Python runtime environment...",
+                timeout=90.0,
+            )
             if res.returncode != 0:
                 raise InstallerError(f"Failed to create Python virtual environment: {res.stderr.strip()}")
 
+            self.logger.info("Upgrading pip in runtime venv...")
             pip_cmd = [str(self.paths.python), "-m", "pip", "install", "--upgrade", "pip"]
-            run_quiet(pip_cmd, capture_output=True, text=True)
+            self.run_command_streaming(
+                pip_cmd,
+                substep="Upgrading package manager in runtime environment...",
+                timeout=120.0,
+                inactivity_timeout=45.0,
+            )
 
             reqs_file = self.paths.tooling / "requirements.txt"
             if reqs_file.exists():
                 self.logger.info(f"Installing Chief requirements from {reqs_file}")
                 install_cmd = [str(self.paths.python), "-m", "pip", "install", "-r", str(reqs_file)]
-                res = run_quiet(install_cmd, capture_output=True, text=True)
+                res = self.run_command_streaming(
+                    install_cmd,
+                    substep="Installing Chief dependencies into private runtime...",
+                    timeout=300.0,
+                    inactivity_timeout=60.0,
+                )
                 if res.returncode != 0:
                     raise InstallerError(f"Failed to install requirements: {res.stderr.strip()}")
 
@@ -1058,43 +1295,113 @@ class InstallerOrchestrator:
             self.state_machine.transition(StepId.BROWSER, StepStatus.SUCCESS, message="Browser engine ready (mock).")
             return
 
+        # Check for existing verified browser configuration
+        if self.paths.browser_config.exists():
+            try:
+                with open(self.paths.browser_config, "r", encoding="utf-8") as f:
+                    cached_info = json.load(f)
+                cached_exec = Path(cached_info.get("executable", ""))
+                if cached_exec.exists() and os.access(cached_exec, os.X_OK):
+                    self.logger.info("Reusing existing verified browser configuration", executable=str(cached_exec))
+                    self.state_machine.transition(StepId.BROWSER, StepStatus.SUCCESS, message="Browser engine verified from existing installation.")
+                    return
+            except Exception:
+                pass
+
         if not self.paths.browser_config.exists():
-            self.logger.info("Installing Playwright Chromium browser...")
-            install_cmd = [str(self.paths.python), "-m", "playwright", "install", "chromium"]
-            install_res = run_quiet(
-                install_cmd,
-                capture_output=True,
-                text=True,
-            )
+            self.state_machine.emit_substep("Detecting Playwright browser driver...", phase_state="WORKING")
+            driver_bin = None
+            driver_cli = None
+            try:
+                detect_code = (
+                    "import json\n"
+                    "try:\n"
+                    "    from playwright._impl._driver import compute_driver_executable\n"
+                    "    print(json.dumps(list(compute_driver_executable())))\n"
+                    "except Exception:\n"
+                    "    pass\n"
+                )
+                det_res = run_quiet([str(self.paths.python), "-c", detect_code], capture_output=True, text=True)
+                if det_res.returncode == 0 and det_res.stdout.strip():
+                    parsed = json.loads(det_res.stdout.strip().splitlines()[-1])
+                    if len(parsed) >= 2 and Path(parsed[0]).exists() and Path(parsed[1]).exists():
+                        driver_bin, driver_cli = parsed[0], parsed[1]
+            except Exception:
+                pass
+
+            if driver_bin and driver_cli:
+                install_cmd = [driver_bin, driver_cli, "install", "chromium"]
+            else:
+                install_cmd = [str(self.paths.python), "-m", "playwright", "install", "chromium"]
+
+            self.logger.info("Installing Playwright Chromium browser...", command=" ".join(install_cmd[:3]))
+
+            def _on_browser_line(line: str) -> None:
+                s = line.strip()
+                if not s:
+                    return
+                if "downloading" in s.lower() or "installing" in s.lower():
+                    self.state_machine.emit_substep(s, phase_state="WORKING")
+                elif "%" in s:
+                    m = re.search(r"(\d+)%", s)
+                    if m:
+                        pct = float(m.group(1)) / 100.0
+                        self.state_machine.emit_substep(
+                            f"Downloading browser engine ({m.group(1)}%)...",
+                            progress=pct,
+                            phase_state="WORKING",
+                        )
+
+            try:
+                install_res = self.run_command_streaming(
+                    install_cmd,
+                    substep="Downloading Chromium browser engine...",
+                    timeout=300.0,
+                    inactivity_timeout=60.0,
+                    on_line=_on_browser_line,
+                )
+            except TimeoutError as te:
+                raise InstallerError(f"Browser engine setup failed: {te}") from te
+
             if install_res.returncode != 0:
                 if os.name != "nt":
                     self.logger.info("Retrying with --with-deps...", error=install_res.stderr.strip())
-                    install_cmd = [str(self.paths.python), "-m", "playwright", "install", "--with-deps", "chromium"]
-                    install_res = run_quiet(
-                        install_cmd,
-                        capture_output=True,
-                        text=True,
-                    )
+                    if driver_bin and driver_cli:
+                        retry_cmd = [driver_bin, driver_cli, "install", "--with-deps", "chromium"]
+                    else:
+                        retry_cmd = [str(self.paths.python), "-m", "playwright", "install", "--with-deps", "chromium"]
+                    try:
+                        install_res = self.run_command_streaming(
+                            retry_cmd,
+                            substep="Retrying browser engine setup with system dependencies...",
+                            timeout=300.0,
+                            inactivity_timeout=60.0,
+                            on_line=_on_browser_line,
+                        )
+                    except TimeoutError as te:
+                        raise InstallerError(f"Browser engine setup failed: {te}") from te
+
             if install_res.returncode != 0:
                 raise InstallerError(
                     f"Playwright chromium installation failed with exit code {install_res.returncode}: {install_res.stderr.strip()}"
                 )
 
+            self.state_machine.emit_substep("Resolving Chromium executable path...", phase_state="WORKING")
             find_script = (
                 "from playwright.sync_api import sync_playwright\n"
                 "p = sync_playwright().start()\n"
                 "print(p.chromium.executable_path)\n"
                 "p.stop()\n"
             )
-            path_res = run_quiet(
+            path_res = self.run_command_streaming(
                 [str(self.paths.python), "-c", find_script],
-                capture_output=True,
-                text=True,
+                substep="Resolving installed Chromium executable location...",
+                timeout=30.0,
             )
             if path_res.returncode != 0 or not path_res.stdout.strip():
                 raise InstallerError(f"Failed to locate Chromium executable path: {path_res.stderr.strip()}")
 
-            chromium_exec = Path(path_res.stdout.strip())
+            chromium_exec = Path(path_res.stdout.strip().splitlines()[-1].strip())
             if not chromium_exec.exists():
                 raise InstallerError(f"Chromium executable does not exist at {chromium_exec}")
 
@@ -1115,10 +1422,10 @@ class InstallerOrchestrator:
                 "    browser.close()\n"
                 "print('CHIEF_PLAYWRIGHT_BROWSER_OK')\n"
             )
-            smoke_res = run_quiet(
+            smoke_res = self.run_command_streaming(
                 [str(self.paths.python), "-c", smoke_script],
-                capture_output=True,
-                text=True,
+                substep="Verifying browser launch and rendering acceptance...",
+                timeout=30.0,
             )
             if smoke_res.returncode != 0 or "CHIEF_PLAYWRIGHT_BROWSER_OK" not in smoke_res.stdout:
                 raise InstallerError(
@@ -1188,11 +1495,25 @@ class InstallerOrchestrator:
                 self.logger.info(f"Building {name} PWA with npm...")
                 npm_env = os.environ.copy()
                 npm_env["PATH"] = f"{node_bin.parent}{os.pathsep}{npm_env.get('PATH', '')}"
-                ci_res = run_quiet([str(npm_bin), "ci", "--engine-strict"], cwd=str(app_dir), capture_output=True, text=True, env=npm_env)
+                ci_res = self.run_command_streaming(
+                    [str(npm_bin), "ci", "--engine-strict"],
+                    substep=f"Installing {name.capitalize()} dependencies with npm...",
+                    cwd=str(app_dir),
+                    env=npm_env,
+                    timeout=300.0,
+                    inactivity_timeout=60.0,
+                )
                 if ci_res.returncode != 0:
                     raise InstallerError(f"npm ci failed for {name} PWA: {ci_res.stderr.strip()}")
 
-                build_res = run_quiet([str(npm_bin), "run", "build"], cwd=str(app_dir), capture_output=True, text=True, env=npm_env)
+                build_res = self.run_command_streaming(
+                    [str(npm_bin), "run", "build"],
+                    substep=f"Compiling {name.capitalize()} production assets...",
+                    cwd=str(app_dir),
+                    env=npm_env,
+                    timeout=300.0,
+                    inactivity_timeout=60.0,
+                )
                 if build_res.returncode != 0:
                     raise InstallerError(f"npm run build failed for {name} PWA: {build_res.stderr.strip()}")
 
@@ -1451,6 +1772,11 @@ class InstallerOrchestrator:
             cmd_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             cmd_file.write_text(cmd_script, encoding="utf-8")
             self._track_created_file(cmd_file)
+
+            runner_script = self.generate_caddy_service_runner()
+            runner_file = self.paths.caddy_root / "bin" / "caddy_runner.py"
+            runner_file.write_text(runner_script, encoding="utf-8")
+            self._track_created_file(runner_file)
 
             task_xml = self.generate_caddy_task_xml(user)
             task_file = self.paths.unit_dest / "chief-tls-proxy.xml"

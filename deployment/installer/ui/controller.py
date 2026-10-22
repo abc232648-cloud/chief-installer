@@ -6,6 +6,7 @@ operating system or deployment business logic. Can be tested headlessly.
 from enum import Enum
 import re
 import threading
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 from ..errors import InstallerError
@@ -74,6 +75,15 @@ class InstallerUIController:
         self.failed_reason: str = ""
         self.failed_step: str = ""
         self.diagnostic_report: str = ""
+
+        # Activity, timing, and progress metrics
+        self.start_time: Optional[float] = None
+        self.last_activity_time: Optional[float] = None
+        self.current_substep: str = ""
+        self.current_phase_state: str = "IDLE"
+        self.bytes_downloaded: Optional[int] = None
+        self.bytes_total: Optional[int] = None
+        self.is_cancelling: bool = False
 
         # Uninstall state
         self.uninstall_mode: str = "standard"
@@ -203,6 +213,12 @@ class InstallerUIController:
         }
 
     def start_installation(self) -> None:
+        self.start_time = time.time()
+        self.last_activity_time = self.start_time
+        self.current_phase_state = "WORKING"
+        self.is_cancelling = False
+        self.bytes_downloaded = None
+        self.bytes_total = None
         self.set_screen(ScreenId.PROGRESS)
 
         options = InstallOptions(
@@ -249,6 +265,9 @@ class InstallerUIController:
         return t
 
     def cancel_installation(self) -> None:
+        self.is_cancelling = True
+        self.current_phase_state = "CANCELLING"
+        self.current_substep = "Cancelling installation and safely rolling back partial changes..."
         if self._active_orchestrator:
             self._active_orchestrator.cancel()
 
@@ -257,6 +276,11 @@ class InstallerUIController:
         self.current_step_display = event.display_name
         self.current_step_message = event.message
         self.current_progress = event.progress
+        self.current_substep = event.substep or ""
+        self.current_phase_state = event.phase_state or ("WORKING" if event.status == StepStatus.RUNNING else event.status.value)
+        self.bytes_downloaded = event.bytes_downloaded
+        self.bytes_total = event.bytes_total
+        self.last_activity_time = time.time()
 
         for listener in self._progress_listeners:
             try:

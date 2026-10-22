@@ -80,7 +80,27 @@ class ChiefAgentDeploymentClient:
             )
 
         python_exec = str(self.python_bin) if self.python_bin.exists() else sys.executable
-        cmd = [python_exec, "-m", "deployment.contract", "--info"]
+        if sys.platform == "win32":
+            cmd = [
+                python_exec,
+                "-c",
+                "import sys, subprocess\n"
+                "_orig = subprocess.Popen\n"
+                "def _q(*a, **k):\n"
+                "    k['creationflags'] = k.get('creationflags', 0) | subprocess.CREATE_NO_WINDOW\n"
+                "    si = k.get('startupinfo') or subprocess.STARTUPINFO()\n"
+                "    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW\n"
+                "    si.wShowWindow = subprocess.SW_HIDE\n"
+                "    k['startupinfo'] = si\n"
+                "    return _orig(*a, **k)\n"
+                "subprocess.Popen = _q\n"
+                "import runpy\n"
+                "sys.argv = [sys.argv[0], '--info']\n"
+                "runpy.run_module('deployment.contract', run_name='__main__')\n",
+                "--info",
+            ]
+        else:
+            cmd = [python_exec, "-m", "deployment.contract", "--info"]
         env = dict(os.environ)
         env["PYTHONPATH"] = str(root)
 
@@ -181,6 +201,17 @@ class ChiefAgentDeploymentClient:
 
         runner = (
             "import sys, json\n"
+            "if sys.platform == 'win32':\n"
+            "    import subprocess\n"
+            "    _orig_popen = subprocess.Popen\n"
+            "    def _quiet_popen(*p_args, **p_kwargs):\n"
+            "        p_kwargs['creationflags'] = p_kwargs.get('creationflags', 0) | subprocess.CREATE_NO_WINDOW\n"
+            "        si = p_kwargs.get('startupinfo') or subprocess.STARTUPINFO()\n"
+            "        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW\n"
+            "        si.wShowWindow = subprocess.SW_HIDE\n"
+            "        p_kwargs['startupinfo'] = si\n"
+            "        return _orig_popen(*p_args, **p_kwargs)\n"
+            "    subprocess.Popen = _quiet_popen\n"
             "from pathlib import Path\n"
             "from deployment import contract\n"
             "raw = sys.stdin.read()\n"

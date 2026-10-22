@@ -17,6 +17,7 @@ import subprocess
 import sys
 from typing import Any, List, Optional, Tuple
 import webbrowser
+from .process import popen as popen_quiet
 
 from .manifest import CURRENT_RELEASE_MANIFEST
 from .orchestrator import InstallerPaths
@@ -304,7 +305,7 @@ def launch_console_window(diagnostic: ConsoleDiagnostic, paths: InstallerPaths) 
 
     cmd = build_app_mode_command(runner, diagnostic.console_url, diagnostic.public_host, profile_dir)
     try:
-        proc = subprocess.Popen(
+        proc = popen_quiet(
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -447,9 +448,17 @@ class ConsoleRecoveryUI:
 
         if self.diagnostic.state == ConsoleState.SETUP_REQUIRED:
             def on_run_installer():
-                # Launch installer
-                cmd = [sys.executable, "-m", "deployment.installer", "--gui"]
-                subprocess.Popen(cmd)
+                frozen_exe = os.environ.get("CHIEF_INSTALLER_FROZEN_EXECUTABLE")
+                if getattr(sys, "frozen", False) and frozen_exe and Path(frozen_exe).exists():
+                    cmd = [frozen_exe, "--gui"]
+                else:
+                    py_bin = sys.executable
+                    if os.name == "nt" and py_bin.lower().endswith("python.exe"):
+                        pyw = Path(py_bin).with_name("pythonw.exe")
+                        if pyw.exists():
+                            py_bin = str(pyw)
+                    cmd = [py_bin, "-m", "deployment.installer", "--gui"]
+                popen_quiet(cmd)
                 root.destroy()
 
             installer_btn = tk.Button(

@@ -212,14 +212,26 @@ def test_windows_caddy_storage_and_service_cmd(tmp_path):
     assert f'set "XDG_CONFIG_HOME={config_home}"' in cmd_script
     assert "run --config" in cmd_script
 
-    # Task XML executes caddy_service.cmd
+    # Task XML executes caddy_runner.py via windowless pythonw launcher
     xml_str = orchestrator.generate_caddy_task_xml("TestUser")
     root = ET.fromstring(xml_str)
     exec_node = root.find(".//{http://schemas.microsoft.com/windows/2004/02/mit/task}Exec")
     assert exec_node is not None
     cmd_text = exec_node.find("{http://schemas.microsoft.com/windows/2004/02/mit/task}Command").text
-    assert "caddy_service.cmd" in cmd_text
-    assert "caddy" in cmd_text.lower()
+    args_node = exec_node.find("{http://schemas.microsoft.com/windows/2004/02/mit/task}Arguments")
+    args_text = args_node.text if args_node is not None else ""
+    # Scheduled task must NOT invoke a console batch file (.cmd or cmd.exe)
+    assert not cmd_text.lower().endswith(".cmd")
+    assert "cmd.exe" not in cmd_text.lower()
+    assert "pythonw" in cmd_text.lower()
+    assert "caddy_runner.py" in args_text
+
+    # Windowless service runner sets explicit Caddy environment and CREATE_NO_WINDOW
+    runner_script = orchestrator.generate_caddy_service_runner()
+    assert "CREATE_NO_WINDOW" in runner_script
+    assert "SW_HIDE" in runner_script
+    assert f"env['CADDY_DATA_DIR'] = {repr(data_dir)}" in runner_script
+    assert f"env['XDG_DATA_HOME'] = {repr(data_home)}" in runner_script
 
 
 def test_windows_task_status_parsing(monkeypatch):

@@ -393,20 +393,28 @@ class InstallerApp(tk.Tk):
     # 8. Progress Screen
     def _build_progress(self, parent: ttk.Frame) -> None:
         title = ttk.Label(parent, text="Installing Chief...", font=("Helvetica", 16, "bold"))
-        title.pack(anchor=tk.W, pady=(0, 16))
+        title.pack(anchor=tk.W, pady=(0, 12))
 
         self.progress_bar = ttk.Progressbar(parent, mode="indeterminate")
-        self.progress_bar.pack(fill=tk.X, pady=(0, 16))
+        self.progress_bar.pack(fill=tk.X, pady=(0, 10))
         self.progress_bar.start(15)
 
         self.status_step_lbl = ttk.Label(parent, text="Starting installation...", font=("Helvetica", 10, "bold"))
-        self.status_step_lbl.pack(anchor=tk.W, pady=(0, 4))
+        self.status_step_lbl.pack(anchor=tk.W, pady=(0, 2))
 
-        self.status_msg_lbl = ttk.Label(parent, text="", font=("Helvetica", 9), foreground="#555555")
-        self.status_msg_lbl.pack(anchor=tk.W, pady=(0, 16))
+        self.status_substep_lbl = ttk.Label(parent, text="", font=("Helvetica", 9), foreground="#222222")
+        self.status_substep_lbl.pack(anchor=tk.W, pady=(0, 4))
+
+        self.metrics_lbl = ttk.Label(
+            parent,
+            text="Elapsed: 00:00  •  Active (just now)  •  Status: Initializing",
+            font=("Helvetica", 8),
+            foreground="#666666",
+        )
+        self.metrics_lbl.pack(anchor=tk.W, pady=(0, 10))
 
         log_frame = ttk.LabelFrame(parent, text="Technical Log", padding="8 8 8 8")
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 16))
+        log_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 12))
 
         self.progress_text = tk.Text(log_frame, height=8, width=60, font=("Courier", 8), wrap=tk.WORD)
         self.progress_text.pack(fill=tk.BOTH, expand=True)
@@ -414,13 +422,68 @@ class InstallerApp(tk.Tk):
         btn_bar = ttk.Frame(parent)
         btn_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
-        cancel_btn = ttk.Button(btn_bar, text="Cancel", command=self.controller.cancel_installation)
-        cancel_btn.pack(side=tk.RIGHT)
+        def on_cancel_clicked():
+            self.cancel_btn.config(text="Cancelling...", state=tk.DISABLED)
+            self.controller.cancel_installation()
+
+        self.cancel_btn = ttk.Button(btn_bar, text="Cancel", command=on_cancel_clicked)
+        self.cancel_btn.pack(side=tk.RIGHT)
+
+        # Start periodic progress tick
+        self._tick_progress()
+
+    def _tick_progress(self) -> None:
+        if self.controller.current_screen != ScreenId.PROGRESS:
+            return
+        if not hasattr(self, "metrics_lbl") or not self.metrics_lbl.winfo_exists():
+            return
+
+        now = time.time()
+        start = self.controller.start_time or now
+        last_act = self.controller.last_activity_time or now
+
+        elapsed_sec = int(now - start)
+        mins, secs = divmod(elapsed_sec, 60)
+        elapsed_str = f"{mins:02d}:{secs:02d}"
+
+        since_act = int(now - last_act)
+        if since_act < 5:
+            activity_str = "Active (just now)"
+        elif since_act < 30:
+            activity_str = f"Active ({since_act}s ago)"
+        else:
+            activity_str = f"Unusually quiet ({since_act}s since last response)"
+
+        phase = self.controller.current_phase_state.capitalize()
+        self.metrics_lbl.config(
+            text=f"Elapsed: {elapsed_str}  •  {activity_str}  •  Status: {phase}"
+        )
+
+        # Update determinate bar if total bytes are known
+        if (
+            self.controller.bytes_total
+            and self.controller.bytes_total > 0
+            and self.controller.bytes_downloaded is not None
+        ):
+            pct = min(100.0, (self.controller.bytes_downloaded / self.controller.bytes_total) * 100.0)
+            self.progress_bar.stop()
+            self.progress_bar.config(mode="determinate", maximum=100.0, value=pct)
+        elif self.progress_bar["mode"] == "determinate":
+            self.progress_bar.config(mode="indeterminate")
+            self.progress_bar.start(15)
+
+        if self.controller.is_cancelling:
+            if hasattr(self, "cancel_btn") and self.cancel_btn.winfo_exists():
+                self.cancel_btn.config(text="Cancelling...", state=tk.DISABLED)
+
+        self.after(500, self._tick_progress)
 
     def _update_progress_ui(self, event: InstallEvent) -> None:
         if hasattr(self, "status_step_lbl") and self.status_step_lbl.winfo_exists():
             self.status_step_lbl.config(text=f"→ {event.display_name}")
-            self.status_msg_lbl.config(text=event.message)
+            if hasattr(self, "status_substep_lbl") and self.status_substep_lbl.winfo_exists():
+                sub = event.substep or event.message
+                self.status_substep_lbl.config(text=sub)
             if hasattr(self, "progress_text") and self.progress_text.winfo_exists():
                 mark = "✓" if event.status == StepStatus.SUCCESS else ("✗" if event.status == StepStatus.FAILED else "→")
                 self.progress_text.insert(tk.END, f"{mark} {event.display_name}: {event.message}\n")

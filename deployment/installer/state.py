@@ -147,6 +147,36 @@ class StateMachine:
             finished_at=finished_at,
         )
 
+    def emit_substep(
+        self,
+        substep: str,
+        *,
+        progress: float = 0.0,
+        bytes_downloaded: Optional[int] = None,
+        bytes_total: Optional[int] = None,
+        phase_state: str = "WORKING",
+        message: Optional[str] = None,
+    ) -> None:
+        """Emit fine-grained substep progress for the currently running step without state transition."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        step_def = STEP_DEFINITIONS.get(self.current_step)
+        display_name = step_def.display_name if step_def else self.current_step.value
+        started_at = self._step_start_times.get(self.current_step, now_iso)
+
+        self.event_bus.emit(
+            step_id=self.current_step,
+            display_name=display_name,
+            status=self.current_status,
+            progress=progress,
+            message=message or substep,
+            substep=substep,
+            bytes_downloaded=bytes_downloaded,
+            bytes_total=bytes_total,
+            phase_state=phase_state,
+            started_at=started_at,
+            activity_time=now_iso,
+        )
+
     def fail(self, error: Exception, *, step_id: Optional[StepId] = None) -> None:
         failing_step = step_id or self.current_step
         code = getattr(error, "code", "INSTALLATION_FAILED")

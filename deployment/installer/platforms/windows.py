@@ -563,6 +563,10 @@ class WindowsPlatformAdapter(PlatformAdapter):
             target_exe = os.environ.get("CHIEF_INSTALLER_FROZEN_EXECUTABLE") or sys.executable
         elif hasattr(paths, "tooling") and (paths.tooling / "Chief-Installer-Windows.exe").exists():
             target_exe = str(paths.tooling / "Chief-Installer-Windows.exe")
+        elif os.name == "nt" and target_exe.lower().endswith("python.exe"):
+            pyw = Path(target_exe).with_name("pythonw.exe")
+            if pyw.exists():
+                target_exe = str(pyw)
 
         def _make_shortcut(link_path: Path, args: str, desc: str) -> None:
             ps_script = (
@@ -573,7 +577,7 @@ class WindowsPlatformAdapter(PlatformAdapter):
                 f"$s.Description = '{desc}'; "
                 f"$s.Save()"
             )
-            run_quiet(["powershell", "-NoProfile", "-Command", ps_script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            run_quiet(["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps_script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         if desktop_dir.is_dir():
             _make_shortcut(desktop_dir / "Chief Console.lnk", "--console", "Chief On-Farm Operations Console")
