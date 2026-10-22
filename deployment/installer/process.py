@@ -309,7 +309,7 @@ if sys.platform == "win32":
                 raise RuntimeError(f"QueryInformationJobObject failed with error {err}")
 
         raw_pids = list(buf.ProcessIdList[: buf.NumberOfProcessIdsInList])
-        return [p for p in raw_pids if p > 0 and _win_is_pid_alive(p)]
+        return [p for p in raw_pids if p > 0]
 
     def _job_is_valid(job: Any) -> bool:
         if job is None:
@@ -677,8 +677,15 @@ def run_streaming(
     if on_proc:
         try:
             on_proc(proc)
-        except Exception:
-            pass
+        except BaseException as operation_error:
+            try:
+                terminate_process_tree(proc)
+            except Exception as cleanup_error:
+                raise cleanup_error from operation_error
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None:
+                    stream.close()
+            raise
 
     q: queue.Queue = queue.Queue()
 
@@ -816,11 +823,9 @@ def run_streaming(
         # Drain any remaining lines in queue
         _drain_queue()
 
-        if sys.platform == "win32":
-            job = getattr(proc, "_chief_job", None)
-            if job:
-                _win_close_job(job)
-                proc._chief_job = None
+        # A successful root exit must not leave temporary descendants running.
+        cleaned_up = True
+        terminate_process_tree(proc)
 
         return subprocess.CompletedProcess(
             args=cmd,

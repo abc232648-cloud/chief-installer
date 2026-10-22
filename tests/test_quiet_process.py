@@ -566,3 +566,24 @@ def test_run_preserves_input_encoding_and_check():
     with pytest.raises(subprocess.CalledProcessError) as error:
         process.run([sys.executable, '-c', 'import sys; sys.exit(7)'], check=True)
     assert error.value.returncode == 7
+
+
+def test_streaming_success_reaps_detached_output_child(tmp_path):
+    marker = tmp_path / 'descendant.pid'
+    command = ("import subprocess,sys; from pathlib import Path; "
+               "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'],"
+               "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+               f"Path({str(marker)!r}).write_text(str(p.pid))")
+    result = process.run_streaming([sys.executable, '-c', command], timeout=5)
+    assert result.returncode == 0
+    assert not _is_pid_alive(int(marker.read_text()))
+
+
+def test_process_registration_callback_failure_reaps_child():
+    children = []
+    def fail(proc):
+        children.append(proc)
+        raise ValueError('registration failed')
+    with pytest.raises(ValueError, match='registration failed'):
+        process.run_streaming([sys.executable, '-c', 'import time; time.sleep(30)'], on_proc=fail)
+    assert children[0].poll() is not None

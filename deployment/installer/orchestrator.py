@@ -688,6 +688,12 @@ class InstallerOrchestrator:
                 if cand2.is_dir() and (cand2 / ".git").is_dir():
                     local_override = cand2
 
+        def run_git(command, **_capture_options):
+            # Git can wait on a slow network; keep it visible and cancellable.
+            return self.run_command_streaming(
+                command, substep=f"Preparing {component}: {command[1]}", timeout=600,
+            )
+
         clone_source = str(local_override) if local_override else repo_url
         preserved_dir: Optional[Path] = None
         if target_dir.exists() and any(target_dir.iterdir()) and not git_dir.exists():
@@ -707,14 +713,14 @@ class InstallerOrchestrator:
             if not target_dir.exists() or not any(target_dir.iterdir()):
                 target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
                 self.logger.info(f"Cloning {component} from {clone_source} at commit {commit}")
-                res = run_quiet(
+                res = run_git(
                     ["git", "clone", clone_source, str(target_dir)],
                     capture_output=True,
                     text=True,
                 )
                 if res.returncode != 0:
                     raise InstallerError(f"Failed to clone {component} from {clone_source}: {res.stderr.strip()}")
-                res = run_quiet(
+                res = run_git(
                     ["git", "-C", str(target_dir), "checkout", commit],
                     capture_output=True,
                     text=True,
@@ -727,7 +733,7 @@ class InstallerOrchestrator:
                         f"Cannot verify {component} staging at {target_dir}: "
                         "the directory is not a Git checkout."
                     )
-                status = run_quiet(
+                status = run_git(
                     ["git", "-C", str(target_dir), "status", "--porcelain"],
                     capture_output=True, text=True,
                 )
@@ -737,26 +743,26 @@ class InstallerOrchestrator:
                         "it contains local changes or its Git status cannot be verified. "
                         "Preserve those files before retrying; nothing was discarded."
                     )
-                res = run_quiet(
+                res = run_git(
                     ["git", "-C", str(target_dir), "rev-parse", "HEAD"],
                     capture_output=True,
                     text=True,
                 )
                 actual_head = res.stdout.strip().lower()
                 if actual_head != commit.lower():
-                    checkout_res = run_quiet(
+                    checkout_res = run_git(
                         ["git", "-C", str(target_dir), "checkout", commit],
                         capture_output=True,
                         text=True,
                     )
                     if checkout_res.returncode != 0:
                         fetch_src = str(local_override) if local_override else "origin"
-                        run_quiet(
+                        run_git(
                             ["git", "-C", str(target_dir), "fetch", fetch_src],
                             capture_output=True,
                             text=True,
                         )
-                        res2 = run_quiet(
+                        res2 = run_git(
                             ["git", "-C", str(target_dir), "checkout", commit],
                             capture_output=True,
                             text=True,
@@ -766,7 +772,7 @@ class InstallerOrchestrator:
 
             if not git_dir.exists():
                 raise InstallerError(f"Acquired {component} at {target_dir} is not a Git checkout.")
-            res = run_quiet(
+            res = run_git(
                 ["git", "-C", str(target_dir), "rev-parse", "HEAD"],
                 capture_output=True,
                 text=True,

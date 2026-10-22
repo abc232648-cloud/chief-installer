@@ -164,3 +164,18 @@ def test_cleanup_failure_preserves_files_before_rollback(tmp_path):
     installer._cleanup_unverified = True
     installer._rollback_attempt()
     assert marker.exists()
+
+
+def test_repository_acquisition_uses_cancellable_runner(tmp_path, monkeypatch):
+    from deployment.installer.errors import CancelledError
+    installer = make_installer(tmp_path)
+    calls = []
+    def cancel(command, **kwargs):
+        calls.append((command, kwargs))
+        raise CancelledError('synthetic cancellation')
+    monkeypatch.setattr(installer, 'run_command_streaming', cancel)
+    with pytest.raises(CancelledError):
+        installer._acquire_repository(component='chief-agent', repo_url='https://example.invalid/source',
+                                      commit='a'*40, target_dir=tmp_path/'new-source')
+    assert calls[0][0][0] == 'git'
+    assert calls[0][1]['timeout'] == 600
