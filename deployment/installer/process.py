@@ -313,11 +313,6 @@ if sys.platform == "win32":
             return
         if isinstance(job, _JobWrapper):
             job.close()
-        elif _is_valid_handle(job):
-            try:
-                _kernel32.CloseHandle(wintypes.HANDLE(job))
-            except Exception:
-                pass
 
 
 def _posix_is_pid_alive(pid: int) -> bool:
@@ -596,6 +591,13 @@ def terminate_process_tree(proc: subprocess.Popen, timeout: float = 3.0) -> None
 
     if proc.poll() is None and proc.pid not in surviving:
         surviving.append(proc.pid)
+
+    for stream in (getattr(proc, "stdin", None), getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
+        if stream is not None and not getattr(stream, "closed", True):
+            try:
+                stream.close()
+            except Exception:
+                pass
 
     if surviving:
         raise RuntimeError(

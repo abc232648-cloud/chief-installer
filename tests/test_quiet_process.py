@@ -182,15 +182,19 @@ def test_terminate_process_tree_parent_exits_before_descendants():
     gc_code = "import time; time.sleep(60)"
     parent_code = f"import subprocess, sys; c = subprocess.Popen([sys.executable, '-c', {repr(gc_code)}]); print(c.pid); sys.stdout.flush()"
     proc = process.popen([sys.executable, "-c", parent_code], stdout=subprocess.PIPE, text=True)
-    child_pid_str = proc.stdout.readline().strip()
-    child_pid = int(child_pid_str)
-    proc.wait(timeout=5.0)
-    assert proc.poll() is not None, "Parent process should have exited"
-    assert _is_pid_alive(child_pid), "Child process should still be alive before terminate_process_tree"
+    try:
+        child_pid_str = proc.stdout.readline().strip()
+        child_pid = int(child_pid_str)
+        proc.wait(timeout=5.0)
+        assert proc.poll() is not None, "Parent process should have exited"
+        assert _is_pid_alive(child_pid), "Child process should still be alive before terminate_process_tree"
 
-    # Terminate tree
-    process.terminate_process_tree(proc, timeout=3.0)
-    assert not _is_pid_alive(child_pid), "Child process must be terminated even though parent already exited"
+        # Terminate tree
+        process.terminate_process_tree(proc, timeout=3.0)
+        assert not _is_pid_alive(child_pid), "Child process must be terminated even though parent already exited"
+    finally:
+        if proc.stdout and not proc.stdout.closed:
+            proc.stdout.close()
 
 
 def test_terminate_process_tree_multi_generation_grandchild():
@@ -200,19 +204,23 @@ def test_terminate_process_tree_multi_generation_grandchild():
     parent_code = f"import subprocess, sys; c = subprocess.Popen([sys.executable, '-c', {repr(child_code)}], stdout=subprocess.PIPE, text=True); print('C:' + str(c.pid)); print(c.stdout.readline().strip()); sys.stdout.flush()"
 
     proc = process.popen([sys.executable, "-c", parent_code], stdout=subprocess.PIPE, text=True)
-    c_line = proc.stdout.readline().strip()
-    gc_line = proc.stdout.readline().strip()
-    c_pid = int(c_line.split(":")[1])
-    gc_pid = int(gc_line.split(":")[1])
-    proc.wait(timeout=5.0)
+    try:
+        c_line = proc.stdout.readline().strip()
+        gc_line = proc.stdout.readline().strip()
+        c_pid = int(c_line.split(":")[1])
+        gc_pid = int(gc_line.split(":")[1])
+        proc.wait(timeout=5.0)
 
-    assert _is_pid_alive(c_pid), "Child should be alive"
-    assert _is_pid_alive(gc_pid), "Grandchild should be alive"
+        assert _is_pid_alive(c_pid), "Child should be alive"
+        assert _is_pid_alive(gc_pid), "Grandchild should be alive"
 
-    process.terminate_process_tree(proc, timeout=3.0)
+        process.terminate_process_tree(proc, timeout=3.0)
 
-    assert not _is_pid_alive(c_pid), "Child must be terminated"
-    assert not _is_pid_alive(gc_pid), "Grandchild must be terminated"
+        assert not _is_pid_alive(c_pid), "Child must be terminated"
+        assert not _is_pid_alive(gc_pid), "Grandchild must be terminated"
+    finally:
+        if proc.stdout and not proc.stdout.closed:
+            proc.stdout.close()
 
 
 def test_run_streaming_cancellation_terminates_descendants():
@@ -305,7 +313,7 @@ def test_terminate_process_tree_verification_failure_raises(monkeypatch):
 
     if os.name == "nt":
         monkeypatch.setattr(process, "_win_get_job_pids", lambda job: [999999])
-        fake_proc._chief_job = 1234
+        fake_proc._chief_job = process._win_create_job()
     else:
         monkeypatch.setattr(process, "_posix_is_pgid_alive", lambda pgid: True)
 
@@ -436,6 +444,10 @@ def test_persistent_service_lifecycle_boundary():
         assert _is_pid_alive(service_proc.pid), "Persistent service must remain alive"
         assert service_proc.poll() is None
     finally:
+        try:
+            temp_proc.wait(timeout=1.0)
+        except Exception:
+            pass
         try:
             service_proc.terminate()
             service_proc.wait(timeout=2.0)
