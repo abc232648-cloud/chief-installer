@@ -32,6 +32,7 @@ a = Analysis(
         'deployment.installer.ui.app',
         'deployment.installer.ui.controller',
         'deployment.installer.console',
+        'deployment.installer.process',
         'zipfile',
         'xml.etree.ElementTree',
     ],

@@ -307,6 +307,7 @@ def launch_console_window(diagnostic: ConsoleDiagnostic, paths: InstallerPaths) 
     try:
         proc = popen_quiet(
             cmd,
+            contained=False,  # browser must outlive the installer process; Job Object must not kill it
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True if os.name != "nt" else False,
@@ -458,7 +459,7 @@ class ConsoleRecoveryUI:
                         if pyw.exists():
                             py_bin = str(pyw)
                     cmd = [py_bin, "-m", "deployment.installer", "--gui"]
-                popen_quiet(cmd)
+                popen_quiet(cmd, contained=False)  # installer must outlive this dialog process
                 root.destroy()
 
             installer_btn = tk.Button(

@@ -78,7 +78,7 @@ def test_windows_creates_distinct_console_and_installer_shortcuts(tmp_path, monk
     def mock_run(cmd, *args, **kwargs):
         captured_cmds.append(cmd)
         return subprocess.CompletedProcess(cmd, 0)
-    monkeypatch.setattr(subprocess, "run", mock_run)
+    monkeypatch.setattr("deployment.installer.platforms.windows.run_quiet", mock_run)
 
     adapter = WindowsPlatformAdapter()
     paths = InstallerPaths(

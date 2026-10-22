@@ -2,23 +2,18 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
 from deployment.installer import process
 
-
-@pytest.mark.parametrize('method', ['run', 'popen'])
-def test_non_windows_options_unchanged(monkeypatch, method):
+def test_non_windows_options_unchanged(monkeypatch):
     monkeypatch.setattr(process.sys, 'platform', 'linux')
-    calls=[]
-    monkeypatch.setattr(subprocess, 'run' if method=='run' else 'Popen',
-                        lambda *args, **kwargs: calls.append(kwargs))
-    getattr(process,method)(['tool'], stdout=subprocess.PIPE, env={'TEST':'value'})
-    if method == 'popen':
-        assert calls==[{'stdout':subprocess.PIPE,'env':{'TEST':'value'},'start_new_session':True}]
-    else:
-        assert calls==[{'stdout':subprocess.PIPE,'env':{'TEST':'value'}}]
+    calls = []
+    monkeypatch.setattr(subprocess, 'Popen', lambda *args, **kwargs: calls.append(kwargs))
+    process.popen(['tool'], stdout=subprocess.PIPE, env={'TEST':'value'})
+    assert calls == [{'stdout':subprocess.PIPE,'env':{'TEST':'value'},'start_new_session':True}]
 
 
 @pytest.mark.skipif(os.name!='nt', reason='Windows console allocation check')
@@ -308,12 +303,11 @@ def test_terminate_process_tree_preserves_unrelated_process():
 
 def test_terminate_process_tree_verification_failure_raises(monkeypatch):
     """Verify that terminate_process_tree raises RuntimeError if cleanup cannot be confirmed."""
-    fake_proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(0)"])
+    fake_proc = process.popen([sys.executable, "-c", "import sys; sys.exit(0)"])
     fake_proc.wait()
 
     if os.name == "nt":
         monkeypatch.setattr(process, "_win_get_job_pids", lambda job: [999999])
-        fake_proc._chief_job = process._win_create_job()
     else:
         monkeypatch.setattr(process, "_posix_is_pgid_alive", lambda pgid: True)
 
@@ -350,7 +344,7 @@ def test_windows_immediate_grandchild_containment_race():
 @pytest.mark.parametrize("fail_point", ["assign", "resume"])
 def test_windows_job_launch_failure_no_leaks(fail_point):
     """Verify that launch failure in Job assignment or thread resume safely terminates the suspended process with no leaks."""
-    process._containment_tls.sim_fail = fail_point
+    process._popen_sim_fail.value = fail_point
     failed = False
     try:
         proc = process.popen([sys.executable, "-c", "import time; time.sleep(30)"])
@@ -358,8 +352,8 @@ def test_windows_job_launch_failure_no_leaks(fail_point):
         failed = True
         assert fail_point in str(e).lower()
     finally:
-        leaked_pid = getattr(process._containment_tls, "last_created_pid", None)
-        process._containment_tls.sim_fail = None
+        leaked_pid = process._popen_sim_fail.last_created_pid
+        process._popen_sim_fail.value = None
 
     assert failed, f"Expected popen to fail safely at {fail_point}"
     assert leaked_pid is not None
@@ -379,7 +373,7 @@ def test_windows_job_creation_failure_fails_safely(monkeypatch):
 @pytest.mark.skipif(os.name != "nt", reason="Windows Job Object buffer growth test")
 def test_windows_query_buffer_growth_retrieves_all_processes():
     """Verify that when more processes exist than the initial query buffer can hold, buffer is dynamically resized."""
-    process._containment_tls.initial_query_buffer_size = 1
+    process._popen_sim_fail.initial_query_buffer_size = 1
     job = process._win_create_job()
     assert job is not None
     procs = []
@@ -397,7 +391,7 @@ def test_windows_query_buffer_growth_retrieves_all_processes():
         for p in procs:
             assert p.pid in pids, f"PID {p.pid} must be in returned job PIDs: {pids}"
     finally:
-        process._containment_tls.initial_query_buffer_size = 64
+        process._popen_sim_fail.initial_query_buffer_size = 64
         job.close()
         for p in procs:
             try:
@@ -532,3 +526,43 @@ def test_posix_graceful_resistance_forces_kill():
     assert _is_pid_alive(proc.pid)
     process.terminate_process_tree(proc, timeout=2.0)
     assert not _is_pid_alive(proc.pid)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows monkeypatch guard")
+def test_import_does_not_patch_winapi():
+    """Verify that importing process.py does not replace _winapi.CreateProcess."""
+    import _winapi
+    import importlib
+    original_fn = _winapi.CreateProcess
+    # Reload the module; it must NOT reassign _winapi.CreateProcess
+    importlib.reload(process)
+    assert _winapi.CreateProcess is original_fn, (
+        "Importing/reloading deployment.installer.process must not replace "
+        "_winapi.CreateProcess"
+    )
+
+
+@pytest.mark.parametrize('exit_parent', [False, True])
+def test_run_owns_descendants(tmp_path, exit_parent):
+    pid_file = tmp_path / 'child.pid'
+    parent = ("import subprocess,sys,time; from pathlib import Path; "
+              "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+              "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+              f"Path({str(pid_file)!r}).write_text(str(p.pid)); "
+              + ("" if exit_parent else "time.sleep(60)"))
+    if exit_parent:
+        process.run([sys.executable, '-c', parent], capture_output=True, timeout=5)
+    else:
+        with pytest.raises(subprocess.TimeoutExpired):
+            process.run([sys.executable, '-c', parent], capture_output=True, timeout=2)
+    assert pid_file.exists()
+    assert not _is_pid_alive(int(pid_file.read_text()))
+
+
+def test_run_preserves_input_encoding_and_check():
+    result = process.run([sys.executable, '-c', 'import sys; print(sys.stdin.read())'],
+                         input='hello', capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == 'hello'
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        process.run([sys.executable, '-c', 'import sys; sys.exit(7)'], check=True)
+    assert error.value.returncode == 7

@@ -12,6 +12,10 @@ import weakref
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
+class ProcessCleanupError(RuntimeError):
+    """Owned processes could not be verified stopped; preserve working files."""
+
+
 _LINE_SPLIT_REGEX = re.compile(r"(\r\n|\r|\n)")
 
 if sys.platform == "win32":
@@ -200,60 +204,66 @@ if sys.platform == "win32":
         finally:
             _kernel32.CloseHandle(wintypes.HANDLE(h))
 
-    _containment_tls = threading.local()
-    _orig_CreateProcess = _winapi.CreateProcess
+    # Save a direct reference to the real _winapi.CreateProcess BEFORE module
+    # initialisation completes so we own it regardless of any external patching.
+    # We NEVER reassign _winapi.CreateProcess – no monkeypatching.
+    _real_CreateProcess = _winapi.CreateProcess
 
-    def _hooked_create_process(*args, **kwargs):
-        job = getattr(_containment_tls, "job", None)
-        if job is None:
-            return _orig_CreateProcess(*args, **kwargs)
+    class _SimFail:
+        """Thread-local-free test injection point for simulating win32 launch failures."""
+        value: Optional[str] = None
+        last_created_pid: Optional[int] = None
 
-        args_list = list(args)
-        if len(args_list) > 5:
-            args_list[5] = args_list[5] | _CREATE_SUSPENDED
-        elif "dwCreationFlags" in kwargs:
-            kwargs["dwCreationFlags"] = kwargs["dwCreationFlags"] | _CREATE_SUSPENDED
-        elif "creationflags" in kwargs:
-            kwargs["creationflags"] = kwargs["creationflags"] | _CREATE_SUSPENDED
+    _popen_sim_fail = _SimFail()
 
-        hp, ht, pid, tid = _orig_CreateProcess(*args_list, **kwargs)
-        _containment_tls.last_created_pid = pid
+    def _win_create_process_in_job(args_or_str, job, opts, sim_fail=None):
+        """Use CPython pipe/handle setup with a per-launch Windows API facade.
 
-        try:
-            sim_fail = getattr(_containment_tls, "sim_fail", None)
-            if sim_fail == "assign":
-                asg_ok = False
-            else:
-                h_job = job.handle if isinstance(job, _JobWrapper) else job
-                asg_ok = bool(_kernel32.AssignProcessToJobObject(
-                    wintypes.HANDLE(h_job),
-                    wintypes.HANDLE(hp),
-                ))
+        The function globals are copied, never modified in subprocess itself.
+        This private CPython seam is covered by the supported Python CI matrix.
+        """
+        import types
 
-            if not asg_ok:
-                err = _kernel32.GetLastError() or _ERROR_ACCESS_DENIED
-                _kernel32.TerminateProcess(wintypes.HANDLE(hp), 1)
-                _kernel32.CloseHandle(wintypes.HANDLE(ht))
-                _kernel32.CloseHandle(wintypes.HANDLE(hp))
-                raise OSError(err, f"AssignProcessToJobObject failed with WinError {err}")
+        class LaunchAPI:
+            def __getattr__(self, name):
+                return getattr(_winapi, name)
 
-            if sim_fail == "resume":
-                res = 0xFFFFFFFF
-            else:
-                res = _kernel32.ResumeThread(wintypes.HANDLE(ht))
+            def CreateProcess(self, *args, **kwargs):
+                arguments = list(args)
+                arguments[5] |= _CREATE_SUSPENDED
+                hp, ht, pid, tid = _real_CreateProcess(*arguments, **kwargs)
+                _popen_sim_fail.last_created_pid = pid
+                try:
+                    if sim_fail == "assign" or not _kernel32.AssignProcessToJobObject(
+                        wintypes.HANDLE(job.handle), wintypes.HANDLE(hp)
+                    ):
+                        raise OSError(_kernel32.GetLastError() or 5, "AssignProcessToJobObject failed")
+                    result = (0xFFFFFFFF if sim_fail == "resume" else
+                              _kernel32.ResumeThread(wintypes.HANDLE(ht)))
+                    if result == 0xFFFFFFFF:
+                        raise OSError(_kernel32.GetLastError() or 5, "ResumeThread failed")
+                    return hp, ht, pid, tid
+                except BaseException:
+                    try:
+                        if not _kernel32.TerminateProcess(wintypes.HANDLE(hp), 1):
+                            raise ctypes.WinError(_kernel32.GetLastError())
+                        if _winapi.WaitForSingleObject(hp, 3000) != 0:
+                            raise RuntimeError("Failed to reap suspended child")
+                    finally:
+                        _winapi.CloseHandle(ht)
+                        _winapi.CloseHandle(hp)
+                    raise
 
-            if res == 0xFFFFFFFF:
-                err = _kernel32.GetLastError() or _ERROR_ACCESS_DENIED
-                _kernel32.TerminateProcess(wintypes.HANDLE(hp), 1)
-                _kernel32.CloseHandle(wintypes.HANDLE(ht))
-                _kernel32.CloseHandle(wintypes.HANDLE(hp))
-                raise OSError(err, f"ResumeThread failed with WinError {err}")
-        except Exception:
-            raise
-
-        return hp, ht, pid, tid
-
-    _winapi.CreateProcess = _hooked_create_process
+        original = subprocess.Popen._execute_child
+        namespace = dict(original.__globals__)
+        namespace['_winapi'] = LaunchAPI()
+        execute = types.FunctionType(original.__code__, namespace,
+                                     original.__name__, original.__defaults__,
+                                     original.__closure__)
+        execute.__kwdefaults__ = original.__kwdefaults__
+        class ContainedPopen(subprocess.Popen):
+            _execute_child = execute
+        return ContainedPopen(args_or_str, **opts)
 
     def _win_get_job_pids(job: Union[_JobWrapper, int]) -> List[int]:
         """Retrieve currently active process IDs in the Job Object.
@@ -265,10 +275,10 @@ if sys.platform == "win32":
         if not _is_valid_handle(h_job):
             raise ValueError("Invalid Job Object handle provided to _win_get_job_pids")
 
-        if getattr(_containment_tls, "sim_query_fail", False):
+        if getattr(_popen_sim_fail, "sim_query_fail", False):
             raise RuntimeError("Simulated QueryInformationJobObject failure")
 
-        init_size = getattr(_containment_tls, "initial_query_buffer_size", 64)
+        init_size = getattr(_popen_sim_fail, "initial_query_buffer_size", 64)
         struct_cls = _make_process_id_list_struct(init_size)
         buf = struct_cls()
 
@@ -403,7 +413,40 @@ def _options(options: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def run(*args, contained: bool = True, **kwargs) -> subprocess.CompletedProcess:
-    return subprocess.run(*args, **_options(kwargs))
+    """Synchronous temporary command with the same ownership as streaming."""
+    if not contained:
+        return subprocess.run(*args, **_options(kwargs))
+    check = kwargs.pop("check", False)
+    input_ = kwargs.pop("input", None)
+    timeout = kwargs.pop("timeout", None)
+    capture = kwargs.pop("capture_output", False)
+    if capture:
+        if kwargs.get("stdout") is not None or kwargs.get("stderr") is not None:
+            raise ValueError("capture_output is mutually exclusive with stdout/stderr")
+        kwargs["stdout"] = kwargs["stderr"] = subprocess.PIPE
+    if input_ is not None:
+        if kwargs.get("stdin") is not None:
+            raise ValueError("stdin and input arguments may not both be used")
+        kwargs["stdin"] = subprocess.PIPE
+    proc = popen(*args, contained=True, **kwargs)
+    try:
+        stdout_data, stderr_data = proc.communicate(input=input_, timeout=timeout)
+    except BaseException as operation_error:
+        try:
+            terminate_process_tree(proc)
+        except Exception as cleanup_error:
+            raise cleanup_error from operation_error
+        raise
+    else:
+        terminate_process_tree(proc)
+    finally:
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
+    result = subprocess.CompletedProcess(proc.args, proc.returncode, stdout_data, stderr_data)
+    if check:
+        result.check_returncode()
+    return result
 
 
 def popen(*args, contained: bool = True, **kwargs) -> subprocess.Popen:
@@ -413,6 +456,7 @@ def popen(*args, contained: bool = True, **kwargs) -> subprocess.Popen:
             opts.setdefault("start_new_session", True)
         proc = subprocess.Popen(*args, **opts)
         if contained and proc is not None and getattr(proc, "pid", None) is not None:
+            proc._chief_cleanup_lock = threading.RLock()
             proc._chief_pgid = proc.pid
         return proc
 
@@ -424,24 +468,34 @@ def popen(*args, contained: bool = True, **kwargs) -> subprocess.Popen:
     if job is None:
         raise RuntimeError("Failed to create and configure Windows Job Object for process containment")
 
-    _containment_tls.job = job
-    proc = None
+    cmd = args[0] if args else opts.pop("args", None)
+    sim_fail = _popen_sim_fail.value
     try:
-        proc = subprocess.Popen(*args, **opts)
+        proc = _win_create_process_in_job(cmd, job, opts, sim_fail=sim_fail)
     except Exception:
         job.close()
         raise
-    finally:
-        _containment_tls.job = None
 
-    if proc is not None:
-        proc._chief_job = job
-        weakref.finalize(proc, job.close)
-
+    proc._chief_cleanup_lock = threading.RLock()
+    proc._chief_job = job
+    weakref.finalize(proc, job.close)
     return proc
 
 
 def terminate_process_tree(proc: subprocess.Popen, timeout: float = 3.0) -> None:
+    if proc is None:
+        return
+    lock = getattr(proc, '_chief_cleanup_lock', None)
+    if lock is None:
+        raise ProcessCleanupError('Cannot verify ownership of this process')
+    with lock:
+        try:
+            _terminate_owned_tree(proc, timeout)
+        except Exception as exc:
+            raise ProcessCleanupError(str(exc)) from exc
+
+
+def _terminate_owned_tree(proc: subprocess.Popen, timeout: float = 3.0) -> None:
     """Safely terminate a process and all its descendants with bounded shutdown and verification.
 
     Establishes ownership via Windows Job Objects or POSIX process groups,
@@ -591,13 +645,6 @@ def terminate_process_tree(proc: subprocess.Popen, timeout: float = 3.0) -> None
 
     if proc.poll() is None and proc.pid not in surviving:
         surviving.append(proc.pid)
-
-    for stream in (getattr(proc, "stdin", None), getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
-        if stream is not None and not getattr(stream, "closed", True):
-            try:
-                stream.close()
-            except Exception:
-                pass
 
     if surviving:
         raise RuntimeError(

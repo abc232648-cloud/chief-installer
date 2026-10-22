@@ -154,3 +154,13 @@ def test_cached_wrong_node_version_is_not_reused(tmp_path, monkeypatch):
         return SimpleNamespace(returncode=0, stdout='v' + (installer.manifest.node_version if command[0] == str(system_node) else '22.23.3'))
     monkeypatch.setattr(module, 'run_quiet', version)
     assert installer._acquire_node_runtime() == (system_node, system_npm)
+
+
+def test_cleanup_failure_preserves_files_before_rollback(tmp_path):
+    installer = make_installer(tmp_path)
+    marker = tmp_path / "owned-partial-file"
+    marker.write_text("preserve until process cleanup is verified")
+    installer._tracked_files_created.append(marker)
+    installer._cleanup_unverified = True
+    installer._rollback_attempt()
+    assert marker.exists()

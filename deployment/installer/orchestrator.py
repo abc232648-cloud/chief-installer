@@ -16,7 +16,7 @@ import socket
 import ssl
 import subprocess
 import threading
-from .process import run as run_quiet, popen as popen_quiet, run_streaming, terminate_process_tree
+from .process import run as run_quiet, popen as popen_quiet, run_streaming, terminate_process_tree, ProcessCleanupError
 import sys
 import tarfile
 import time
@@ -207,6 +207,7 @@ class InstallerOrchestrator:
         self._tracked_units_created: List[Path] = []
         self._tracked_files_created: List[Path] = []
         self._active_process: Optional[subprocess.Popen] = None
+        self._cleanup_unverified = False
         self._process_lock = threading.Lock()
         self._preexisting_paths: Set[Path] = set()
         for p_check in [
@@ -388,6 +389,8 @@ class InstallerOrchestrator:
                 error="Installation cancelled by user.",
             )
         except Exception as exc:
+            if isinstance(exc, ProcessCleanupError):
+                self._cleanup_unverified = True
             duration = round(time.time() - start_time, 2)
             self.state_machine.fail(exc)
             report = self.logger.generate_diagnostic_report(failed_step=self.state_machine.current_step.value, error=exc)
@@ -410,6 +413,9 @@ class InstallerOrchestrator:
         and removes partial credentials and configurations.
         Preserves diagnostic logs, existing backups, and unrelated files.
         """
+        if self._cleanup_unverified:
+            self.logger.error("Rollback paused: process cleanup is unverified. Preserve files for recovery.")
+            return
         self.logger.info("Executing rollback of partial installation attempt...")
         # 1. Stop and disable started services
         if self._tracked_services_started:
@@ -473,12 +479,6 @@ class InstallerOrchestrator:
         """Signal cancellation request and cleanly terminate any active child process."""
         self.state_machine.request_cancellation()
         self.logger.warning("Cancellation requested by user.")
-        with self._process_lock:
-            if self._active_process:
-                try:
-                    terminate_process_tree(self._active_process)
-                except Exception as e:
-                    self.logger.warning(f"Error terminating active child process on cancel: {e}")
 
     def _check_cancelled(self) -> None:
         if self.state_machine.is_cancelled:
@@ -560,6 +560,9 @@ class InstallerOrchestrator:
                 on_proc=_set_active_proc,
                 check_cancelled=lambda: self.state_machine.is_cancelled,
             )
+        except ProcessCleanupError:
+            self._cleanup_unverified = True
+            raise
         except CancelledError:
             self.state_machine.emit_substep(
                 "Cancelling operation and rolling back changes...",
