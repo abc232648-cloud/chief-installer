@@ -21,6 +21,12 @@ SHA_FILE = PACKAGE_DIR / "Chief-Installer-Windows.exe.sha256"
 
 
 def main() -> int:
+    global PACKAGE_BIN, META_FILE, SHA_FILE
+    if len(sys.argv) > 1:
+        PACKAGE_BIN = Path(sys.argv[1]).resolve()
+        META_FILE = PACKAGE_BIN.parent / "INSTALLER_SHA256.json"
+        SHA_FILE = PACKAGE_BIN.parent / (PACKAGE_BIN.name + ".sha256")
+
     print("=== Chief Windows Packaged Artifact Qualification ===")
 
     # 1. Ensure package exists or build it
