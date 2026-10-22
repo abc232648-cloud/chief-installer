@@ -8,6 +8,7 @@ Supports Windows 10 and Windows 11 x64 systems using native Windows conventions:
 - Safe archive and partial recovery without destroying user repositories
 """
 import csv
+import base64
 from datetime import datetime, timezone
 import getpass
 import io
@@ -495,6 +496,59 @@ class WindowsPlatformAdapter(PlatformAdapter):
                 run_quiet(["schtasks", "/end", "/tn", task], capture_output=True, text=True)
             except Exception:
                 pass
+
+    def quiesce_installation(self, root: Path, service_names: List[str]) -> None:
+        """Disable owned tasks and verify no executable in this install remains alive.
+
+        Task Scheduler /end alone can leave launcher children running. Never
+        kill by image name: other installations may also use Python or Caddy.
+        """
+        root = Path(root).resolve()
+        if root == root.parent or len(root.parts) < 3:
+            raise ValueError("Refusing an unbounded installation process scope")
+        allowed = {'chief-agent-dashboard', 'chief-agent-worker',
+                   'chief-agent-scheduler', 'chief-tls-proxy'}
+        names = [self._normalize_task_name(s) for s in service_names]
+        if not set(names).issubset(allowed):
+            raise ValueError("Unknown Chief service in cleanup scope")
+        # Quote literal data for PowerShell; never interpolate shell code.
+        literal = lambda value: "'" + str(value).replace("'", "''") + "'"
+        script = """
+$ErrorActionPreference = 'Stop'
+$root = ROOT_LITERAL
+$names = @(NAMES_LITERAL)
+$prefix = $root.TrimEnd('\\') + '\\'
+$tasks = @(Get-ScheduledTask | Where-Object { $_.TaskPath -eq '\\' -and $_.TaskName -in $names })
+foreach ($task in $tasks) {
+    $task | Disable-ScheduledTask | Out-Null
+    $task | Stop-ScheduledTask
+}
+function OwnedProcesses {
+    @(Get-CimInstance Win32_Process | Where-Object {
+        $_.ExecutablePath -and $_.ExecutablePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+    })
+}
+$deadline = [DateTime]::UtcNow.AddSeconds(15)
+do {
+    foreach ($item in @(OwnedProcesses)) {
+        $process = Get-Process -Id $item.ProcessId -ErrorAction SilentlyContinue
+        if ($process -and $process.Path -and $process.Path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+            $process | Stop-Process -Force -ErrorAction Stop
+        }
+    }
+    $remaining = @(OwnedProcesses)
+    $running = @(Get-ScheduledTask | Where-Object { $_.TaskPath -eq '\\' -and $_.TaskName -in $names -and $_.State -eq 'Running' })
+    if ($remaining.Count -eq 0 -and $running.Count -eq 0) { Write-Output 'CHIEF_STOP_VERIFIED'; exit 0 }
+    Start-Sleep -Milliseconds 200
+} while ([DateTime]::UtcNow -lt $deadline)
+throw 'Chief processes or tasks remain active; files must not be moved or removed.'
+""".replace('ROOT_LITERAL', literal(root)).replace('NAMES_LITERAL', ','.join(map(literal, names)))
+        encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
+        result = run_quiet(['powershell.exe', '-NoProfile', '-NonInteractive',
+                            '-WindowStyle', 'Hidden', '-EncodedCommand', encoded],
+                           capture_output=True, text=True, timeout=30)
+        if result.returncode != 0 or 'CHIEF_STOP_VERIFIED' not in result.stdout.splitlines():
+            raise RuntimeError('Chief service shutdown could not be verified; preserving installation files.')
 
     def install_wireguard_system_config(self, source_conf: Path) -> None:
         raise UnsupportedPlatformError("WireGuard server hosting is only supported on Linux (Ubuntu systemd on Folio). WireGuard server cannot be hosted on Windows.")

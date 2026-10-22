@@ -417,6 +417,13 @@ class InstallerOrchestrator:
             self.logger.error("Rollback paused: process cleanup is unverified. Preserve files for recovery.")
             return
         self.logger.info("Executing rollback of partial installation attempt...")
+        if self._tracked_services_started and hasattr(self.platform, 'quiesce_installation'):
+            try:
+                self.platform.quiesce_installation(self.paths.root, self._tracked_services_started)
+            except Exception as exc:
+                self._cleanup_unverified = True
+                self.logger.error(f"Rollback paused: {exc}")
+                return
         # 1. Stop and disable started services
         if self._tracked_services_started:
             self.logger.info("Rollback: stopping started services...", services=self._tracked_services_started)
@@ -1236,6 +1243,16 @@ class InstallerOrchestrator:
 
     def _step_archive(self, existing_paths: list) -> None:
         self.state_machine.transition(StepId.ARCHIVE, StepStatus.RUNNING, message="Safely archiving previous Chief installations...")
+        if hasattr(self.platform, 'quiesce_installation'):
+            self.state_machine.emit_substep("Stopping previous Chief services before archiving...")
+            services = ["chief-agent-dashboard.service", "chief-agent-worker.service",
+                        "chief-agent-scheduler.service", "chief-tls-proxy.service"]
+            roots = {self.paths.root}
+            roots.update(Path(p) for p in existing_paths
+                         if (Path(p) / 'runtime').exists() or (Path(p) / 'caddy').exists())
+            for root in roots:
+                self._check_cancelled()
+                self.platform.quiesce_installation(root, services)
         arch_path = self.platform.archive_existing_installation(
             self.paths.archive_base,
             progress_callback=lambda msg: self.logger.info(f"Archive: {msg}"),
@@ -1951,6 +1968,9 @@ class InstallerOrchestrator:
 
         services = ["chief-agent-dashboard.service", "chief-agent-worker.service",
                     "chief-agent-scheduler.service", "chief-tls-proxy.service"]
+        # Record intent before enabling or starting anything: a partial failure
+        # can otherwise leave an untracked running service behind.
+        self._tracked_services_started = list(services)
         enabled = self.platform.control_services("enable", services)
         for service in services:
             if not enabled.get(service, False):
