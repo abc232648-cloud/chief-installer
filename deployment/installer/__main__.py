@@ -16,6 +16,25 @@ except ImportError:
 _FROZEN_EXECUTABLE_ENV = "CHIEF_INSTALLER_FROZEN_EXECUTABLE"
 
 
+def _resolve_python_alias(candidate: str) -> str:
+    """Avoid app-alias filesystem virtualization for installed AppData files."""
+    from pathlib import Path
+    if os.name != "nt" or "windowsapps" not in {p.lower() for p in Path(candidate).parts}:
+        return candidate
+    import json
+    from deployment.installer.process import run
+    result = run(
+        [candidate, "-c", "import json,sys; print(json.dumps(sys.executable))"],
+        cwd=os.environ.get("SystemRoot", r"C:\Windows"),
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    resolved = Path(json.loads(result.stdout.strip()))
+    if (not resolved.is_absolute() or not resolved.is_file() or
+            "windowsapps" in {p.lower() for p in resolved.parts}):
+        raise RuntimeError("Python app alias did not resolve to an installed interpreter")
+    return str(resolved)
+
+
 def _restore_external_loader_environment() -> None:
     """Undo PyInstaller's Linux loader-path override for child processes.
 
@@ -61,7 +80,7 @@ def _configure_packaged_python() -> None:
 
     host_python = shutil.which("python3") or shutil.which("python")
     if host_python:
-        sys.executable = host_python
+        sys.executable = _resolve_python_alias(host_python)
 
     _restore_external_loader_environment()
 
