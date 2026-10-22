@@ -1968,21 +1968,7 @@ def uninstall_chief(
     ] if purge else []
     all_targets_to_remove = runtime_paths_to_remove + purge_targets
 
-    real_home = Path.home().resolve()
     configured_home = p.get_home().resolve()
-    if configured_home != real_home:
-        real_forbidden = [
-            real_home / "Chief_Device_Setup",
-            real_home / "Chief_Previous_Installations",
-        ]
-        for target in all_targets_to_remove:
-            target_resolved = target.resolve()
-            if any(target_resolved == forbidden.resolve() for forbidden in real_forbidden):
-                raise InstallerError(
-                    f"Safety guard violation: target '{target}' resolves into the real user home "
-                    f"while custom home '{configured_home}' was supplied."
-                )
-
     allowed_roots = [configured_home, p.root.resolve(), p.config_root.resolve()]
     for target in all_targets_to_remove:
         target_resolved = target.resolve()
