@@ -17,7 +17,6 @@ from pathlib import Path
 import pytest
 import shutil
 import sys
-import tempfile
 import threading
 
 from test_installer_orchestrator import FakePlatformAdapter
@@ -311,12 +310,16 @@ def test_cleanup_local_discovery_preserves_unrelated_hosts_and_legacy_chief_loca
     hosts_file = tmp_path / "hosts"
     initial_hosts = (
         "127.0.0.1\tlocalhost\n"
-        "127.0.0.1\tchief-my-farm.local\t# Chief local host\n"
+        "127.0.0.1\tchief-my-farm.local\t# Chief on-farm console local host\n"
         "127.0.0.1\tchief.local\t# Unrelated or legacy service\n"
         "192.168.1.100\tnas-storage.local\n"
         "::1\tlocalhost ip6-localhost\n"
     )
     hosts_file.write_text(initial_hosts, encoding="utf-8")
+    conf_file = tmp_path / "avahi-daemon.conf"
+    conf_file.write_text("[server]\nhost-name=unrelated-farm\n", encoding="utf-8")
+    service_file = tmp_path / "chief.service"
+    service_file.write_text("pre-existing user service definition", encoding="utf-8")
 
     monkeypatch.setattr("deployment.installer.privileged.linux.Path", lambda p: hosts_file if p == "/etc/hosts" else Path(p))
     mock_run = lambda *args, **kwargs: subprocess.CompletedProcess(args=args[0] if args else [], returncode=0, stdout="", stderr="")
@@ -324,7 +327,12 @@ def test_cleanup_local_discovery_preserves_unrelated_hosts_and_legacy_chief_loca
     monkeypatch.setattr("deployment.installer.privileged.linux.subprocess.run", mock_run)
 
     # Clean up ONLY the confirmed canonical host for this installation
-    ret = run_cleanup_local_discovery("chief-my-farm.local", hosts_path_override=hosts_file)
+    ret = run_cleanup_local_discovery(
+        "chief-my-farm.local",
+        hosts_path_override=hosts_file,
+        conf_path_override=conf_file,
+        avahi_service_override=service_file,
+    )
     assert ret == 0
 
     resulting_hosts = hosts_file.read_text(encoding="utf-8")
@@ -337,6 +345,33 @@ def test_cleanup_local_discovery_preserves_unrelated_hosts_and_legacy_chief_loca
     assert "chief.local" in resulting_hosts
     assert "192.168.1.100\tnas-storage.local" in resulting_hosts
     assert "::1\tlocalhost ip6-localhost" in resulting_hosts
+    assert conf_file.read_text(encoding="utf-8") == "[server]\nhost-name=unrelated-farm\n"
+    assert service_file.read_text(encoding="utf-8") == "pre-existing user service definition"
+
+
+def test_cleanup_unknown_avahi_ownership_fails_without_modifying_config(tmp_path, monkeypatch):
+    """A legacy matching Avahi hostname without an ownership record is preserved and reported."""
+    from deployment.installer.privileged.linux import run_cleanup_local_discovery
+    import shutil
+
+    hosts = tmp_path / "hosts"
+    hosts_original = "127.0.0.1\tlocalhost chief-farm.local\n"
+    hosts.write_text(hosts_original, encoding="utf-8")
+    conf = tmp_path / "avahi-daemon.conf"
+    conf_original = "[server]\nhost-name=chief-farm\nuse-ipv4=yes\n"
+    conf.write_text(conf_original, encoding="utf-8")
+    monkeypatch.setattr(shutil, "which", lambda _: None)
+
+    result = run_cleanup_local_discovery(
+        "chief-farm.local",
+        hosts_path_override=hosts,
+        conf_path_override=conf,
+        state_path_override=tmp_path / "missing-state.json",
+    )
+
+    assert result == 1
+    assert conf.read_text(encoding="utf-8") == conf_original
+    assert hosts.read_text(encoding="utf-8") == hosts_original
 
 
 def test_purge_entrypoints_require_explicit_confirmation(tmp_path, monkeypatch):
@@ -605,17 +640,19 @@ def test_packaged_gui_uninstall_modes_and_terminal_fallback_protection(tmp_path,
     assert "Chief Installation" not in err_buf2.getvalue()
 
 
-def test_purge_preserves_real_home_sentinel_with_temporary_home(tmp_path):
-    """Prove that running full purge against a temporary home directory removes temporary
+def test_purge_preserves_default_home_sentinel_when_custom_home_supplied(tmp_path, monkeypatch):
+    """Keep the default-profile sentinel intact while purging a different temp home.
 
-    setup files while leaving real home's Chief_Device_Setup directory and sentinel untouched.
+    Both profiles are pytest temporary directories: this test verifies the real
+    Path.home() decision path without writing into the developer's account.
     """
-    real_setup_dir = Path.home() / "Chief_Device_Setup"
+    default_home = tmp_path / "default_profile"
+    monkeypatch.setattr(Path, "home", lambda: default_home)
+    real_setup_dir = default_home / "Chief_Device_Setup"
     real_setup_dir.mkdir(parents=True, exist_ok=True)
-    real_sentinel = real_setup_dir / "real_sentinel_do_not_delete.txt"
-    real_sentinel.write_text("ACTIVE_FARM_REAL_SENTINEL", encoding="utf-8")
-
+    real_sentinel = real_setup_dir / "sentinel.txt"
     try:
+        real_sentinel.write_text("ACTIVE_FARM_REAL_SENTINEL", encoding="utf-8")
         temp_home = tmp_path / "temp_farmer_home"
         temp_root = tmp_path / "temp_chief_root"
         temp_paths = InstallerPaths.create(custom_root=temp_root, home=temp_home)
@@ -648,19 +685,17 @@ def test_purge_preserves_real_home_sentinel_with_temporary_home(tmp_path):
     finally:
         if real_sentinel.exists():
             real_sentinel.unlink()
-        try:
-            if real_setup_dir.exists() and not any(real_setup_dir.iterdir()):
-                real_setup_dir.rmdir()
-        except Exception:
-            pass
+        if real_setup_dir.exists() and not any(real_setup_dir.iterdir()):
+            real_setup_dir.rmdir()
 
 
-def test_purge_safety_guard_rejects_targets_outside_temp_home(tmp_path):
+def test_purge_safety_guard_rejects_targets_outside_temp_home(tmp_path, monkeypatch):
     """Verify that if a purge target resolves outside supplied boundaries or to real home,
 
     uninstall_chief fails closed immediately before touching any files.
     """
     temp_home = tmp_path / "temp_home"
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "default_profile")
     temp_root = tmp_path / "temp_root"
     temp_paths = InstallerPaths.create(custom_root=temp_root, home=temp_home)
 
@@ -673,14 +708,20 @@ def test_purge_safety_guard_rejects_targets_outside_temp_home(tmp_path):
     with pytest.raises(InstallerError) as exc_info:
         uninstall_chief(paths=rogue_paths, platform=adapter, purge=True, confirmed=True)
     assert "Safety guard violation" in str(exc_info.value)
+    assert adapter.stopped_services == []
+    assert adapter.disabled_services == []
+    assert adapter.unregistered_units == []
 
     # Case B: When custom temp home is supplied, target pointing to real home setup dir must fail
     rogue_paths_real = InstallerPaths.create(custom_root=temp_root, home=temp_home)
-    rogue_paths_real.device_setup_dir = Path.home() / "Chief_Device_Setup"
+    rogue_paths_real.device_setup_dir = (tmp_path / "default_profile" / "Chief_Device_Setup")
 
     with pytest.raises(InstallerError) as exc_info2:
         uninstall_chief(paths=rogue_paths_real, platform=adapter, purge=True, confirmed=True)
     assert "Safety guard violation" in str(exc_info2.value)
+    assert adapter.stopped_services == []
+    assert adapter.disabled_services == []
+    assert adapter.unregistered_units == []
 
 
 def test_avahi_and_hosts_cleanup_preserves_unrelated_settings_and_services(tmp_path, monkeypatch):
@@ -693,18 +734,18 @@ def test_avahi_and_hosts_cleanup_preserves_unrelated_settings_and_services(tmp_p
     # 1. Setup isolated /etc/hosts with Chief and unrelated entries
     hosts_path = tmp_path / "hosts"
     hosts_path.write_text(
-        "127.0.0.1\tlocalhost my-farm.local unrelated-host.local\n"
-        "::1\tlocalhost ip6-localhost my-farm.local other-alias.local\n"
+        "127.0.0.1\tlocalhost unrelated-host.local\n"
+        "::1\tlocalhost ip6-localhost other-alias.local\n"
         "192.168.1.50\tnas.farm.local\n",
         encoding="utf-8",
     )
 
-    # 2. Setup isolated avahi-daemon.conf with Chief hostname, unrelated settings, and sections
+    # 2. Setup isolated Avahi config with a previous hostname and unrelated settings.
     conf_path = tmp_path / "avahi-daemon.conf"
     initial_conf = (
         "# Avahi daemon configuration\n"
         "[server]\n"
-        "host-name=my-farm\n"
+        "host-name=previous-farm\n"
         "use-ipv4=yes\n"
         "ratelimit-interval-usec=1000000\n"
         "\n"
@@ -713,8 +754,10 @@ def test_avahi_and_hosts_cleanup_preserves_unrelated_settings_and_services(tmp_p
         "publish-hinfo=no\n"
     )
     conf_path.write_text(initial_conf, encoding="utf-8")
+    state_path = conf_path.with_name(conf_path.name + ".chief-state")
 
-    # 3. Setup Avahi services directory with chief.service and unrelated service
+    # The installer does not create or track these service files, so cleanup
+    # must preserve both.
     services_dir = tmp_path / "services"
     services_dir.mkdir(parents=True, exist_ok=True)
     chief_service = services_dir / "chief.service"
@@ -722,18 +765,32 @@ def test_avahi_and_hosts_cleanup_preserves_unrelated_settings_and_services(tmp_p
     unrelated_service = services_dir / "ssh.service"
     unrelated_service.write_text("<service-group><name>SSH</name></service-group>", encoding="utf-8")
 
-    # Mock systemctl try-restart avahi-daemon succeeding
+    # Mock systemctl operations succeeding.
     import shutil
     monkeypatch.setattr(shutil, "which", lambda cmd: f"/bin/{cmd}")
     mock_run = lambda *args, **kwargs: subprocess.CompletedProcess(args=args[0] if args else [], returncode=0, stdout="", stderr="")
     monkeypatch.setattr(subprocess, "run", mock_run)
 
-    # Run cleanup for "my-farm.local"
+    # Exercise setup and uninstall as a pair. Setup records the existing
+    # hostname before replacing it; cleanup must restore it exactly.
+    from deployment.installer.privileged.linux import run_configure_avahi
+    setup_rc = run_configure_avahi(
+        "my-farm",
+        conf_path_override=conf_path,
+        hosts_path_override=hosts_path,
+        nsswitch_path_override=tmp_path / "nsswitch.conf",
+        state_path_override=state_path,
+    )
+    assert setup_rc == 0
+    assert "host-name=my-farm\n" in conf_path.read_text(encoding="utf-8")
+    assert state_path.exists()
+
     rc = run_cleanup_local_discovery(
         "my-farm.local",
         hosts_path_override=hosts_path,
         conf_path_override=conf_path,
         avahi_service_override=chief_service,
+        state_path_override=state_path,
     )
     assert rc == 0
 
@@ -744,9 +801,10 @@ def test_avahi_and_hosts_cleanup_preserves_unrelated_settings_and_services(tmp_p
     assert "192.168.1.50\tnas.farm.local" in hosts_lines
     assert "my-farm.local" not in hosts_path.read_text(encoding="utf-8")
 
-    # Verify avahi-daemon.conf cleanup: host-name=my-farm removed, other settings and sections intact
+    # Verify Avahi cleanup restores the previous hostname and all other settings.
     conf_result = conf_path.read_text(encoding="utf-8")
-    assert "host-name=my-farm" not in conf_result
+    assert conf_result == initial_conf
+    assert not state_path.exists()
     assert "[server]" in conf_result
     assert "use-ipv4=yes" in conf_result
     assert "ratelimit-interval-usec=1000000" in conf_result
@@ -754,8 +812,9 @@ def test_avahi_and_hosts_cleanup_preserves_unrelated_settings_and_services(tmp_p
     assert "publish-addresses=yes" in conf_result
     assert "publish-hinfo=no" in conf_result
 
-    # Verify Avahi services cleanup: chief.service unlinked, unrelated ssh.service untouched
-    assert not chief_service.exists()
+    # Neither service file is known to be installer-owned, so preserve both.
+    assert chief_service.exists()
+    assert "Chief" in chief_service.read_text(encoding="utf-8")
     assert unrelated_service.exists()
     assert "SSH" in unrelated_service.read_text(encoding="utf-8")
 
@@ -767,5 +826,6 @@ def test_avahi_and_hosts_cleanup_preserves_unrelated_settings_and_services(tmp_p
         hosts_path_override=hosts_path,
         conf_path_override=conf_path,
         avahi_service_override=chief_service,
+        state_path_override=state_path,
     )
     assert err_rc == 1

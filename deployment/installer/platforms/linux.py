@@ -657,15 +657,8 @@ class LinuxPlatformAdapter(PlatformAdapter):
         try:
             self._run_privileged(["cleanup-local-discovery", public_host])
             return True
-        except PrivilegeError:
-            raise
         except Exception as exc:
-            # Fallback in unprivileged/mock unit test environments
-            avahi_service = Path("/etc/avahi/services/chief.service")
-            if avahi_service.exists():
-                try:
-                    avahi_service.unlink()
-                except Exception:
-                    return False
-            return True
-
+            # Do not claim success or delete a globally named Avahi file when
+            # the privileged cleanup did not run. The orchestrator reports this
+            # as a failed uninstall and leaves the remaining state visible.
+            raise PrivilegeError(f"Could not clean up local discovery for {public_host}: {exc}") from exc

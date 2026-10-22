@@ -31,7 +31,7 @@ def test_update_hosts_file_is_idempotent(tmp_path):
     assert content.count("chief-farm.local") == 1
 
 
-def test_update_hosts_file_replaces_old_chief_alias(tmp_path):
+def test_update_hosts_file_preserves_other_chief_alias(tmp_path):
     hosts = tmp_path / "hosts"
     hosts.write_text("127.0.0.1\tchief-old-farm.local\n", encoding="utf-8")
 
@@ -39,7 +39,7 @@ def test_update_hosts_file_replaces_old_chief_alias(tmp_path):
 
     content = hosts.read_text(encoding="utf-8")
     assert "chief-new-farm.local" in content
-    assert "chief-old-farm.local" not in content
+    assert "chief-old-farm.local" in content
 
 
 def test_update_hosts_file_fails_closed_on_write_error(tmp_path, monkeypatch):
@@ -103,6 +103,66 @@ def test_run_configure_avahi_updates_conf_and_hosts(tmp_path, monkeypatch):
     assert "host-name=chief-test-host" in conf.read_text(encoding="utf-8")
     assert "127.0.0.1\tchief-test-host.local" in hosts.read_text(encoding="utf-8")
     assert "mdns4_minimal" in nss.read_text(encoding="utf-8")
+    assert (tmp_path / "avahi-daemon.conf.chief-state").exists()
+
+
+def test_run_configure_avahi_does_not_claim_preexisting_matching_hostname(tmp_path, monkeypatch):
+    conf = tmp_path / "avahi-daemon.conf"
+    original = "[server]\nhost-name=chief-test-host\nuse-ipv4=yes\n"
+    conf.write_text(original, encoding="utf-8")
+    hosts = tmp_path / "hosts"
+    hosts.write_text("127.0.0.1 localhost chief-test-host.local\n", encoding="utf-8")
+    nss = tmp_path / "nsswitch.conf"
+    nss.write_text("hosts: files mdns4_minimal [NOTFOUND=return] dns\n", encoding="utf-8")
+
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0))
+
+    rc = run_configure_avahi(
+        "chief-test-host",
+        conf_path_override=conf,
+        hosts_path_override=hosts,
+        nsswitch_path_override=nss,
+    )
+
+    assert rc == 0
+    assert conf.read_text(encoding="utf-8") == original
+    assert not (tmp_path / "avahi-daemon.conf.chief-state").exists()
+
+
+def test_run_configure_avahi_created_server_section_is_removed_on_cleanup(tmp_path, monkeypatch):
+    import shutil
+    import subprocess
+    from deployment.installer.privileged.linux import run_cleanup_local_discovery
+
+    conf = tmp_path / "avahi-daemon.conf"
+    hosts = tmp_path / "hosts"
+    hosts.write_text("127.0.0.1 localhost\n", encoding="utf-8")
+    nss = tmp_path / "nsswitch.conf"
+    monkeypatch.setattr(shutil, "which", lambda _: "/bin/systemctl")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0),
+    )
+
+    rc = run_configure_avahi(
+        "chief-empty-config",
+        conf_path_override=conf,
+        hosts_path_override=hosts,
+        nsswitch_path_override=nss,
+    )
+    assert rc == 0
+    assert "[server]" in conf.read_text(encoding="utf-8")
+
+    rc = run_cleanup_local_discovery(
+        "chief-empty-config.local",
+        conf_path_override=conf,
+        hosts_path_override=hosts,
+    )
+    assert rc == 0
+    assert not conf.exists()
+    assert hosts.read_text(encoding="utf-8") == "127.0.0.1 localhost\n"
 
 
 def test_local_vs_remote_name_resolution_contract(tmp_path, monkeypatch):
@@ -120,6 +180,7 @@ def test_local_vs_remote_name_resolution_contract(tmp_path, monkeypatch):
         label,
         conf_path_override=conf,
         hosts_path_override=hosts,
+        nsswitch_path_override=tmp_path / "nsswitch.conf",
     )
     assert rc == 0
 

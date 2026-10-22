@@ -184,7 +184,7 @@ class InstallerOrchestrator:
         self.manifest = manifest or CURRENT_RELEASE_MANIFEST
         self.paths = paths or InstallerPaths.create()
         self.event_bus = event_bus or EventBus()
-        self.logger = logger or InstallerLogger()
+        self.logger = logger or InstallerLogger(log_dir=self.paths.state_root / "installer" / "logs")
         self.state_machine = StateMachine(event_bus=self.event_bus)
         self.deployment_client = deployment_client or ChiefAgentDeploymentClient(
             agent_root=self.paths.tooling,
@@ -1914,7 +1914,7 @@ def uninstall_chief(
     from .cli import get_default_platform_adapter
     plat = platform or get_default_platform_adapter()
     p = paths or InstallerPaths.create()
-    log = logger or InstallerLogger()
+    log = logger or InstallerLogger(log_dir=p.state_root / "installer" / "logs")
 
     if purge and not confirmed:
         err_msg = "Full purge requires explicit confirmation before deleting user databases and credentials."
@@ -1938,6 +1938,59 @@ def uninstall_chief(
         "failed_items": [],
         "purge": purge,
     }
+
+    # Validate every removal target before stopping services, removing launchers,
+    # or invoking privileged cleanup. A rejected custom path must have no side
+    # effects on either Chief or the host.
+    runtime_paths_to_remove = [
+        p.browser_config,
+        p.caddyfile,
+        p.caddy_root / "bin",
+        p.managed,
+        p.runtime,
+        p.node_root,
+        p.pwa_root,
+        p.tooling,
+        p.release_source,
+    ]
+    purge_targets = [
+        p.identity_config,
+        p.config,
+        p.production,
+        p.state_root,
+        p.caddy_root / "data",
+        p.caddy_root / "config",
+        p.caddy_root,
+        p.get_device_setup_dir(),
+        p.archive_base,
+        p.config_root,
+        p.root,
+    ] if purge else []
+    all_targets_to_remove = runtime_paths_to_remove + purge_targets
+
+    real_home = Path.home().resolve()
+    configured_home = p.get_home().resolve()
+    if configured_home != real_home:
+        real_forbidden = [
+            real_home / "Chief_Device_Setup",
+            real_home / "Chief_Previous_Installations",
+        ]
+        for target in all_targets_to_remove:
+            target_resolved = target.resolve()
+            if any(target_resolved == forbidden.resolve() for forbidden in real_forbidden):
+                raise InstallerError(
+                    f"Safety guard violation: target '{target}' resolves into the real user home "
+                    f"while custom home '{configured_home}' was supplied."
+                )
+
+    allowed_roots = [configured_home, p.root.resolve(), p.config_root.resolve()]
+    for target in all_targets_to_remove:
+        target_resolved = target.resolve()
+        if not any(target_resolved.is_relative_to(allowed) for allowed in allowed_roots):
+            raise InstallerError(
+                f"Safety guard violation: path '{target}' resolves outside supplied boundaries "
+                f"({configured_home}, {p.root}, {p.config_root})."
+            )
 
     # 1. Stop and disable all 4 Chief services
     try:
@@ -2034,75 +2087,6 @@ def uninstall_chief(
             report["failed_items"].append(f"Failed to clean up local discovery for {canonical_host}: {exc}")
 
     # 6. Remove Chief files based on standard vs full purge mode
-    runtime_paths_to_remove = [
-        p.browser_config,
-        p.caddyfile,
-        p.caddy_root / "bin",
-        p.managed,
-        p.runtime,
-        p.node_root,
-        p.pwa_root,
-        p.tooling,
-        p.release_source,
-    ]
-
-    purge_targets = [
-        p.identity_config,
-        p.config,
-        p.production,
-        p.state_root,
-        p.caddy_root / "data",
-        p.caddy_root / "config",
-        p.caddy_root,
-        p.device_setup_dir,
-        p.archive_base,
-        p.config_root,
-        p.root,
-    ] if purge else []
-
-    # Safety guard: Ensure all removal targets are strictly confined to supplied boundaries
-    # and never target the real home directory when a custom temporary home/root is supplied.
-    all_targets_to_remove = runtime_paths_to_remove + purge_targets
-
-    # 1. Guard against targeting the real user home when custom temporary home was supplied
-    real_home = Path.home().resolve()
-    if p.home.resolve() != real_home:
-        real_forbidden = [
-            real_home / "Chief_Device_Setup",
-            real_home / "Chief_Previous_Installations",
-        ]
-        for target in all_targets_to_remove:
-            t_res = target.resolve()
-            for forb in real_forbidden:
-                if t_res == forb.resolve():
-                    err_msg = (
-                        f"Safety guard violation: target '{target}' targets real user home '{real_home}' "
-                        f"while custom temporary home '{p.home}' was supplied."
-                    )
-                    log.error(err_msg)
-                    raise InstallerError(err_msg)
-
-    # 2. Guard: All targets to remove MUST strictly resolve inside the primary root boundaries
-    allowed_roots = [
-        p.home.resolve(),
-        p.root.resolve(),
-        p.config_root.resolve(),
-    ]
-    for target in all_targets_to_remove:
-        t_res = target.resolve()
-        is_inside_allowed = False
-        for allowed in allowed_roots:
-            try:
-                t_res.relative_to(allowed)
-                is_inside_allowed = True
-                break
-            except ValueError:
-                continue
-        if not is_inside_allowed:
-            err_msg = f"Safety guard violation: path '{target}' resolves outside supplied boundaries ({p.home}, {p.root}, {p.config_root})"
-            log.error(err_msg)
-            raise InstallerError(err_msg)
-
     for item in runtime_paths_to_remove:
         _safe_remove_path(item, report["removed_paths"], report["failed_items"], log)
 
@@ -2123,4 +2107,3 @@ def uninstall_chief(
     report["success"] = (len(report["failed_items"]) == 0)
     log.info("Chief uninstallation completed", success=report["success"], removed_paths_count=len(report["removed_paths"]))
     return report
-
