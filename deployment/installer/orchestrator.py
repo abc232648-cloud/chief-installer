@@ -695,6 +695,20 @@ class InstallerOrchestrator:
             )
 
         clone_source = str(local_override) if local_override else repo_url
+        def checkout_pinned():
+            result = run_git(["git", "-C", str(target_dir), "checkout", commit])
+            if result.returncode == 0:
+                return
+            # Local release caches can be older than the new installer. Fetch
+            # the exact pin from its declared repository, never from another
+            # stale cache or an implicitly selected branch.
+            fetched = run_git(["git", "-C", str(target_dir), "fetch", "--no-tags", repo_url, commit])
+            if fetched.returncode != 0:
+                raise InstallerError(f"Failed to fetch pinned {component} commit {commit}: {fetched.stderr.strip()}")
+            result = run_git(["git", "-C", str(target_dir), "checkout", commit])
+            if result.returncode != 0:
+                raise InstallerError(f"Failed to checkout {component} commit {commit}: {result.stderr.strip()}")
+
         preserved_dir: Optional[Path] = None
         if target_dir.exists() and any(target_dir.iterdir()) and not git_dir.exists():
             # A previous interrupted clone or pre-existing unmanaged directory can
@@ -720,13 +734,7 @@ class InstallerOrchestrator:
                 )
                 if res.returncode != 0:
                     raise InstallerError(f"Failed to clone {component} from {clone_source}: {res.stderr.strip()}")
-                res = run_git(
-                    ["git", "-C", str(target_dir), "checkout", commit],
-                    capture_output=True,
-                    text=True,
-                )
-                if res.returncode != 0:
-                    raise InstallerError(f"Failed to checkout {component} commit {commit}: {res.stderr.strip()}")
+                checkout_pinned()
             else:
                 if not git_dir.exists():
                     raise InstallerError(
@@ -750,25 +758,7 @@ class InstallerOrchestrator:
                 )
                 actual_head = res.stdout.strip().lower()
                 if actual_head != commit.lower():
-                    checkout_res = run_git(
-                        ["git", "-C", str(target_dir), "checkout", commit],
-                        capture_output=True,
-                        text=True,
-                    )
-                    if checkout_res.returncode != 0:
-                        fetch_src = str(local_override) if local_override else "origin"
-                        run_git(
-                            ["git", "-C", str(target_dir), "fetch", fetch_src],
-                            capture_output=True,
-                            text=True,
-                        )
-                        res2 = run_git(
-                            ["git", "-C", str(target_dir), "checkout", commit],
-                            capture_output=True,
-                            text=True,
-                        )
-                        if res2.returncode != 0:
-                            raise InstallerError(f"Failed to checkout {component} commit {commit}: {res2.stderr.strip()}")
+                    checkout_pinned()
 
             if not git_dir.exists():
                 raise InstallerError(f"Acquired {component} at {target_dir} is not a Git checkout.")
