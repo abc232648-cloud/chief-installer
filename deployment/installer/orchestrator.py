@@ -1124,6 +1124,8 @@ class InstallerOrchestrator:
             pythonw = python_bin.with_name("pythonw.exe")
             if pythonw.exists() or python_bin.name.lower() == "python.exe":
                 python_bin = pythonw
+        else:
+            python_bin = python_bin.with_name("pythonw.exe")
 
         task = ET.Element("Task", {"version": "1.4", "xmlns": "http://schemas.microsoft.com/windows/2004/02/mit/task"})
 
