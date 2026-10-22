@@ -1,11 +1,35 @@
 """Quiet child processes; preserve output capture, streaming, and exit handling."""
+import codecs
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+_LINE_SPLIT_REGEX = re.compile(r"(\r\n|\r|\n)")
+
+
+def _extract_lines(buffer: str, is_final: bool = False) -> Tuple[List[str], str]:
+    lines = []
+    pos = 0
+    while True:
+        m = _LINE_SPLIT_REGEX.search(buffer, pos)
+        if not m:
+            break
+        # If the match is a trailing '\r' at the very end of the buffer and not final,
+        # wait to see if the next chunk starts with '\n'
+        if not is_final and m.group(0) == "\r" and m.end() == len(buffer):
+            break
+        lines.append(buffer[pos:m.start()] + "\n")
+        pos = m.end()
+    remaining = buffer[pos:]
+    if is_final and remaining:
+        lines.append(remaining)
+        remaining = ""
+    return lines, remaining
 
 
 def _options(options: Dict[str, Any]) -> Dict[str, Any]:
@@ -77,18 +101,34 @@ def run_streaming(
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-        encoding="utf-8",
-        errors="replace",
     )
 
     q: queue.Queue = queue.Queue()
 
     def _reader(stream, name: str):
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        buffer = ""
         try:
-            for line in iter(stream.readline, ""):
-                q.put((name, line))
+            while True:
+                chunk = stream.read1(1024) if hasattr(stream, "read1") else stream.read(1024)
+                if not chunk:
+                    break
+                q.put((name, "activity", None))
+                if isinstance(chunk, bytes):
+                    text = decoder.decode(chunk, final=False)
+                else:
+                    text = str(chunk)
+                if text:
+                    buffer += text
+                    lines, buffer = _extract_lines(buffer, is_final=False)
+                    for l in lines:
+                        q.put((name, "line", l))
+            trailing = decoder.decode(b"", final=True)
+            if trailing:
+                buffer += trailing
+            lines, buffer = _extract_lines(buffer, is_final=True)
+            for l in lines:
+                q.put((name, "line", l))
         except Exception:
             pass
         finally:
@@ -96,7 +136,7 @@ def run_streaming(
                 stream.close()
             except Exception:
                 pass
-            q.put((name, None))
+            q.put((name, "eof", None))
 
     t_out = threading.Thread(target=_reader, args=(proc.stdout, "out"), daemon=True)
     t_err = threading.Thread(target=_reader, args=(proc.stderr, "err"), daemon=True)
@@ -110,17 +150,24 @@ def run_streaming(
     open_readers = 2
     quiet_signalled = False
 
+    def _handle_item(item):
+        if len(item) == 3:
+            return item[0], item[1], item[2]
+        elif len(item) == 2:
+            return item[0], ("line" if item[1] is not None else "eof"), item[1]
+        return None, None, None
+
     def _drain_queue():
         while not q.empty():
             try:
-                name, line = q.get_nowait()
-                if line is not None:
+                name, kind, data = _handle_item(q.get_nowait())
+                if kind == "line" and data is not None:
                     if name == "out":
-                        captured_stdout.append(line)
+                        captured_stdout.append(data)
                     else:
-                        captured_stderr.append(line)
+                        captured_stderr.append(data)
                     if on_line:
-                        on_line(line)
+                        on_line(data)
             except queue.Empty:
                 break
 
@@ -154,20 +201,22 @@ def run_streaming(
             quiet_signalled = True
 
         try:
-            name, line = q.get(timeout=0.1)
-            if line is None:
+            item = q.get(timeout=0.1)
+            name, kind, data = _handle_item(item)
+            if kind == "eof":
                 open_readers -= 1
                 continue
             last_activity_time = time.time()
             quiet_signalled = False
             if on_activity:
                 on_activity(last_activity_time)
-            if name == "out":
-                captured_stdout.append(line)
-            else:
-                captured_stderr.append(line)
-            if on_line:
-                on_line(line)
+            if kind == "line" and data is not None:
+                if name == "out":
+                    captured_stdout.append(data)
+                else:
+                    captured_stderr.append(data)
+                if on_line:
+                    on_line(data)
         except queue.Empty:
             pass
 
@@ -176,18 +225,7 @@ def run_streaming(
     t_err.join(timeout=2.0)
 
     # Drain any remaining lines in queue
-    while not q.empty():
-        try:
-            name, line = q.get_nowait()
-            if line:
-                if name == "out":
-                    captured_stdout.append(line)
-                else:
-                    captured_stderr.append(line)
-                if on_line:
-                    on_line(line)
-        except queue.Empty:
-            break
+    _drain_queue()
 
     return subprocess.CompletedProcess(
         args=cmd,

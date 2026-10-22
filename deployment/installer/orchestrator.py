@@ -1262,7 +1262,7 @@ class InstallerOrchestrator:
                 pip_cmd,
                 substep="Upgrading package manager in runtime environment...",
                 timeout=120.0,
-                inactivity_timeout=45.0,
+                inactivity_timeout=60.0,
             )
 
             reqs_file = self.paths.tooling / "requirements.txt"
@@ -1273,7 +1273,7 @@ class InstallerOrchestrator:
                     install_cmd,
                     substep="Installing Chief dependencies into private runtime...",
                     timeout=300.0,
-                    inactivity_timeout=60.0,
+                    inactivity_timeout=90.0,
                 )
                 if res.returncode != 0:
                     raise InstallerError(f"Failed to install requirements: {res.stderr.strip()}")
@@ -1359,7 +1359,7 @@ class InstallerOrchestrator:
                     install_cmd,
                     substep="Downloading Chromium browser engine...",
                     timeout=300.0,
-                    inactivity_timeout=60.0,
+                    inactivity_timeout=90.0,
                     on_line=_on_browser_line,
                 )
             except TimeoutError as te:
@@ -1377,7 +1377,7 @@ class InstallerOrchestrator:
                             retry_cmd,
                             substep="Retrying browser engine setup with system dependencies...",
                             timeout=300.0,
-                            inactivity_timeout=60.0,
+                            inactivity_timeout=90.0,
                             on_line=_on_browser_line,
                         )
                     except TimeoutError as te:
@@ -1503,7 +1503,7 @@ class InstallerOrchestrator:
                     cwd=str(app_dir),
                     env=npm_env,
                     timeout=300.0,
-                    inactivity_timeout=60.0,
+                    inactivity_timeout=90.0,
                 )
                 if ci_res.returncode != 0:
                     raise InstallerError(f"npm ci failed for {name} PWA: {ci_res.stderr.strip()}")
@@ -1514,7 +1514,7 @@ class InstallerOrchestrator:
                     cwd=str(app_dir),
                     env=npm_env,
                     timeout=300.0,
-                    inactivity_timeout=60.0,
+                    inactivity_timeout=90.0,
                 )
                 if build_res.returncode != 0:
                     raise InstallerError(f"npm run build failed for {name} PWA: {build_res.stderr.strip()}")
