@@ -15,19 +15,82 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 _LINE_SPLIT_REGEX = re.compile(r"(\r\n|\r|\n)")
 
 if sys.platform == "win32":
+    import _winapi
     import ctypes
     from ctypes import wintypes
 
     _kernel32 = ctypes.windll.kernel32
 
+    # Windows API signatures with documented pointer-sized and explicit types
+    _kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    _kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+
+    _kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    _kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+
+    _kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    _kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+
+    _kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+    _kernel32.QueryInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+
+    _kernel32.TerminateJobObject.restype = wintypes.BOOL
+    _kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+
+    _kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    _kernel32.GetExitCodeProcess.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+
+    _kernel32.TerminateProcess.restype = wintypes.BOOL
+    _kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+
+    _kernel32.ResumeThread.restype = wintypes.DWORD
+    _kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    _kernel32.GetLastError.restype = wintypes.DWORD
+    _kernel32.GetLastError.argtypes = []
+
+    _CREATE_SUSPENDED = 0x00000004
     _JobObjectExtendedLimitInformation = 9
     _JobObjectBasicProcessIdList = 3
     _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
-    _JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x1000
     _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     _PROCESS_TERMINATE = 0x0001
     _STILL_ACTIVE = 259
-    _TH32CS_SNAPPROCESS = 0x00000002
+    _ERROR_MORE_DATA = 234
+    _ERROR_ACCESS_DENIED = 5
+    _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    def _is_valid_handle(h: Any) -> bool:
+        if h is None:
+            return False
+        val = getattr(h, "value", h)
+        if val is None:
+            return False
+        try:
+            val = int(val)
+        except (ValueError, TypeError):
+            return False
+        return val not in (0, -1, _INVALID_HANDLE_VALUE)
 
     class _IO_COUNTERS(ctypes.Structure):
         _fields_ = [
@@ -62,26 +125,14 @@ if sys.platform == "win32":
             ("PeakJobMemoryLimit", ctypes.c_size_t),
         ]
 
-    class _JOBOBJECT_BASIC_PROCESS_ID_LIST(ctypes.Structure):
-        _fields_ = [
-            ("NumberOfAssignedProcesses", wintypes.DWORD),
-            ("NumberOfProcessIdsInList", wintypes.DWORD),
-            ("ProcessIdList", ctypes.c_size_t * 256),
-        ]
-
-    class _PROCESSENTRY32(ctypes.Structure):
-        _fields_ = [
-            ("dwSize", wintypes.DWORD),
-            ("cntUsage", wintypes.DWORD),
-            ("th32ProcessID", wintypes.DWORD),
-            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
-            ("th32ModuleID", wintypes.DWORD),
-            ("cntThreads", wintypes.DWORD),
-            ("th32ParentProcessID", wintypes.DWORD),
-            ("pcPriClassBase", ctypes.c_long),
-            ("dwFlags", wintypes.DWORD),
-            ("szExeFile", ctypes.c_char * 260),
-        ]
+    def _make_process_id_list_struct(count: int):
+        class _DYNAMIC_JOBOBJECT_BASIC_PROCESS_ID_LIST(ctypes.Structure):
+            _fields_ = [
+                ("NumberOfAssignedProcesses", wintypes.DWORD),
+                ("NumberOfProcessIdsInList", wintypes.DWORD),
+                ("ProcessIdList", ctypes.c_size_t * max(1, count)),
+            ]
+        return _DYNAMIC_JOBOBJECT_BASIC_PROCESS_ID_LIST
 
     class _JobWrapper:
         """Encapsulates a Win32 Job Object handle ensuring single-close semantics."""
@@ -89,30 +140,33 @@ if sys.platform == "win32":
         def __init__(self, handle: int):
             self.handle = handle
 
+        def is_valid(self) -> bool:
+            return _is_valid_handle(self.handle)
+
         def close(self) -> None:
             h = self.handle
             self.handle = 0
-            if h:
+            if _is_valid_handle(h):
                 try:
-                    _kernel32.CloseHandle(h)
+                    _kernel32.CloseHandle(wintypes.HANDLE(h))
                 except Exception:
                     pass
 
     def _win_create_job() -> Optional[_JobWrapper]:
         try:
             h_job = _kernel32.CreateJobObjectW(None, None)
-            if not h_job:
+            if not _is_valid_handle(h_job):
                 return None
             info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
             info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
             success = _kernel32.SetInformationJobObject(
-                h_job,
+                wintypes.HANDLE(h_job),
                 _JobObjectExtendedLimitInformation,
                 ctypes.byref(info),
                 ctypes.sizeof(info),
             )
             if not success:
-                _kernel32.CloseHandle(h_job)
+                _kernel32.CloseHandle(wintypes.HANDLE(h_job))
                 return None
             return _JobWrapper(h_job)
         except Exception:
@@ -121,87 +175,147 @@ if sys.platform == "win32":
     def _win_is_pid_alive(pid: int) -> bool:
         if pid <= 0:
             return False
-        h = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not h:
+        h = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, wintypes.DWORD(pid))
+        if not _is_valid_handle(h):
+            err = _kernel32.GetLastError()
+            if err == _ERROR_ACCESS_DENIED:
+                return True
             return False
         try:
             code = wintypes.DWORD()
-            if _kernel32.GetExitCodeProcess(h, ctypes.byref(code)):
+            if _kernel32.GetExitCodeProcess(wintypes.HANDLE(h), ctypes.byref(code)):
                 return code.value == _STILL_ACTIVE
-            return False
+            return True
         finally:
-            _kernel32.CloseHandle(h)
+            _kernel32.CloseHandle(wintypes.HANDLE(h))
 
     def _win_kill_pid(pid: int) -> bool:
         if pid <= 0:
             return False
-        h = _kernel32.OpenProcess(_PROCESS_TERMINATE, False, pid)
-        if not h:
+        h = _kernel32.OpenProcess(_PROCESS_TERMINATE, False, wintypes.DWORD(pid))
+        if not _is_valid_handle(h):
             return False
         try:
-            return bool(_kernel32.TerminateProcess(h, 1))
+            return bool(_kernel32.TerminateProcess(wintypes.HANDLE(h), 1))
         finally:
-            _kernel32.CloseHandle(h)
+            _kernel32.CloseHandle(wintypes.HANDLE(h))
+
+    _containment_tls = threading.local()
+    _orig_CreateProcess = _winapi.CreateProcess
+
+    def _hooked_create_process(*args, **kwargs):
+        job = getattr(_containment_tls, "job", None)
+        if job is None:
+            return _orig_CreateProcess(*args, **kwargs)
+
+        args_list = list(args)
+        if len(args_list) > 5:
+            args_list[5] = args_list[5] | _CREATE_SUSPENDED
+        elif "dwCreationFlags" in kwargs:
+            kwargs["dwCreationFlags"] = kwargs["dwCreationFlags"] | _CREATE_SUSPENDED
+        elif "creationflags" in kwargs:
+            kwargs["creationflags"] = kwargs["creationflags"] | _CREATE_SUSPENDED
+
+        hp, ht, pid, tid = _orig_CreateProcess(*args_list, **kwargs)
+        _containment_tls.last_created_pid = pid
+
+        try:
+            sim_fail = getattr(_containment_tls, "sim_fail", None)
+            if sim_fail == "assign":
+                asg_ok = False
+            else:
+                h_job = job.handle if isinstance(job, _JobWrapper) else job
+                asg_ok = bool(_kernel32.AssignProcessToJobObject(
+                    wintypes.HANDLE(h_job),
+                    wintypes.HANDLE(hp),
+                ))
+
+            if not asg_ok:
+                err = _kernel32.GetLastError() or _ERROR_ACCESS_DENIED
+                _kernel32.TerminateProcess(wintypes.HANDLE(hp), 1)
+                _kernel32.CloseHandle(wintypes.HANDLE(ht))
+                _kernel32.CloseHandle(wintypes.HANDLE(hp))
+                raise OSError(err, f"AssignProcessToJobObject failed with WinError {err}")
+
+            if sim_fail == "resume":
+                res = 0xFFFFFFFF
+            else:
+                res = _kernel32.ResumeThread(wintypes.HANDLE(ht))
+
+            if res == 0xFFFFFFFF:
+                err = _kernel32.GetLastError() or _ERROR_ACCESS_DENIED
+                _kernel32.TerminateProcess(wintypes.HANDLE(hp), 1)
+                _kernel32.CloseHandle(wintypes.HANDLE(ht))
+                _kernel32.CloseHandle(wintypes.HANDLE(hp))
+                raise OSError(err, f"ResumeThread failed with WinError {err}")
+        except Exception:
+            raise
+
+        return hp, ht, pid, tid
+
+    _winapi.CreateProcess = _hooked_create_process
 
     def _win_get_job_pids(job: Union[_JobWrapper, int]) -> List[int]:
+        """Retrieve currently active process IDs in the Job Object.
+
+        Dynamically expands query buffer if more processes exist.
+        Raises RuntimeError on API query failure to ensure errors are never treated as empty.
+        """
         h_job = job.handle if isinstance(job, _JobWrapper) else job
-        if not h_job:
-            return []
-        pid_list = _JOBOBJECT_BASIC_PROCESS_ID_LIST()
-        res = _kernel32.QueryInformationJobObject(
-            h_job,
+        if not _is_valid_handle(h_job):
+            raise ValueError("Invalid Job Object handle provided to _win_get_job_pids")
+
+        if getattr(_containment_tls, "sim_query_fail", False):
+            raise RuntimeError("Simulated QueryInformationJobObject failure")
+
+        init_size = getattr(_containment_tls, "initial_query_buffer_size", 64)
+        struct_cls = _make_process_id_list_struct(init_size)
+        buf = struct_cls()
+
+        success = _kernel32.QueryInformationJobObject(
+            wintypes.HANDLE(h_job),
             _JobObjectBasicProcessIdList,
-            ctypes.byref(pid_list),
-            ctypes.sizeof(pid_list),
+            ctypes.byref(buf),
+            ctypes.sizeof(buf),
             None,
         )
-        if not res:
-            return []
-        pids = list(pid_list.ProcessIdList[: pid_list.NumberOfProcessIdsInList])
-        return [p for p in pids if p > 0 and _win_is_pid_alive(p)]
+        if not success:
+            err = _kernel32.GetLastError()
+            if err == _ERROR_MORE_DATA:
+                needed = max(buf.NumberOfAssignedProcesses, init_size * 2)
+                struct_cls = _make_process_id_list_struct(needed)
+                buf = struct_cls()
+                success = _kernel32.QueryInformationJobObject(
+                    wintypes.HANDLE(h_job),
+                    _JobObjectBasicProcessIdList,
+                    ctypes.byref(buf),
+                    ctypes.sizeof(buf),
+                    None,
+                )
+                if not success:
+                    err2 = _kernel32.GetLastError()
+                    raise RuntimeError(f"QueryInformationJobObject failed on resize retry: {err2}")
+            else:
+                raise RuntimeError(f"QueryInformationJobObject failed with error {err}")
 
-    def _win_find_descendant_pids(parent_pid: int) -> List[int]:
-        """Snapshot-based descendant PID discovery fallback."""
-        if parent_pid <= 0:
-            return []
-        h_snap = _kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
-        if not h_snap:
-            return []
-        entry = _PROCESSENTRY32()
-        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32)
-        parent_map: Dict[int, List[int]] = {}
-        try:
-            if _kernel32.Process32First(h_snap, ctypes.byref(entry)):
-                while True:
-                    ppid = entry.th32ParentProcessID
-                    cpid = entry.th32ProcessID
-                    parent_map.setdefault(ppid, []).append(cpid)
-                    if not _kernel32.Process32Next(h_snap, ctypes.byref(entry)):
-                        break
-        finally:
-            _kernel32.CloseHandle(h_snap)
-        descendants: List[int] = []
-        stack = [parent_pid]
-        visited: Set[int] = set()
-        while stack:
-            curr = stack.pop()
-            if curr in visited:
-                continue
-            visited.add(curr)
-            for child in parent_map.get(curr, []):
-                if child not in visited:
-                    descendants.append(child)
-                    stack.append(child)
-        return [p for p in descendants if _win_is_pid_alive(p)]
+        raw_pids = list(buf.ProcessIdList[: buf.NumberOfProcessIdsInList])
+        return [p for p in raw_pids if p > 0 and _win_is_pid_alive(p)]
+
+    def _job_is_valid(job: Any) -> bool:
+        if job is None:
+            return False
+        if hasattr(job, "is_valid"):
+            return job.is_valid()
+        return _is_valid_handle(job)
 
     def _win_close_job(job: Optional[Union[_JobWrapper, int]]) -> None:
         if job is None:
             return
         if isinstance(job, _JobWrapper):
             job.close()
-        elif job:
+        elif _is_valid_handle(job):
             try:
-                _kernel32.CloseHandle(job)
+                _kernel32.CloseHandle(wintypes.HANDLE(job))
             except Exception:
                 pass
 
@@ -293,33 +407,42 @@ def _options(options: Dict[str, Any]) -> Dict[str, Any]:
     return options
 
 
-def run(*args, **kwargs) -> subprocess.CompletedProcess:
+def run(*args, contained: bool = True, **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(*args, **_options(kwargs))
 
 
-def popen(*args, **kwargs) -> subprocess.Popen:
+def popen(*args, contained: bool = True, **kwargs) -> subprocess.Popen:
     opts = _options(kwargs)
     if sys.platform != "win32":
-        opts.setdefault("start_new_session", True)
-    proc = subprocess.Popen(*args, **opts)
-    if proc is not None and getattr(proc, "pid", None) is not None:
-        if sys.platform == "win32":
-            job = _win_create_job()
-            if job:
-                proc_handle = getattr(proc, "_handle", None)
-                if proc_handle is not None:
-                    try:
-                        if _kernel32.AssignProcessToJobObject(job.handle, int(proc_handle)):
-                            proc._chief_job = job
-                            weakref.finalize(proc, job.close)
-                        else:
-                            job.close()
-                    except Exception:
-                        job.close()
-                else:
-                    job.close()
-        else:
+        if contained:
+            opts.setdefault("start_new_session", True)
+        proc = subprocess.Popen(*args, **opts)
+        if contained and proc is not None and getattr(proc, "pid", None) is not None:
             proc._chief_pgid = proc.pid
+        return proc
+
+    # Windows implementation:
+    if not contained:
+        return subprocess.Popen(*args, **opts)
+
+    job = _win_create_job()
+    if job is None:
+        raise RuntimeError("Failed to create and configure Windows Job Object for process containment")
+
+    _containment_tls.job = job
+    proc = None
+    try:
+        proc = subprocess.Popen(*args, **opts)
+    except Exception:
+        job.close()
+        raise
+    finally:
+        _containment_tls.job = None
+
+    if proc is not None:
+        proc._chief_job = job
+        weakref.finalize(proc, job.close)
+
     return proc
 
 
@@ -335,16 +458,17 @@ def terminate_process_tree(proc: subprocess.Popen, timeout: float = 3.0) -> None
     # Check if process and all descendants are already dead
     if sys.platform == "win32":
         job = getattr(proc, "_chief_job", None)
-        if job:
-            active_pids = _win_get_job_pids(job)
-            if not active_pids and proc.poll() is not None:
-                _win_close_job(job)
-                proc._chief_job = None
-                return
+        if job and _job_is_valid(job):
+            try:
+                active_pids = _win_get_job_pids(job)
+                if not active_pids and proc.poll() is not None:
+                    _win_close_job(job)
+                    proc._chief_job = None
+                    return
+            except Exception:
+                pass
         elif proc.poll() is not None:
-            active_pids = _win_find_descendant_pids(proc.pid)
-            if not active_pids:
-                return
+            return
     else:
         pgid = getattr(proc, "_chief_pgid", proc.pid)
         if proc.poll() is not None and not _posix_is_pgid_alive(pgid) and not _posix_get_descendant_pids(proc.pid):
@@ -377,12 +501,16 @@ def terminate_process_tree(proc: subprocess.Popen, timeout: float = 3.0) -> None
     while time.monotonic() < grace_deadline:
         if sys.platform == "win32":
             job = getattr(proc, "_chief_job", None)
-            if job:
-                if not _win_get_job_pids(job) and proc.poll() is not None:
-                    _win_close_job(job)
-                    proc._chief_job = None
-                    return
-            elif proc.poll() is not None and not _win_find_descendant_pids(proc.pid):
+            if job and _job_is_valid(job):
+                try:
+                    active_pids = _win_get_job_pids(job)
+                    if not active_pids and proc.poll() is not None:
+                        _win_close_job(job)
+                        proc._chief_job = None
+                        return
+                except Exception:
+                    pass
+            elif proc.poll() is not None:
                 return
         else:
             pgid = getattr(proc, "_chief_pgid", proc.pid)
@@ -393,30 +521,17 @@ def terminate_process_tree(proc: subprocess.Popen, timeout: float = 3.0) -> None
     # 2. Forceful phase
     if sys.platform == "win32":
         job = getattr(proc, "_chief_job", None)
-        h_job = job.handle if isinstance(job, _JobWrapper) else job
-        if h_job:
+        if job and _job_is_valid(job):
             try:
-                _kernel32.TerminateJobObject(h_job, 1)
+                h_job = job.handle if isinstance(job, _JobWrapper) else job
+                _kernel32.TerminateJobObject(wintypes.HANDLE(h_job), 1)
             except Exception:
                 pass
-        else:
-            for cpid in _win_find_descendant_pids(proc.pid):
-                _win_kill_pid(cpid)
-            if proc.poll() is None:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                try:
-                    subprocess.run(
-                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                        creationflags=subprocess.CREATE_NO_WINDOW,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=2.0,
-                    )
-                except Exception:
-                    pass
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
     else:
         pgid = getattr(proc, "_chief_pgid", proc.pid)
         try:
@@ -439,10 +554,14 @@ def terminate_process_tree(proc: subprocess.Popen, timeout: float = 3.0) -> None
     while time.monotonic() < force_deadline:
         if sys.platform == "win32":
             job = getattr(proc, "_chief_job", None)
-            if job:
-                if not _win_get_job_pids(job) and proc.poll() is not None:
-                    break
-            elif proc.poll() is not None and not _win_find_descendant_pids(proc.pid):
+            if job and _job_is_valid(job):
+                try:
+                    active_pids = _win_get_job_pids(job)
+                    if not active_pids and proc.poll() is not None:
+                        break
+                except Exception:
+                    pass
+            elif proc.poll() is not None:
                 break
         else:
             pgid = getattr(proc, "_chief_pgid", proc.pid)
@@ -459,12 +578,14 @@ def terminate_process_tree(proc: subprocess.Popen, timeout: float = 3.0) -> None
     surviving: List[int] = []
     if sys.platform == "win32":
         job = getattr(proc, "_chief_job", None)
-        if job:
+        if job and _job_is_valid(job):
+            # Query active PIDs; any query error will raise directly rather than returning []
             surviving = _win_get_job_pids(job)
             _win_close_job(job)
             proc._chief_job = None
         else:
-            surviving = _win_find_descendant_pids(proc.pid)
+            if proc.poll() is None:
+                surviving.append(proc.pid)
     else:
         pgid = getattr(proc, "_chief_pgid", proc.pid)
         if _posix_is_pgid_alive(pgid):
@@ -556,6 +677,7 @@ def run_streaming(
     captured_stderr: List[str] = []
     open_readers = 2
     quiet_signalled = False
+    cleaned_up = False
 
     def _handle_item(item):
         if len(item) == 3:
@@ -581,6 +703,7 @@ def run_streaming(
     try:
         while open_readers > 0 or proc.poll() is None:
             if check_cancelled and check_cancelled():
+                cleaned_up = True
                 terminate_process_tree(proc)
                 t_out.join(timeout=1.0)
                 t_err.join(timeout=1.0)
@@ -591,6 +714,7 @@ def run_streaming(
 
             now = time.monotonic()
             if timeout and (now - start_time) > timeout:
+                cleaned_up = True
                 terminate_process_tree(proc)
                 t_out.join(timeout=1.0)
                 t_err.join(timeout=1.0)
@@ -598,6 +722,7 @@ def run_streaming(
                 raise TimeoutError(f"Process timed out after {timeout:.1f} seconds.")
 
             if inactivity_timeout and (now - last_activity_time) > inactivity_timeout:
+                cleaned_up = True
                 terminate_process_tree(proc)
                 t_out.join(timeout=1.0)
                 t_err.join(timeout=1.0)
@@ -654,8 +779,15 @@ def run_streaming(
             stdout="".join(captured_stdout),
             stderr="".join(captured_stderr),
         )
-    except Exception:
-        terminate_process_tree(proc)
+    except Exception as op_err:
+        if not cleaned_up:
+            try:
+                terminate_process_tree(proc)
+            except Exception as cleanup_err:
+                t_out.join(timeout=1.0)
+                t_err.join(timeout=1.0)
+                _drain_queue()
+                raise cleanup_err from op_err
         t_out.join(timeout=1.0)
         t_err.join(timeout=1.0)
         _drain_queue()

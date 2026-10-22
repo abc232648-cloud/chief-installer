@@ -312,3 +312,211 @@ def test_terminate_process_tree_verification_failure_raises(monkeypatch):
     with pytest.raises(RuntimeError) as exc_info:
         process.terminate_process_tree(fake_proc, timeout=0.3)
     assert "Failed to terminate process tree" in str(exc_info.value)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object race test")
+def test_windows_immediate_grandchild_containment_race():
+    """Verify that a child spawning a grandchild on line 1 before parent exits is captured and terminated."""
+    gc_code = "import time; time.sleep(30)"
+    parent_code = (
+        f"import subprocess, sys\n"
+        f"p = subprocess.Popen([sys.executable, '-c', {repr(gc_code)}], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        f"print('GC_PID:' + str(p.pid), flush=True)\n"
+        f"sys.exit(0)\n"
+    )
+    proc = process.popen([sys.executable, "-c", parent_code], stdout=subprocess.PIPE, text=True)
+    out, _ = proc.communicate(timeout=5.0)
+    assert "GC_PID:" in out
+    gc_pid = int(out.split("GC_PID:")[1].strip())
+    assert proc.poll() == 0, "Parent process should have exited cleanly"
+
+    # Grandchild should be alive in the job
+    assert process._win_is_pid_alive(gc_pid)
+
+    # Terminate process tree using parent's Popen object
+    process.terminate_process_tree(proc, timeout=3.0)
+    assert not process._win_is_pid_alive(gc_pid), "Grandchild must be terminated even if child spawned it on line 1"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object launch failure test")
+@pytest.mark.parametrize("fail_point", ["assign", "resume"])
+def test_windows_job_launch_failure_no_leaks(fail_point):
+    """Verify that launch failure in Job assignment or thread resume safely terminates the suspended process with no leaks."""
+    process._containment_tls.sim_fail = fail_point
+    failed = False
+    try:
+        proc = process.popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    except OSError as e:
+        failed = True
+        assert fail_point in str(e).lower()
+    finally:
+        leaked_pid = getattr(process._containment_tls, "last_created_pid", None)
+        process._containment_tls.sim_fail = None
+
+    assert failed, f"Expected popen to fail safely at {fail_point}"
+    assert leaked_pid is not None
+    time.sleep(0.3)
+    assert not process._win_is_pid_alive(leaked_pid), "Suspended process must be terminated on launch failure"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object creation failure test")
+def test_windows_job_creation_failure_fails_safely(monkeypatch):
+    """Verify that if Job Object creation fails, popen fails closed and does not run uncontained."""
+    monkeypatch.setattr(process, "_win_create_job", lambda: None)
+    with pytest.raises(RuntimeError) as exc_info:
+        process.popen([sys.executable, "-c", "import sys; sys.exit(0)"])
+    assert "Failed to create and configure Windows Job Object" in str(exc_info.value)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object buffer growth test")
+def test_windows_query_buffer_growth_retrieves_all_processes():
+    """Verify that when more processes exist than the initial query buffer can hold, buffer is dynamically resized."""
+    process._containment_tls.initial_query_buffer_size = 1
+    job = process._win_create_job()
+    assert job is not None
+    procs = []
+    try:
+        for _ in range(3):
+            p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+            process._kernel32.AssignProcessToJobObject(
+                process.wintypes.HANDLE(job.handle),
+                process.wintypes.HANDLE(int(p._handle)),
+            )
+            procs.append(p)
+
+        # Buffer size of 1 triggers ERROR_MORE_DATA, dynamically resizing
+        pids = process._win_get_job_pids(job)
+        for p in procs:
+            assert p.pid in pids, f"PID {p.pid} must be in returned job PIDs: {pids}"
+    finally:
+        process._containment_tls.initial_query_buffer_size = 64
+        job.close()
+        for p in procs:
+            try:
+                p.terminate()
+                p.wait(timeout=1.0)
+            except Exception:
+                pass
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows API access-denied check")
+def test_windows_is_pid_alive_access_denied_treated_as_alive(monkeypatch):
+    """Verify that OpenProcess returning ERROR_ACCESS_DENIED is treated as process alive."""
+    monkeypatch.setattr(process._kernel32, "OpenProcess", lambda *args: 0)
+    monkeypatch.setattr(process._kernel32, "GetLastError", lambda: 5)  # ERROR_ACCESS_DENIED
+    assert process._win_is_pid_alive(12345) is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle validation check")
+def test_windows_handle_validation():
+    """Verify explicit handle validation handles None, 0, -1, and INVALID_HANDLE_VALUE."""
+    assert process._is_valid_handle(None) is False
+    assert process._is_valid_handle(0) is False
+    assert process._is_valid_handle(-1) is False
+    assert process._is_valid_handle(process._INVALID_HANDLE_VALUE) is False
+    assert process._is_valid_handle(12345) is True
+    assert process._is_valid_handle(process.wintypes.HANDLE(12345)) is True
+
+
+def test_persistent_service_lifecycle_boundary():
+    """Verify that persistent services created with contained=False survive installer temporary process cleanup."""
+    # Persistent service (contained=False)
+    service_proc = process.popen([sys.executable, "-c", "import time; time.sleep(30)"], contained=False)
+    # Temporary installer process (contained=True)
+    temp_proc = process.popen([sys.executable, "-c", "import time; time.sleep(30)"], contained=True)
+
+    try:
+        assert _is_pid_alive(service_proc.pid)
+        assert _is_pid_alive(temp_proc.pid)
+
+        # Terminating temporary process tree must not affect persistent service
+        process.terminate_process_tree(temp_proc, timeout=2.0)
+
+        assert not _is_pid_alive(temp_proc.pid), "Temporary process must be terminated"
+        assert _is_pid_alive(service_proc.pid), "Persistent service must remain alive"
+        assert service_proc.poll() is None
+    finally:
+        try:
+            service_proc.terminate()
+            service_proc.wait(timeout=2.0)
+        except Exception:
+            pass
+
+
+def test_run_streaming_callback_exception_terminates_process_and_chains():
+    """Verify that an exception raised by a streaming callback cleanly terminates the process tree and preserves the exception."""
+    child_pid = []
+
+    def failing_callback(line):
+        if "STARTED:" in line:
+            child_pid.append(int(line.split("STARTED:")[1].strip()))
+            raise ValueError("Intentional callback error")
+
+    code = "import sys, os; print('STARTED:' + str(os.getpid()), flush=True); import time; time.sleep(30)"
+
+    with pytest.raises(ValueError) as exc_info:
+        process.run_streaming([sys.executable, "-u", "-c", code], on_line=failing_callback)
+
+    assert "Intentional callback error" in str(exc_info.value)
+    assert child_pid, "Should have received PID before failing"
+    time.sleep(0.3)
+    assert not _is_pid_alive(child_pid[0]), "Child process must be terminated when callback raises"
+
+
+def test_run_streaming_cancellation_concurrent_with_normal_exit():
+    """Verify that cancellation racing with normal exit does not cause errors or hangs."""
+    code = "import sys, time; time.sleep(0.05); sys.exit(0)"
+    cancel_flag = [False]
+
+    import threading
+    t = threading.Timer(0.04, lambda: cancel_flag.__setitem__(0, True))
+    t.start()
+    try:
+        try:
+            res = process.run_streaming([sys.executable, "-c", code], check_cancelled=lambda: cancel_flag[0])
+            assert res.returncode == 0
+        except Exception as e:
+            from deployment.installer.errors import CancelledError
+            assert isinstance(e, CancelledError)
+    finally:
+        t.cancel()
+
+
+def test_descendants_holding_pipes_open_unblocks_on_termination():
+    """Verify that when a grandchild inherits and holds open stdout, timeout terminates the tree and unblocks readers."""
+    gc_code = "import time; time.sleep(60)"
+    parent_code = (
+        f"import subprocess, sys\n"
+        f"c = subprocess.Popen([sys.executable, '-c', {repr(gc_code)}])\n"
+        f"print('GC:' + str(c.pid), flush=True)\n"
+        f"import time; time.sleep(60)\n"
+    )
+    lines = []
+    start_t = time.monotonic()
+    with pytest.raises(TimeoutError):
+        process.run_streaming([sys.executable, "-c", parent_code], on_line=lines.append, timeout=1.0)
+    elapsed = time.monotonic() - start_t
+    assert elapsed < 4.0, f"Cleanup took too long ({elapsed:.2f}s); pipe was likely held open"
+
+    gc_pid = None
+    for l in lines:
+        if "GC:" in l:
+            gc_pid = int(l.split("GC:")[1].strip())
+    assert gc_pid is not None
+    assert not _is_pid_alive(gc_pid)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX graceful resistance test")
+def test_posix_graceful_resistance_forces_kill():
+    """Verify that on POSIX, a process ignoring SIGTERM is forcefully killed with SIGKILL."""
+    code = (
+        "import signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "while True:\n"
+        "    time.sleep(1)\n"
+    )
+    proc = process.popen([sys.executable, "-c", code])
+    time.sleep(0.2)
+    assert _is_pid_alive(proc.pid)
+    process.terminate_process_tree(proc, timeout=2.0)
+    assert not _is_pid_alive(proc.pid)
