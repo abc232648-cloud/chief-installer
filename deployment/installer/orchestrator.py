@@ -1987,14 +1987,17 @@ class InstallerOrchestrator:
 
         for s in ("chief-agent-dashboard.service", "chief-agent-worker.service", "chief-agent-scheduler.service", "chief-tls-proxy.service"):
             active = False
-            deadline_active = time.monotonic() + 5.0
+            self.state_machine.emit_substep(
+                f"Waiting for {s} startup (up to 60 seconds)...", phase_state="WORKING")
+            deadline_active = time.monotonic() + 60.0
             while time.monotonic() < deadline_active:
+                self._check_cancelled()
                 if self.platform.verify_service_active(s):
                     active = True
                     break
                 time.sleep(0.5)
             if not active:
-                raise InstallerError(f"Service {s} failed to become active")
+                raise InstallerError(f"Service {s} failed to become active within 60 seconds")
 
         port = 8765
         if self.paths.config.exists():

@@ -170,6 +170,26 @@ def test_automatic_startup_failure_blocks_completion(tmp_path, monkeypatch, miss
     assert orchestrator.state_machine.current_status != StepStatus.SUCCESS
 
 
+@pytest.mark.parametrize('startup_delay', [10, 999])
+def test_service_startup_can_be_slow_but_remains_bounded(tmp_path, monkeypatch, startup_delay):
+    clock = _Clock()
+    monkeypatch.setattr(orchestrator_module.time, 'monotonic', clock.monotonic)
+    monkeypatch.setattr(orchestrator_module.time, 'sleep', clock.sleep)
+    platform = _DeadlinePlatform(clock)
+    monkeypatch.setattr(platform, 'verify_service_active', lambda name: clock.now >= startup_delay)
+    instance = InstallerOrchestrator(
+        platform=platform,
+        options=InstallOptions(owner_name='Test', owner_password='SyntheticTestPassword'),
+        paths=InstallerPaths.create(custom_root=tmp_path/'chief', home=tmp_path/'home'),
+        logger=InstallerLogger(log_dir=tmp_path/'logs'), deployment_client=_DeploymentClient())
+    instance.state_machine.current_step = StepId.LOCAL_DISCOVERY
+    instance.state_machine.current_status = StepStatus.SUCCESS
+    expected = '15-second deadline' if startup_delay == 10 else 'within 60 seconds'
+    with pytest.raises(InstallerError, match=expected):
+        instance._step_health_check()
+    assert clock.now == pytest.approx(25 if startup_delay == 10 else 60)
+
+
 @pytest.mark.parametrize("failure", [None, "certificate", "missing", "redirect", "starting"])
 def test_https_routes_require_trust_and_expected_pages(tmp_path, monkeypatch, failure):
     clock = _Clock()
