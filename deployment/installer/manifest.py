@@ -142,7 +142,7 @@ ACCEPTED_FIRST_RELEASE_MANIFEST = ReleaseManifest(
 CURRENT_RELEASE_MANIFEST = replace(
     ACCEPTED_FIRST_RELEASE_MANIFEST,
     release_id="chief-2026-10-20-integrated-review",
-    chief_agent_commit="0b08a94bd568ff31e09fe1306d3c2700c54478e5",
+    chief_agent_commit="76e31c440d350816ff2a7a0ef7a8d2bf54565a1c",
     node_version="24.21.0",
 )
 

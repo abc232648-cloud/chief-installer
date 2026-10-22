@@ -474,7 +474,7 @@ class InstallerOrchestrator:
         self.state_machine.request_cancellation()
         self.logger.warning("Cancellation requested by user.")
         with self._process_lock:
-            if self._active_process and self._active_process.poll() is None:
+            if self._active_process:
                 try:
                     terminate_process_tree(self._active_process)
                 except Exception as e:
@@ -543,6 +543,10 @@ class InstallerOrchestrator:
                 handle_line(res.stderr)
             return res
 
+        def _set_active_proc(proc):
+            with self._process_lock:
+                self._active_process = proc
+
         try:
             return run_streaming(
                 cmd,
@@ -553,6 +557,7 @@ class InstallerOrchestrator:
                 quiet_threshold=30.0,
                 on_line=handle_line,
                 on_quiet=handle_quiet,
+                on_proc=_set_active_proc,
                 check_cancelled=lambda: self.state_machine.is_cancelled,
             )
         except CancelledError:
@@ -561,6 +566,9 @@ class InstallerOrchestrator:
                 phase_state="CANCELLING",
             )
             raise
+        finally:
+            with self._process_lock:
+                self._active_process = None
 
     def _download_file(
         self,
@@ -667,10 +675,15 @@ class InstallerOrchestrator:
             env_override = os.environ.get("CHIEF_AGENT_SOURCE")
             if env_override and Path(env_override).is_dir():
                 local_override = Path(env_override)
+            elif getattr(self.paths, "release_source", None) and (Path(self.paths.release_source) / ".git").is_dir():
+                local_override = Path(self.paths.release_source)
             else:
                 cand = Path(__file__).resolve().parents[3] / "chief-agent"
                 if cand.is_dir() and (cand / ".git").is_dir():
                     local_override = cand
+                cand2 = Path(__file__).resolve().parents[3] / "chief-integrated-candidate-20261020"
+                if cand2.is_dir() and (cand2 / ".git").is_dir():
+                    local_override = cand2
 
         clone_source = str(local_override) if local_override else repo_url
         preserved_dir: Optional[Path] = None
