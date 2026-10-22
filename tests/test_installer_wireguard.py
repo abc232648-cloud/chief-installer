@@ -548,7 +548,10 @@ def test_linux_setup_path_with_real_chief_backend_and_dns_startup(tmp_path, monk
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
 
     # Start live real DNS daemon on loopback port to test real RFC 1035 UDP packet flow on non-root test host
-    test_dns_port = 53536
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as _s:
+        _s.bind(("127.0.0.1", 0))
+        test_dns_port = _s.getsockname()[1]
     live_dns = WireGuardDNSServer(
         bind_ip="127.0.0.1",
         port=test_dns_port,
