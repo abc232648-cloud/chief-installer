@@ -1328,6 +1328,10 @@ class InstallerOrchestrator:
             self.state_machine.transition(StepId.BROWSER, StepStatus.SUCCESS, message="Browser engine ready (mock).")
             return
 
+        from .desktop_runtime import provision as provision_desktop
+        self.state_machine.emit_substep('Preparing Chief desktop application...', phase_state='WORKING')
+        provision_desktop(self.paths, self._download_file)
+
         # Check for existing verified browser configuration
         if self.paths.browser_config.exists():
             try:

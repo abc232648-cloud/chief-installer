@@ -102,6 +102,15 @@ def main() -> int:
 
     _configure_packaged_python()
 
+    if len(sys.argv) > 1 and sys.argv[1] == '--desktop-control':
+        from deployment.installer.desktop_runtime import control_main
+        try:
+            return control_main(sys.argv[2:])
+        except Exception:
+            import json
+            print(json.dumps({'status': 'INCOMPLETE', 'reason': 'Service state could not be verified.'}))
+            return 1
+
     if sys.argv[1:] == ["--release-info"]:
         import json
         from deployment.installer.manifest import DEFAULT_RELEASE_MANIFEST

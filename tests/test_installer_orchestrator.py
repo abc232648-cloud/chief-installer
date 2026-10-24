@@ -336,6 +336,7 @@ def test_orchestrator_diagnostic_report_no_secrets(tmp_path):
 def test_step_browser_fails_closed_when_version_check_fails(tmp_path, monkeypatch):
     """Test that _step_browser fails closed instead of falling back to a synthesized version."""
     import subprocess
+    monkeypatch.setattr('deployment.installer.desktop_runtime.provision', lambda *a, **kw: None)
     from deployment.installer.errors import InstallerError
 
     class BrowserTestPlatform(FakePlatformAdapter):
@@ -377,6 +378,7 @@ def test_step_browser_fails_closed_when_version_check_fails(tmp_path, monkeypatc
 def test_step_browser_fails_closed_when_smoke_test_fails(tmp_path, monkeypatch):
     """Test that _step_browser fails closed when the Playwright smoke launch test fails."""
     import subprocess
+    monkeypatch.setattr('deployment.installer.desktop_runtime.provision', lambda *a, **kw: None)
     from deployment.installer.errors import InstallerError
 
     class BrowserTestPlatform(FakePlatformAdapter):

@@ -683,6 +683,55 @@ def run_cleanup_local_discovery(
     return 0
 
 
+def run_install_desktop_engine(archive_name: str) -> int:
+    """Install only the pinned upstream engine, never a caller-selected program.
+
+    Hash the root-owned copy, not a mutable caller path, before extracting or
+    assigning the sandbox bit. No commands from the archive are executed here.
+    """
+    import shutil
+    from ..desktop_runtime import (PINS, digest, extract, linux_runtime, plain,
+                                   verify_linux_ownership, verify_runtime)
+    if os.geteuid() != 0:
+        return 2
+    archive = plain(Path(archive_name))
+    if not archive.is_file() or archive.stat().st_size > 512 * 1024 * 1024:
+        return 2
+    parent = plain(linux_runtime().parent)
+    parent.mkdir(mode=0o755, exist_ok=True)
+    info = parent.stat()
+    if info.st_uid != 0 or info.st_mode & 0o022:
+        return 2
+    # TemporaryDirectory is a freshly created root-owned 0700 directory.
+    with tempfile.TemporaryDirectory(prefix='.verified-engine-', dir=parent) as folder:
+        protected_archive = Path(folder) / 'engine.zip'
+        with archive.open('rb') as source, protected_archive.open('xb') as target:
+            copied = 0
+            while block := source.read(1024 * 1024):
+                copied += len(block)
+                if copied > 512 * 1024 * 1024:
+                    return 2
+                target.write(block)
+        if digest(protected_archive) != PINS['linux-x64']:
+            return 2
+        destination = plain(linux_runtime())
+        if destination.exists():
+            verify_linux_ownership(destination)
+            verify_runtime(protected_archive, destination)
+            return 0
+        stage = Path(folder) / 'runtime'
+        extract(protected_archive, stage)
+        for item in [stage, *stage.rglob('*')]:
+            item.chmod(0o755 if item.is_dir() or item.stat().st_mode & 0o111 else 0o644)
+        sandbox = stage / 'chrome-sandbox'
+        if not sandbox.is_file() or not (stage / 'electron').is_file():
+            return 2
+        sandbox.chmod(0o4755)
+        stage.rename(destination)
+        verify_linux_ownership(destination)
+    return 0
+
+
 def main(argv: List[str]) -> int:
     if len(argv) < 2:
         sys.stderr.write("Usage: chief-installer-helper <command> [<args>...]\n")
@@ -692,7 +741,15 @@ def main(argv: List[str]) -> int:
     command = argv[1]
     args = argv[2:]
 
-    if command == "install-packages":
+    if command == 'install-desktop-engine':
+        if len(args) != 1:
+            return 2
+        try:
+            return run_install_desktop_engine(args[0])
+        except Exception:
+            sys.stderr.write('Verified desktop engine installation failed. No unverified program was activated.\n')
+            return 1
+    elif command == "install-packages":
         return run_install_packages(args)
     elif command == "enable-linger":
         if len(args) != 1:

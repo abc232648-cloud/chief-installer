@@ -13,6 +13,7 @@ a = Analysis(
     pathex=[str(project_root)],
     binaries=[],
     datas=[
+        (str(project_root / 'deployment' / 'installer' / 'desktop'), 'deployment/installer/desktop'),
         (str(project_root / 'packaging' / 'installer' / 'linux' / 'chief-installer.desktop'), '.'),
     ],
     hiddenimports=[

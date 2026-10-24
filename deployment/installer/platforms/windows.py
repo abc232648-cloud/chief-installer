@@ -613,7 +613,10 @@ throw 'Chief processes or tasks remain active; files must not be moved or remove
         start_menu_dir.mkdir(parents=True, exist_ok=True)
 
         target_exe = sys.executable
-        if getattr(sys, "frozen", False):
+        if (paths.root / 'desktop/current.json').is_file():
+            from ..desktop_runtime import installed
+            target_exe = installed(paths)['helper']
+        elif getattr(sys, "frozen", False):
             target_exe = os.environ.get("CHIEF_INSTALLER_FROZEN_EXECUTABLE") or sys.executable
         elif hasattr(paths, "tooling") and (paths.tooling / "Chief-Installer-Windows.exe").exists():
             target_exe = str(paths.tooling / "Chief-Installer-Windows.exe")

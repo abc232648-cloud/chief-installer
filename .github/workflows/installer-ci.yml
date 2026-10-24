@@ -47,6 +47,14 @@ jobs:
         run: |
           pytest -v
 
+      - name: Set up desktop policy test runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.21.0'
+
+      - name: Verify desktop security policy
+        run: node --test deployment/installer/desktop/tests/policy.test.cjs
+
   package-linux:
     name: Linux Package Build & Verification
     runs-on: ubuntu-24.04

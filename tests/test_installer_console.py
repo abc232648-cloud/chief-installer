@@ -11,7 +11,6 @@ import pytest
 from deployment.installer.console import (
     ConsoleState,
     ConsoleDiagnostic,
-    build_app_mode_command,
     find_desktop_runner,
     probe_local_console,
     launch_console_window,
@@ -234,7 +233,7 @@ def test_probe_local_console_missing_runner_detects_no_runner(tmp_path, monkeypa
     diag = probe_local_console(paths)
     assert diag.state == ConsoleState.NO_RUNNER
     assert diag.cert_valid is True
-    assert "No supported desktop application runner found" in diag.message
+    assert "not installed or its integrity check failed" in diag.message
 
 
 def test_probe_local_console_healthy_when_all_verified(tmp_path, monkeypatch):
@@ -270,7 +269,7 @@ def test_probe_local_console_healthy_when_all_verified(tmp_path, monkeypatch):
     assert diag.tls_proxy_active is True
 
 
-def test_find_desktop_runner_checks_browser_runtime_config(tmp_path):
+def test_find_desktop_runner_never_reuses_agent_browser_or_system_chrome(tmp_path):
     paths = make_paths(tmp_path)
     # Create fake browser executable
     fake_browser = tmp_path / "fake_chromium"
@@ -286,7 +285,7 @@ def test_find_desktop_runner_checks_browser_runtime_config(tmp_path):
     )
 
     runner = find_desktop_runner(paths)
-    assert runner == str(fake_browser)
+    assert runner is None
 
 
 def test_console_smoke_test_fails_closed_when_no_runner(monkeypatch):
@@ -338,17 +337,10 @@ def test_launch_console_window_returns_false_on_immediate_exit(tmp_path, monkeyp
     assert launch_console_window(diag, paths) is False
 
 
-def test_build_app_mode_command_preserves_desktop_isolation_and_loopback_rules(tmp_path):
-    runner = "/usr/bin/chromium" if os.name != "nt" else r"C:\Program Files\Edge\msedge.exe"
-    console_url = "https://chief-bigi.local/"
-    public_host = "chief-bigi.local"
-    profile_dir = tmp_path / "console_profile"
-
-    cmd = build_app_mode_command(runner, console_url, public_host, profile_dir)
-
-    assert cmd[0] == runner
-    assert cmd[1] == "--app=https://chief-bigi.local/"
-    assert f"--user-data-dir={profile_dir}" in cmd
-    assert "--host-resolver-rules=MAP chief-bigi.local 127.0.0.1" in cmd
-    assert "--class=ChiefConsole" in cmd
-    assert "--app-id=ChiefConsole" in cmd
+def test_console_has_no_generic_browser_fallback():
+    import inspect
+    from deployment.installer import console
+    source = inspect.getsource(console.find_desktop_runner)
+    assert 'desktop_runtime import installed' in source
+    assert 'shutil.which' not in source
+    assert 'browser_config' not in source

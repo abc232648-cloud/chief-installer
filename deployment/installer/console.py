@@ -50,53 +50,12 @@ class ConsoleDiagnostic:
 
 
 def find_desktop_runner(paths: Optional[InstallerPaths] = None) -> Optional[str]:
-    """Discover a maintained desktop application runner supporting dedicated window mode (--app)."""
-    # 1. Check browser runtime provisioned by Chief Installer if present
-    resolved_paths = paths or InstallerPaths.create()
-    if resolved_paths.browser_config.exists():
-        try:
-            browser_info = json.loads(resolved_paths.browser_config.read_text(encoding="utf-8"))
-            exe_str = browser_info.get("executable")
-            if exe_str:
-                exe_path = Path(exe_str)
-                if exe_path.is_file() and os.access(exe_path, os.X_OK):
-                    return str(exe_path)
-        except Exception:
-            pass
-
-    # 2. Check platform-specific maintained runners
-    if os.name == "nt":
-        candidates = [
-            Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
-            Path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
-            Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-            Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
-            Path(r"C:\Program Files\Chromium\Application\chrome.exe"),
-        ]
-        for c in candidates:
-            if c.is_file():
-                return str(c)
-        for name in ("msedge", "chrome", "chromium"):
-            w = shutil.which(name)
-            if w:
-                return w
-    else:
-        for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "microsoft-edge", "msedge", "brave-browser"):
-            w = shutil.which(name)
-            if w:
-                return w
-        fallback_paths = [
-            Path("/usr/bin/chromium"),
-            Path("/usr/bin/chromium-browser"),
-            Path("/usr/bin/google-chrome"),
-            Path("/usr/bin/google-chrome-stable"),
-            Path("/usr/bin/microsoft-edge"),
-            Path("/snap/bin/chromium"),
-        ]
-        for p in fallback_paths:
-            if p.is_file() and os.access(p, os.X_OK):
-                return str(p)
-    return None
+    """Only the verified, installed Chief Chromium shell may host the Console."""
+    from .desktop_runtime import installed
+    try:
+        return installed(paths or InstallerPaths.create())['executable']
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 def probe_local_console(paths: Optional[InstallerPaths] = None) -> ConsoleDiagnostic:
@@ -261,8 +220,8 @@ def probe_local_console(paths: Optional[InstallerPaths] = None) -> ConsoleDiagno
             backend_active=backend_active,
             tls_proxy_active=tls_proxy_active,
             cert_valid=cert_valid,
-            message="No supported desktop application runner found (Chromium, Edge, or Chrome).",
-            remediation="Install Chromium ('sudo apt install chromium-browser') or run Chief Installer to provision the browser runtime.",
+            message="The Chief desktop application is not installed or its integrity check failed.",
+            remediation="Run Chief Installer to repair the bundled desktop application; no separate browser download is required.",
         )
 
     return ConsoleDiagnostic(
@@ -279,34 +238,21 @@ def probe_local_console(paths: Optional[InstallerPaths] = None) -> ConsoleDiagno
     )
 
 
-def build_app_mode_command(runner: str, console_url: str, public_host: str, profile_dir: Path) -> List[str]:
-    """Construct command-line arguments to launch an app-mode window with zero browser chrome."""
-    return [
-        runner,
-        f"--app={console_url}",
-        f"--user-data-dir={str(profile_dir)}",
-        f"--host-resolver-rules=MAP {public_host} 127.0.0.1",
-        "--app-id=ChiefConsole",
-        "--class=ChiefConsole",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-features=Translate",
-    ]
-
-
 def launch_console_window(diagnostic: ConsoleDiagnostic, paths: InstallerPaths) -> bool:
     """Launch the Chief Console in a dedicated application window."""
     runner = find_desktop_runner(paths)
     if not runner:
         return False
 
-    profile_dir = paths.state_root / "console_profile"
-    profile_dir.mkdir(parents=True, exist_ok=True)
-
-    cmd = build_app_mode_command(runner, diagnostic.console_url, diagnostic.public_host, profile_dir)
+    from .desktop_runtime import launch_command
     try:
+        cmd = launch_command(paths, diagnostic.public_host)
+        environment = dict(os.environ)
+        for key in ('ELECTRON_RUN_AS_NODE', 'NODE_OPTIONS', 'NODE_PATH'):
+            environment.pop(key, None)
         proc = popen_quiet(
             cmd,
+            env=environment,
             contained=False,  # browser must outlive the installer process; Job Object must not kill it
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -502,11 +448,10 @@ def console_smoke_test() -> int:
     assert diagnostic.console_url.startswith("https://")
     runner = find_desktop_runner(paths)
     if not runner:
-        raise RuntimeError("Chief Console smoke test failed: no supported desktop application runner found. Please install Chromium, Google Chrome, or Microsoft Edge.")
-    cmd = build_app_mode_command(runner, diagnostic.console_url, diagnostic.public_host, paths.state_root / "console_profile")
-    assert "--app=" in cmd[1]
-    assert "--host-resolver-rules=" in cmd[3]
-    assert "--class=ChiefConsole" in cmd[5]
+        raise RuntimeError("Chief Console smoke test failed: no supported desktop application runner found. Run Chief Installer to repair its desktop shell.")
+    from .desktop_runtime import launch_command
+    cmd = launch_command(paths, diagnostic.public_host)
+    assert cmd[0] == runner and cmd[-2] == '--chief-config'
 
     # Model window construction in mock/non-blocking manner
     try:
@@ -534,7 +479,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     paths = InstallerPaths.create()
     diagnostic = probe_local_console(paths)
 
-    if diagnostic.state == ConsoleState.HEALTHY:
+    if find_desktop_runner(paths):
         launched = launch_console_window(diagnostic, paths)
         if launched:
             print(f"[Chief Console] Connected to on-farm interface at {diagnostic.console_url}")

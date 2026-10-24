@@ -563,7 +563,13 @@ class LinuxPlatformAdapter(PlatformAdapter):
         apps_dir.mkdir(parents=True, exist_ok=True)
 
         exec_bin = "/opt/chief-installer/chief-installer"
-        if not Path(exec_bin).exists():
+        if (paths.root / 'desktop/current.json').is_file():
+            from ..desktop_runtime import installed
+            helper = installed(paths)['helper']
+            # Desktop Entry quoting differs from shell quoting. Percent must be
+            # escaped because it introduces field codes in this file format.
+            exec_bin = '"' + helper.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$').replace('%', '%%') + '"'
+        elif not Path(exec_bin).exists():
             exec_bin = f"{sys.executable} -m deployment.installer"
 
         console_desktop = (

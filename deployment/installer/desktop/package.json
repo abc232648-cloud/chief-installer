@@ -1,0 +1,9 @@
+{
+  "name": "chief-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Chief desktop shell with isolated Chromium content",
+  "main": "main.cjs",
+  "scripts": {"test": "node --test tests/*.test.cjs"},
+  "engines": {"node": ">=24 <25"}
+}

@@ -71,9 +71,14 @@ def test_ui_completion_renders_on_farm_console_and_distinct_actions(tmp_path, mo
     paths = InstallerPaths.create(custom_root=tmp_path / 'chief', home=tmp_path / 'home')
     def probe(selected_paths):
         assert selected_paths is paths
-        return SimpleNamespace(state=SimpleNamespace(value='NOT_INSTALLED'))
+        return SimpleNamespace(state=SimpleNamespace(value='HEALTHY'))
     monkeypatch.setattr(console, 'probe_local_console', probe)
-    monkeypatch.setattr(console, 'launch_console_window', lambda *args: pytest.fail('Must not launch a real console'))
+    launches = []
+    def launch(diagnostic, selected_paths):
+        assert selected_paths is paths
+        launches.append(selected_paths)
+        return True
+    monkeypatch.setattr(console, 'launch_console_window', launch)
     class FakePlatform:
         os_name = "windows"
         def __init__(self): self.opened_urls = []
@@ -108,7 +113,8 @@ def test_ui_completion_renders_on_farm_console_and_distinct_actions(tmp_path, mo
 
     # Controller can open on-farm console by default
     assert controller.open_chief_url("chief") is True
-    assert platform.opened_urls[-1] == "https://chief-server.local/"
+    assert launches == [paths]
+    assert platform.opened_urls == []
 
     # Controller can open remote owner companion
     assert controller.open_chief_url("owner") is True

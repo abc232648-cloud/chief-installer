@@ -301,9 +301,8 @@ class InstallerUIController:
         except Exception:
             pass
 
-        url = self.install_result.urls.get("chief") if self.install_result and self.install_result.urls else None
-        if url:
-            return self.platform.open_url_in_browser(url)
+        # Never silently replace the dedicated shell with a user's browser.
+        # The installer/recovery view must report that desktop repair is needed.
         return False
 
     def open_chief_url(self, app_name: str = "chief") -> bool:
