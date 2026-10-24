@@ -98,14 +98,14 @@ def test_windows_packaged_artifact_help():
     assert b"--username" in combined
     assert b"--farm-operations" in combined
     assert b"--tls-mode" in combined
+    assert b"--non-interactive" in combined
+    assert b"--dns-mode" in combined
 
 
 def test_windows_binary_contains_exact_release_manifest():
     result = _run_artifact(_ensure_package(), '--print-release-manifest')
     assert result.returncode == 0
     assert json.loads(result.stdout) == CURRENT_RELEASE_MANIFEST.to_dict()
-    assert b"--non-interactive" in combined
-    assert b"--dns-mode" in combined
 
 
 def test_windows_packaged_artifact_fail_closed_validation():

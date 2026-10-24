@@ -293,7 +293,7 @@ class InstallerUIController:
         try:
             from ..console import launch_console_window, probe_local_console
             from ..orchestrator import InstallerPaths
-            paths = InstallerPaths.create()
+            paths = self.paths or InstallerPaths.create()
             diag = probe_local_console(paths)
             if diag.state.value == "HEALTHY":
                 if launch_console_window(diag, paths):
