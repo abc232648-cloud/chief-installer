@@ -4,6 +4,7 @@ Shares the exact same orchestrator, state machine, and contracts as the GUI.
 """
 import argparse
 import getpass
+import json
 import os
 from pathlib import Path
 import platform
@@ -67,6 +68,7 @@ def run_cli(
     parser.add_argument("--public-host", help="Advanced override for external DNS hostname.")
     parser.add_argument("--tls-mode", choices=["LOCAL", "PUBLIC"], default="LOCAL", help="TLS mode.")
     parser.add_argument("--manifest", help="Path to release manifest JSON.")
+    parser.add_argument("--print-release-manifest", action="store_true", help="Print the embedded release pins without installing anything.")
     parser.add_argument("--non-interactive", action="store_true", help="Fail if required fields are missing instead of prompting.")
     parser.add_argument("--uninstall", action="store_true", help="Uninstall Chief services, launchers, and configuration.")
     parser.add_argument("--purge", action="store_true", help="Full purge: completely remove Chief services, configuration, and archive directories.")
@@ -75,6 +77,9 @@ def run_cli(
     parser.add_argument('--dns-mode', choices=['quad9', 'system'], default='quad9',
                         help='Chief DNS: Quad9 Secure DoH (default) or System DNS. Host DNS is unchanged.')
     args = parser.parse_args(argv)
+    if args.print_release_manifest:
+        print(json.dumps(CURRENT_RELEASE_MANIFEST.to_dict(), sort_keys=True))
+        return 0
 
     # Resolve platform
     adapter = platform_adapter or get_default_platform_adapter()

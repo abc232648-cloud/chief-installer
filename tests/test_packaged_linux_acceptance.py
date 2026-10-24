@@ -71,6 +71,12 @@ def test_packaged_artifact_help_interface():
     assert "--non-interactive" in proc.stdout
 
 
+def test_linux_binary_contains_exact_release_manifest():
+    result = _run_artifact(_ensure_package(), '--print-release-manifest')
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == CURRENT_RELEASE_MANIFEST.to_dict()
+
+
 def test_packaged_artifact_internal_helper_is_routed_before_cli():
     """Regression for the physical Folio failure: frozen helper re-entry must not hit argparse."""
     artifact = _ensure_package()

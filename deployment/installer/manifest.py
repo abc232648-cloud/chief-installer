@@ -141,8 +141,8 @@ ACCEPTED_FIRST_RELEASE_MANIFEST = ReleaseManifest(
 # Review status is explicit in release_id; packaging is not deployment approval.
 CURRENT_RELEASE_MANIFEST = replace(
     ACCEPTED_FIRST_RELEASE_MANIFEST,
-    release_id="chief-2026-10-20-integrated-review",
-    chief_agent_commit="9ea1c806b05b02bb6b0cf4d14ba653a9cc54268d",
+    release_id="chief-2026-10-24-console-review",
+    chief_agent_commit="4aaf66872142349f0507a9a6b497c3d6d06c8d69",
     node_version="24.21.0",
 )
 

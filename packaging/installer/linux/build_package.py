@@ -126,6 +126,7 @@ def build_package(output_dir: Optional[Path] = None) -> Path:
     meta = {
         "artifact": target_executable.name,
         "release_id": manifest.release_id,
+        "release_manifest": manifest.to_dict(),
         "sha256": digest,
         "size_bytes": target_executable.stat().st_size,
     }
