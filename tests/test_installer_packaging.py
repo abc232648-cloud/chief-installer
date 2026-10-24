@@ -110,6 +110,36 @@ def test_source_entrypoint_does_not_modify_loader_path(monkeypatch):
     assert os.environ["LD_LIBRARY_PATH"] == "/custom/user/lib"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows app execution alias")
+def test_python_alias_resolves_before_appdata_work(tmp_path, monkeypatch):
+    from deployment.installer import process
+    actual = tmp_path / "Python" / "python.exe"
+    actual.parent.mkdir()
+    actual.write_bytes(b"test interpreter")
+    calls = []
+    def probe(args, **kwargs):
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0, json.dumps(str(actual)), "")
+    monkeypatch.setattr(process, "run", probe)
+    alias = str(tmp_path / "WindowsApps" / "python3.exe")
+    assert installer_main._resolve_python_alias(alias) == str(actual)
+    assert calls[0][1]["cwd"] == os.environ.get("SystemRoot", r"C:\Windows")
+    assert calls[0][1]["timeout"] == 30
+    assert calls[0][1]["check"] is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows app execution alias")
+def test_python_alias_unresolved_fails_closed(tmp_path, monkeypatch):
+    from deployment.installer import process
+    alias = tmp_path / "WindowsApps" / "python3.exe"
+    alias.parent.mkdir()
+    alias.write_bytes(b"alias")
+    monkeypatch.setattr(process, "run", lambda *a, **kw:
+        subprocess.CompletedProcess(a, 0, json.dumps(str(alias)), ""))
+    with pytest.raises(RuntimeError, match="did not resolve"):
+        installer_main._resolve_python_alias(str(alias))
+
+
 def test_frozen_entrypoint_routes_internal_privileged_helper(monkeypatch):
     captured = {}
 

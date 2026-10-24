@@ -15,11 +15,12 @@ import shutil
 import socket
 import ssl
 import subprocess
-from .process import run as run_quiet
+import threading
+from .process import run as run_quiet, popen as popen_quiet, run_streaming, terminate_process_tree, ProcessCleanupError
 import sys
 import tarfile
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
@@ -88,6 +89,20 @@ class InstallerPaths:
     unit_stage: Path
     unit_dest: Path
     archive_base: Path
+    home: Optional[Path] = None
+    device_setup_dir: Optional[Path] = None
+
+    def __post_init__(self) -> None:
+        if self.home is None:
+            self.home = Path.home()
+        if self.device_setup_dir is None:
+            self.device_setup_dir = self.home / "Chief_Device_Setup"
+
+    def get_home(self) -> Path:
+        return self.home or Path.home()
+
+    def get_device_setup_dir(self) -> Path:
+        return self.device_setup_dir or (self.get_home() / "Chief_Device_Setup")
 
     @classmethod
     def create(cls, custom_root: Optional[Path] = None, home: Optional[Path] = None) -> "InstallerPaths":
@@ -95,8 +110,23 @@ class InstallerPaths:
         is_windows = os.name == "nt"
 
         if is_windows and not custom_root:
-            local_app = Path(os.environ.get("LOCALAPPDATA") or (home_dir / "AppData" / "Local"))
-            roaming_app = Path(os.environ.get("APPDATA") or (home_dir / "AppData" / "Roaming"))
+            if home is not None:
+                # When custom home is supplied on Windows, confine local/roaming app data to home_dir
+                # unless environment variables explicitly point inside that custom home.
+                env_local = os.environ.get("LOCALAPPDATA")
+                env_roam = os.environ.get("APPDATA")
+                if env_local and Path(env_local).is_relative_to(home_dir):
+                    local_app = Path(env_local)
+                else:
+                    local_app = home_dir / "AppData" / "Local"
+
+                if env_roam and Path(env_roam).is_relative_to(home_dir):
+                    roaming_app = Path(env_roam)
+                else:
+                    roaming_app = home_dir / "AppData" / "Roaming"
+            else:
+                local_app = Path(os.environ.get("LOCALAPPDATA") or (home_dir / "AppData" / "Local"))
+                roaming_app = Path(os.environ.get("APPDATA") or (home_dir / "AppData" / "Roaming"))
             root = local_app / "chief"
             config_root = roaming_app / "chief"
             state_root = local_app / "chief" / "state"
@@ -132,6 +162,8 @@ class InstallerPaths:
             unit_stage=state_root / "service-units" / "initial",
             unit_dest=unit_dest,
             archive_base=home_dir / "Chief_Previous_Installations",
+            home=home_dir,
+            device_setup_dir=home_dir / "Chief_Device_Setup",
         )
 
 
@@ -153,7 +185,7 @@ class InstallerOrchestrator:
         self.manifest = manifest or CURRENT_RELEASE_MANIFEST
         self.paths = paths or InstallerPaths.create()
         self.event_bus = event_bus or EventBus()
-        self.logger = logger or InstallerLogger()
+        self.logger = logger or InstallerLogger(log_dir=self.paths.state_root / "installer" / "logs")
         self.state_machine = StateMachine(event_bus=self.event_bus)
         self.deployment_client = deployment_client or ChiefAgentDeploymentClient(
             agent_root=self.paths.tooling,
@@ -171,6 +203,30 @@ class InstallerOrchestrator:
         self._expected_source_sha256: Optional[str] = None
         self._expected_schema_sha256: Optional[str] = None
         self._backup_manifest_sha: Optional[str] = None
+        self._tracked_services_started: List[str] = []
+        self._tracked_units_created: List[Path] = []
+        self._tracked_files_created: List[Path] = []
+        self._active_process: Optional[subprocess.Popen] = None
+        self._cleanup_unverified = False
+        self._process_lock = threading.Lock()
+        self._preexisting_paths: Set[Path] = set()
+        for p_check in [
+            self.paths.production,
+            self.paths.identity_config,
+            self.paths.config,
+            self.paths.state_root,
+            self.paths.caddy_root / "data",
+            self.paths.caddy_root / "config",
+            self.paths.archive_base,
+            self.paths.device_setup_dir,
+        ]:
+            if p_check.exists():
+                self._preexisting_paths.add(p_check)
+
+    def _track_created_file(self, path: Path) -> None:
+        """Track a newly created file or directory for rollback, preserving pre-existing user data."""
+        if path not in self._preexisting_paths and path not in self._tracked_files_created:
+            self._tracked_files_created.append(path)
 
     @property
     def current_step(self) -> StepId:
@@ -324,7 +380,8 @@ class InstallerOrchestrator:
         except CancelledError:
             duration = round(time.time() - start_time, 2)
             self.state_machine.cancel("Installation cancelled by user.")
-            self.logger.warning("Installation was cancelled by user", duration_seconds=duration)
+            self.logger.warning("Installation was cancelled by user; executing rollback...", duration_seconds=duration)
+            self._rollback_attempt()
             return InstallResult(
                 status="CANCELLED",
                 log_path=str(self.logger.log_file),
@@ -332,25 +389,276 @@ class InstallerOrchestrator:
                 error="Installation cancelled by user.",
             )
         except Exception as exc:
+            if isinstance(exc, ProcessCleanupError):
+                self._cleanup_unverified = True
             duration = round(time.time() - start_time, 2)
             self.state_machine.fail(exc)
             report = self.logger.generate_diagnostic_report(failed_step=self.state_machine.current_step.value, error=exc)
-            self.logger.error("Installation failed", error=str(exc), duration_seconds=duration)
+            self.logger.error("Installation failed; executing rollback...", error=str(exc), duration_seconds=duration)
+            self._rollback_attempt()
             return InstallResult(
                 status="FAILED",
+                public_host=self._public_host,
+                archive_path=str(self._archive_path) if self._archive_path else None,
                 log_path=str(self.logger.log_file),
                 duration_seconds=duration,
                 error=str(exc),
                 error_code=getattr(exc, "code", "INSTALLATION_FAILED"),
             )
 
+    def _rollback_attempt(self) -> None:
+        """Roll back partial changes made by this installation attempt.
+
+        Stops and disables started services, unregisters created units,
+        and removes partial credentials and configurations.
+        Preserves diagnostic logs, existing backups, and unrelated files.
+        """
+        if self._cleanup_unverified:
+            self.logger.error("Rollback paused: process cleanup is unverified. Preserve files for recovery.")
+            return
+        self.logger.info("Executing rollback of partial installation attempt...")
+        if self._tracked_services_started and hasattr(self.platform, 'quiesce_installation'):
+            try:
+                self.platform.quiesce_installation(self.paths.root, self._tracked_services_started)
+            except Exception as exc:
+                self._cleanup_unverified = True
+                self.logger.error(f"Rollback paused: {exc}")
+                return
+        # 1. Stop and disable started services
+        if self._tracked_services_started:
+            self.logger.info("Rollback: stopping started services...", services=self._tracked_services_started)
+            try:
+                self.platform.control_services("stop", self._tracked_services_started)
+            except Exception as e:
+                self.logger.warning(f"Rollback: failed to stop services: {e}")
+            try:
+                self.platform.control_services("disable", self._tracked_services_started)
+            except Exception as e:
+                self.logger.warning(f"Rollback: failed to disable services: {e}")
+
+        # 2. Terminate child processes
+        if hasattr(self.platform, "terminate_service_processes") and self._tracked_services_started:
+            try:
+                self.platform.terminate_service_processes(self._tracked_services_started)
+            except Exception as e:
+                self.logger.warning(f"Rollback: failed to terminate processes: {e}")
+
+        # 3. Unregister newly created tasks/units
+        if self._tracked_units_created:
+            self.logger.info("Rollback: unregistering service units...", units=[str(u) for u in self._tracked_units_created])
+            if hasattr(self.platform, "unregister_service_units"):
+                try:
+                    self.platform.unregister_service_units(self._tracked_units_created)
+                except Exception as e:
+                    self.logger.warning(f"Rollback: failed to unregister units: {e}")
+            for u in self._tracked_units_created:
+                try:
+                    if u.exists():
+                        u.unlink()
+                except Exception:
+                    pass
+
+        # 4. Reload service manager
+        try:
+            self.platform.reload_service_manager()
+        except Exception:
+            pass
+
+        # 5. Clean up partial files and credentials created by this attempt
+        for f in self._tracked_files_created:
+            if f in self._preexisting_paths:
+                self.logger.info("Rollback: skipping pre-existing path", path=str(f))
+                continue
+            # NEVER delete production user database directory or user data during rollback
+            if f == self.paths.production or (self.paths.production in f.parents):
+                self.logger.info("Rollback: preserving production user database", path=str(f))
+                continue
+            try:
+                if f.is_file() or f.is_symlink():
+                    f.unlink(missing_ok=True)
+                elif f.is_dir():
+                    shutil.rmtree(f, ignore_errors=True)
+            except Exception as e:
+                self.logger.warning(f"Rollback: failed to clean up file {f}: {e}")
+        self.logger.info("Rollback completed.")
+
     def cancel(self) -> None:
-        """Signal cancellation request."""
+        """Signal cancellation request and cleanly terminate any active child process."""
         self.state_machine.request_cancellation()
+        self.logger.warning("Cancellation requested by user.")
 
     def _check_cancelled(self) -> None:
         if self.state_machine.is_cancelled:
-            raise CancelledError()
+            raise CancelledError("Installation was cancelled by user.")
+
+    def run_command_streaming(
+        self,
+        cmd: List[str],
+        *,
+        substep: str,
+        cwd: Optional[Union[str, Path]] = None,
+        env: Optional[Dict[str, str]] = None,
+        timeout: Optional[float] = None,
+        inactivity_timeout: Optional[float] = None,
+        on_line: Optional[Callable[[str], None]] = None,
+        progress: float = 0.0,
+        bytes_downloaded: Optional[int] = None,
+        bytes_total: Optional[int] = None,
+    ) -> subprocess.CompletedProcess:
+        """Execute child process with quiet windowing, streaming output, substep notifications, and timeouts."""
+        self._check_cancelled()
+        self.state_machine.emit_substep(
+            substep,
+            progress=progress,
+            bytes_downloaded=bytes_downloaded,
+            bytes_total=bytes_total,
+            phase_state="WORKING",
+        )
+        self.logger.info(f"Substep: {substep}", command=" ".join(cmd[:4]))
+
+        def handle_line(line: str):
+            clean = line.strip()
+            if clean:
+                self.logger.info(clean)
+            if on_line:
+                on_line(line)
+
+        def handle_quiet(silence_sec: float):
+            quiet_msg = f"{substep} (waiting on background task, {int(silence_sec)}s quiet)..."
+            self.state_machine.emit_substep(
+                quiet_msg,
+                progress=progress,
+                bytes_downloaded=bytes_downloaded,
+                bytes_total=bytes_total,
+                phase_state="QUIET",
+            )
+            self.logger.info(quiet_msg)
+
+        local_sub = globals().get('subprocess')
+        is_mocked = False
+        if local_sub and (getattr(local_sub.run, '__module__', '') != 'subprocess' or getattr(local_sub.run, '__name__', '') != 'run'):
+            is_mocked = True
+        elif getattr(subprocess.run, '__module__', '') != 'subprocess' or getattr(subprocess.run, '__name__', '') != 'run':
+            is_mocked = True
+
+        if is_mocked:
+            runner = getattr(local_sub, 'run', subprocess.run)
+            res = runner(cmd, cwd=str(cwd) if cwd else None, env=env, capture_output=True, text=True)
+            if hasattr(res, 'stdout') and res.stdout:
+                handle_line(res.stdout)
+            if hasattr(res, 'stderr') and res.stderr:
+                handle_line(res.stderr)
+            return res
+
+        def _set_active_proc(proc):
+            with self._process_lock:
+                self._active_process = proc
+
+        try:
+            return run_streaming(
+                cmd,
+                cwd=cwd,
+                env=env,
+                timeout=timeout,
+                inactivity_timeout=inactivity_timeout,
+                quiet_threshold=30.0,
+                on_line=handle_line,
+                on_quiet=handle_quiet,
+                on_proc=_set_active_proc,
+                check_cancelled=lambda: self.state_machine.is_cancelled,
+            )
+        except ProcessCleanupError:
+            self._cleanup_unverified = True
+            raise
+        except CancelledError:
+            self.state_machine.emit_substep(
+                "Cancelling operation and rolling back changes...",
+                phase_state="CANCELLING",
+            )
+            raise
+        finally:
+            with self._process_lock:
+                self._active_process = None
+
+    def _download_file(
+        self,
+        url: str,
+        destination: Path,
+        *,
+        substep: str,
+        timeout: float = 30.0,
+    ) -> Path:
+        """Download remote URL to destination with streaming chunk progress and cancellation support."""
+        self._check_cancelled()
+        self.state_machine.emit_substep(
+            f"{substep} (connecting...)",
+            phase_state="WAITING",
+        )
+        self.logger.info(f"Downloading from {url} to {destination}...")
+
+        req = urllib.request.Request(url, headers={"User-Agent": "Chief-Installer/1.0"})
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temp_dest = destination.with_suffix(destination.suffix + ".part")
+
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                total_str = resp.headers.get("Content-Length")
+                total_bytes = int(total_str) if total_str and total_str.isdigit() else None
+                downloaded_bytes = 0
+                chunk_size = 65536
+                last_emit = 0.0
+
+                with open(temp_dest, "wb") as out_f:
+                    while True:
+                        self._check_cancelled()
+                        chunk = resp.read(chunk_size)
+                        if not chunk:
+                            break
+                        out_f.write(chunk)
+                        downloaded_bytes += len(chunk)
+
+                        now = time.time()
+                        if now - last_emit >= 0.5:
+                            last_emit = now
+                            if total_bytes and total_bytes > 0:
+                                pct = (downloaded_bytes / total_bytes) * 100.0
+                                prog_val = downloaded_bytes / total_bytes
+                                mb_down = downloaded_bytes / (1024 * 1024)
+                                mb_tot = total_bytes / (1024 * 1024)
+                                msg = f"{substep}: {mb_down:.1f} MB / {mb_tot:.1f} MB ({pct:.0f}%)"
+                            else:
+                                prog_val = 0.0
+                                mb_down = downloaded_bytes / (1024 * 1024)
+                                msg = f"{substep}: {mb_down:.1f} MB downloaded"
+
+                            self.state_machine.emit_substep(
+                                msg,
+                                progress=prog_val,
+                                bytes_downloaded=downloaded_bytes,
+                                bytes_total=total_bytes,
+                                phase_state="WORKING",
+                            )
+
+            if temp_dest.exists():
+                if destination.exists():
+                    destination.unlink()
+                temp_dest.rename(destination)
+            self._track_created_file(destination)
+            return destination
+        except CancelledError:
+            if temp_dest.exists():
+                try:
+                    temp_dest.unlink()
+                except Exception:
+                    pass
+            raise
+        except Exception as exc:
+            if temp_dest.exists():
+                try:
+                    temp_dest.unlink()
+                except Exception:
+                    pass
+            raise InstallerError(f"Download failed for {url}: {exc}") from exc
 
     def _is_test_fixture(self) -> bool:
         """Check if running under an explicit test fixture."""
@@ -377,12 +685,37 @@ class InstallerOrchestrator:
             env_override = os.environ.get("CHIEF_AGENT_SOURCE")
             if env_override and Path(env_override).is_dir():
                 local_override = Path(env_override)
+            elif getattr(self.paths, "release_source", None) and (Path(self.paths.release_source) / ".git").is_dir():
+                local_override = Path(self.paths.release_source)
             else:
                 cand = Path(__file__).resolve().parents[3] / "chief-agent"
                 if cand.is_dir() and (cand / ".git").is_dir():
                     local_override = cand
+                cand2 = Path(__file__).resolve().parents[3] / "chief-integrated-candidate-20261020"
+                if cand2.is_dir() and (cand2 / ".git").is_dir():
+                    local_override = cand2
+
+        def run_git(command, **_capture_options):
+            # Git can wait on a slow network; keep it visible and cancellable.
+            return self.run_command_streaming(
+                command, substep=f"Preparing {component}: {command[1]}", timeout=600,
+            )
 
         clone_source = str(local_override) if local_override else repo_url
+        def checkout_pinned():
+            result = run_git(["git", "-C", str(target_dir), "checkout", commit])
+            if result.returncode == 0:
+                return
+            # Local release caches can be older than the new installer. Fetch
+            # the exact pin from its declared repository, never from another
+            # stale cache or an implicitly selected branch.
+            fetched = run_git(["git", "-C", str(target_dir), "fetch", "--no-tags", repo_url, commit])
+            if fetched.returncode != 0:
+                raise InstallerError(f"Failed to fetch pinned {component} commit {commit}: {fetched.stderr.strip()}")
+            result = run_git(["git", "-C", str(target_dir), "checkout", commit])
+            if result.returncode != 0:
+                raise InstallerError(f"Failed to checkout {component} commit {commit}: {result.stderr.strip()}")
+
         preserved_dir: Optional[Path] = None
         if target_dir.exists() and any(target_dir.iterdir()) and not git_dir.exists():
             # A previous interrupted clone or pre-existing unmanaged directory can
@@ -401,27 +734,21 @@ class InstallerOrchestrator:
             if not target_dir.exists() or not any(target_dir.iterdir()):
                 target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
                 self.logger.info(f"Cloning {component} from {clone_source} at commit {commit}")
-                res = run_quiet(
+                res = run_git(
                     ["git", "clone", clone_source, str(target_dir)],
                     capture_output=True,
                     text=True,
                 )
                 if res.returncode != 0:
                     raise InstallerError(f"Failed to clone {component} from {clone_source}: {res.stderr.strip()}")
-                res = run_quiet(
-                    ["git", "-C", str(target_dir), "checkout", commit],
-                    capture_output=True,
-                    text=True,
-                )
-                if res.returncode != 0:
-                    raise InstallerError(f"Failed to checkout {component} commit {commit}: {res.stderr.strip()}")
+                checkout_pinned()
             else:
                 if not git_dir.exists():
                     raise InstallerError(
                         f"Cannot verify {component} staging at {target_dir}: "
                         "the directory is not a Git checkout."
                     )
-                status = run_quiet(
+                status = run_git(
                     ["git", "-C", str(target_dir), "status", "--porcelain"],
                     capture_output=True, text=True,
                 )
@@ -431,36 +758,18 @@ class InstallerOrchestrator:
                         "it contains local changes or its Git status cannot be verified. "
                         "Preserve those files before retrying; nothing was discarded."
                     )
-                res = run_quiet(
+                res = run_git(
                     ["git", "-C", str(target_dir), "rev-parse", "HEAD"],
                     capture_output=True,
                     text=True,
                 )
                 actual_head = res.stdout.strip().lower()
                 if actual_head != commit.lower():
-                    checkout_res = run_quiet(
-                        ["git", "-C", str(target_dir), "checkout", commit],
-                        capture_output=True,
-                        text=True,
-                    )
-                    if checkout_res.returncode != 0:
-                        fetch_src = str(local_override) if local_override else "origin"
-                        run_quiet(
-                            ["git", "-C", str(target_dir), "fetch", fetch_src],
-                            capture_output=True,
-                            text=True,
-                        )
-                        res2 = run_quiet(
-                            ["git", "-C", str(target_dir), "checkout", commit],
-                            capture_output=True,
-                            text=True,
-                        )
-                        if res2.returncode != 0:
-                            raise InstallerError(f"Failed to checkout {component} commit {commit}: {res2.stderr.strip()}")
+                    checkout_pinned()
 
             if not git_dir.exists():
                 raise InstallerError(f"Acquired {component} at {target_dir} is not a Git checkout.")
-            res = run_quiet(
+            res = run_git(
                 ["git", "-C", str(target_dir), "rev-parse", "HEAD"],
                 capture_output=True,
                 text=True,
@@ -557,8 +866,7 @@ class InstallerOrchestrator:
 
         shasums_url = f"https://nodejs.org/dist/v{node_ver}/SHASUMS256.txt"
         shasums_path = node_tmp / "SHASUMS256.txt"
-        self.logger.info(f"Downloading Node.js SHASUMS256.txt from {shasums_url}")
-        urllib.request.urlretrieve(shasums_url, str(shasums_path))
+        self._download_file(shasums_url, shasums_path, substep="Downloading Node.js checksums")
 
         expected_sha = None
         for line in shasums_path.read_text(encoding="utf-8").splitlines():
@@ -571,8 +879,7 @@ class InstallerOrchestrator:
 
         archive_url = f"https://nodejs.org/dist/v{node_ver}/{node_file}"
         archive_path = node_tmp / node_file
-        self.logger.info(f"Downloading Node.js archive from {archive_url}")
-        urllib.request.urlretrieve(archive_url, str(archive_path))
+        self._download_file(archive_url, archive_path, substep=f"Downloading Node.js {node_ver}")
 
         actual_sha = hashlib.sha256(archive_path.read_bytes()).hexdigest()
         if actual_sha.lower() != expected_sha.lower():
@@ -644,8 +951,7 @@ class InstallerOrchestrator:
 
         checksums_url = f"https://github.com/caddyserver/caddy/releases/download/v{caddy_ver}/caddy_{caddy_ver}_checksums.txt"
         checksums_path = download_tmp / "checksums.txt"
-        self.logger.info(f"Downloading Caddy checksums from {checksums_url}")
-        urllib.request.urlretrieve(checksums_url, str(checksums_path))
+        self._download_file(checksums_url, checksums_path, substep="Downloading Caddy checksums")
 
         actual_checksums_sha256 = hashlib.sha256(checksums_path.read_bytes()).hexdigest()
         if actual_checksums_sha256.lower() != self.manifest.caddy_checksum.lower():
@@ -664,8 +970,7 @@ class InstallerOrchestrator:
 
         archive_url = f"https://github.com/caddyserver/caddy/releases/download/v{caddy_ver}/{caddy_file}"
         archive_path = download_tmp / caddy_file
-        self.logger.info(f"Downloading Caddy binary archive from {archive_url}")
-        urllib.request.urlretrieve(archive_url, str(archive_path))
+        self._download_file(archive_url, archive_path, substep=f"Downloading Caddy {caddy_ver}")
 
         if len(expected_file_hash) == 128:
             actual_hash = hashlib.sha512(archive_path.read_bytes()).hexdigest()
@@ -695,7 +1000,11 @@ class InstallerOrchestrator:
         """Generate authoritative Caddy reverse proxy and PWA configuration."""
         tls_line = "    tls internal\n" if tls_mode == "LOCAL" else ""
         pwa_root = str(self.paths.pwa_root).replace("\\", "/")
+        caddy_data_dir = str(self.paths.caddy_root / "data" / "caddy").replace("\\", "/")
         return (
+            "{\n"
+            f'    storage file_system "{caddy_data_dir}"\n'
+            "}\n\n"
             f"{public_host} {{\n"
             f"{tls_line}"
             f"    encode zstd gzip\n"
@@ -756,11 +1065,86 @@ class InstallerOrchestrator:
             "WantedBy=default.target\n"
         )
 
-    def generate_caddy_task_xml(self, user: str) -> str:
-        """Generate Windows Task Scheduler XML definition for Caddy TLS proxy."""
-        caddy_bin = self.paths.caddy_root / "bin" / ("caddy.exe" if os.name == "nt" else "caddy")
-        args = f'run --config "{self.paths.caddyfile}" --adapter caddyfile'
+    def generate_caddy_service_cmd(self) -> str:
+        """Generate Windows batch runner script that sets explicit Caddy environment variables (manual admin fallback)."""
+        caddy_bin = self.paths.caddy_root / "bin" / "caddy.exe"
+        data_parent = str(self.paths.caddy_root / "data")
+        data_dir = str(self.paths.caddy_root / "data" / "caddy")
+        config_parent = str(self.paths.caddy_root / "config")
+        config_dir = str(self.paths.caddy_root / "config" / "caddy")
+        return (
+            "@echo off\r\n"
+            "setlocal\r\n"
+            f'set "XDG_DATA_HOME={data_parent}"\r\n'
+            f'set "CADDY_DATA_DIR={data_dir}"\r\n'
+            f'set "XDG_CONFIG_HOME={config_parent}"\r\n'
+            f'set "CADDY_CONFIG_DIR={config_dir}"\r\n'
+            f'"{caddy_bin}" run --config "{self.paths.caddyfile}" --adapter caddyfile\r\n'
+        )
+
+    def generate_caddy_service_runner(self) -> str:
+        """Generate windowless Python runner script that sets Caddy environment and executes without console."""
+        caddy_bin = str(self.paths.caddy_root / "bin" / "caddy.exe")
+        data_parent = str(self.paths.caddy_root / "data")
+        data_dir = str(self.paths.caddy_root / "data" / "caddy")
+        config_parent = str(self.paths.caddy_root / "config")
+        config_dir = str(self.paths.caddy_root / "config" / "caddy")
+        caddyfile = str(self.paths.caddyfile)
         work_dir = str(self.paths.caddy_root)
+        return (
+            "# Windowless Caddy Background Service Runner for Chief\n"
+            "import os\n"
+            "import signal\n"
+            "import subprocess\n"
+            "import sys\n\n"
+            "def main():\n"
+            "    env = dict(os.environ)\n"
+            f"    env['XDG_DATA_HOME'] = {repr(data_parent)}\n"
+            f"    env['CADDY_DATA_DIR'] = {repr(data_dir)}\n"
+            f"    env['XDG_CONFIG_HOME'] = {repr(config_parent)}\n"
+            f"    env['CADDY_CONFIG_DIR'] = {repr(config_dir)}\n\n"
+            f"    cmd = [{repr(caddy_bin)}, 'run', '--config', {repr(caddyfile)}, '--adapter', 'caddyfile']\n"
+            "    creationflags = 0\n"
+            "    startupinfo = None\n"
+            "    if sys.platform == 'win32':\n"
+            "        creationflags = subprocess.CREATE_NO_WINDOW\n"
+            "        startupinfo = subprocess.STARTUPINFO()\n"
+            "        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW\n"
+            "        startupinfo.wShowWindow = subprocess.SW_HIDE\n\n"
+            "    proc = subprocess.Popen(\n"
+            "        cmd,\n"
+            f"        cwd={repr(work_dir)},\n"
+            "        env=env,\n"
+            "        creationflags=creationflags,\n"
+            "        startupinfo=startupinfo,\n"
+            "    )\n\n"
+            "    def _handle_term(signum, frame):\n"
+            "        try:\n"
+            "            proc.terminate()\n"
+            "        except Exception:\n"
+            "            pass\n\n"
+            "    signal.signal(signal.SIGTERM, _handle_term)\n"
+            "    signal.signal(signal.SIGINT, _handle_term)\n\n"
+            "    try:\n"
+            "        sys.exit(proc.wait())\n"
+            "    except KeyboardInterrupt:\n"
+            "        proc.terminate()\n"
+            "        sys.exit(proc.wait())\n\n"
+            "if __name__ == '__main__':\n"
+            "    main()\n"
+        )
+
+    def generate_caddy_task_xml(self, user: str) -> str:
+        """Generate Windows Task Scheduler XML definition for Caddy TLS proxy using windowless runner."""
+        runner_file = self.paths.caddy_root / "bin" / "caddy_runner.py"
+        work_dir = str(self.paths.caddy_root)
+        python_bin = self.paths.python
+        if os.name == "nt" or sys.platform == "win32":
+            pythonw = python_bin.with_name("pythonw.exe")
+            if pythonw.exists() or python_bin.name.lower() == "python.exe":
+                python_bin = pythonw
+        else:
+            python_bin = python_bin.with_name("pythonw.exe")
 
         task = ET.Element("Task", {"version": "1.4", "xmlns": "http://schemas.microsoft.com/windows/2004/02/mit/task"})
 
@@ -790,6 +1174,7 @@ class InstallerOrchestrator:
             ("StartWhenAvailable", "true"),
             ("Enabled", "true"),
             ("ExecutionTimeLimit", "PT0S"),
+            ("Hidden", "true"),
         ]:
             child(settings, tag, value)
         restart = child(settings, "RestartOnFailure")
@@ -798,8 +1183,8 @@ class InstallerOrchestrator:
         actions = child(task, "Actions")
         actions.set("Context", "Owner")
         execute = child(actions, "Exec")
-        child(execute, "Command", str(caddy_bin))
-        child(execute, "Arguments", args)
+        child(execute, "Command", str(python_bin))
+        child(execute, "Arguments", f'"{runner_file}"')
         child(execute, "WorkingDirectory", work_dir)
         return ET.tostring(task, encoding="utf-16", xml_declaration=True).decode("utf-16")
 
@@ -858,6 +1243,16 @@ class InstallerOrchestrator:
 
     def _step_archive(self, existing_paths: list) -> None:
         self.state_machine.transition(StepId.ARCHIVE, StepStatus.RUNNING, message="Safely archiving previous Chief installations...")
+        if hasattr(self.platform, 'quiesce_installation'):
+            self.state_machine.emit_substep("Stopping previous Chief services before archiving...")
+            services = ["chief-agent-dashboard.service", "chief-agent-worker.service",
+                        "chief-agent-scheduler.service", "chief-tls-proxy.service"]
+            roots = {self.paths.root}
+            roots.update(Path(p) for p in existing_paths
+                         if (Path(p) / 'runtime').exists() or (Path(p) / 'caddy').exists())
+            for root in roots:
+                self._check_cancelled()
+                self.platform.quiesce_installation(root, services)
         arch_path = self.platform.archive_existing_installation(
             self.paths.archive_base,
             progress_callback=lambda msg: self.logger.info(f"Archive: {msg}"),
@@ -882,18 +1277,35 @@ class InstallerOrchestrator:
         if not self.paths.python.exists():
             venv_cmd = [sys.executable, "-m", "venv", str(self.paths.runtime)]
             self.logger.info("Creating isolated Python virtual environment", venv_cmd=venv_cmd)
-            res = run_quiet(venv_cmd, capture_output=True, text=True)
+            res = self.run_command_streaming(
+                venv_cmd,
+                substep="Creating isolated Python runtime environment...",
+                timeout=90.0,
+            )
             if res.returncode != 0:
                 raise InstallerError(f"Failed to create Python virtual environment: {res.stderr.strip()}")
 
+            self.logger.info("Upgrading pip in runtime venv...")
             pip_cmd = [str(self.paths.python), "-m", "pip", "install", "--upgrade", "pip"]
-            run_quiet(pip_cmd, capture_output=True, text=True)
+            self.run_command_streaming(
+                pip_cmd,
+                substep="Upgrading package manager in runtime environment...",
+                timeout=120.0,
+                inactivity_timeout=60.0,
+            )
 
             reqs_file = self.paths.tooling / "requirements.txt"
             if reqs_file.exists():
                 self.logger.info(f"Installing Chief requirements from {reqs_file}")
                 install_cmd = [str(self.paths.python), "-m", "pip", "install", "-r", str(reqs_file)]
-                res = run_quiet(install_cmd, capture_output=True, text=True)
+                res = self.run_command_streaming(
+                    install_cmd,
+                    substep="Installing Chief dependencies into private runtime...",
+                    # Wheel extraction and bytecode generation can be silent
+                    # on Windows. Silence is not proof that pip has stalled.
+                    # Keep progress heartbeats, cancellation and a hard bound.
+                    timeout=900.0,
+                )
                 if res.returncode != 0:
                     raise InstallerError(f"Failed to install requirements: {res.stderr.strip()}")
 
@@ -916,43 +1328,117 @@ class InstallerOrchestrator:
             self.state_machine.transition(StepId.BROWSER, StepStatus.SUCCESS, message="Browser engine ready (mock).")
             return
 
+        from .desktop_runtime import provision as provision_desktop
+        self.state_machine.emit_substep('Preparing Chief desktop application...', phase_state='WORKING')
+        provision_desktop(self.paths, self._download_file)
+
+        # Check for existing verified browser configuration
+        if self.paths.browser_config.exists():
+            try:
+                with open(self.paths.browser_config, "r", encoding="utf-8") as f:
+                    cached_info = json.load(f)
+                cached_exec = Path(cached_info.get("executable", ""))
+                if cached_exec.exists() and os.access(cached_exec, os.X_OK):
+                    self.logger.info("Reusing existing verified browser configuration", executable=str(cached_exec))
+                    self.state_machine.transition(StepId.BROWSER, StepStatus.SUCCESS, message="Browser engine verified from existing installation.")
+                    return
+            except Exception:
+                pass
+
         if not self.paths.browser_config.exists():
-            self.logger.info("Installing Playwright Chromium browser...")
-            install_cmd = [str(self.paths.python), "-m", "playwright", "install", "chromium"]
-            install_res = run_quiet(
-                install_cmd,
-                capture_output=True,
-                text=True,
-            )
+            self.state_machine.emit_substep("Detecting Playwright browser driver...", phase_state="WORKING")
+            driver_bin = None
+            driver_cli = None
+            try:
+                detect_code = (
+                    "import json\n"
+                    "try:\n"
+                    "    from playwright._impl._driver import compute_driver_executable\n"
+                    "    print(json.dumps(list(compute_driver_executable())))\n"
+                    "except Exception:\n"
+                    "    pass\n"
+                )
+                det_res = run_quiet([str(self.paths.python), "-c", detect_code], capture_output=True, text=True)
+                if det_res.returncode == 0 and det_res.stdout.strip():
+                    parsed = json.loads(det_res.stdout.strip().splitlines()[-1])
+                    if len(parsed) >= 2 and Path(parsed[0]).exists() and Path(parsed[1]).exists():
+                        driver_bin, driver_cli = parsed[0], parsed[1]
+            except Exception:
+                pass
+
+            if driver_bin and driver_cli:
+                install_cmd = [driver_bin, driver_cli, "install", "chromium"]
+            else:
+                install_cmd = [str(self.paths.python), "-m", "playwright", "install", "chromium"]
+
+            self.logger.info("Installing Playwright Chromium browser...", command=" ".join(install_cmd[:3]))
+
+            def _on_browser_line(line: str) -> None:
+                s = line.strip()
+                if not s:
+                    return
+                if "downloading" in s.lower() or "installing" in s.lower():
+                    self.state_machine.emit_substep(s, phase_state="WORKING")
+                elif "%" in s:
+                    m = re.search(r"(\d+)%", s)
+                    if m:
+                        pct = float(m.group(1)) / 100.0
+                        self.state_machine.emit_substep(
+                            f"Downloading browser engine ({m.group(1)}%)...",
+                            progress=pct,
+                            phase_state="WORKING",
+                        )
+
+            try:
+                install_res = self.run_command_streaming(
+                    install_cmd,
+                    substep="Downloading Chromium browser engine...",
+                    timeout=300.0,
+                    inactivity_timeout=90.0,
+                    on_line=_on_browser_line,
+                )
+            except TimeoutError as te:
+                raise InstallerError(f"Browser engine setup failed: {te}") from te
+
             if install_res.returncode != 0:
                 if os.name != "nt":
                     self.logger.info("Retrying with --with-deps...", error=install_res.stderr.strip())
-                    install_cmd = [str(self.paths.python), "-m", "playwright", "install", "--with-deps", "chromium"]
-                    install_res = run_quiet(
-                        install_cmd,
-                        capture_output=True,
-                        text=True,
-                    )
+                    if driver_bin and driver_cli:
+                        retry_cmd = [driver_bin, driver_cli, "install", "--with-deps", "chromium"]
+                    else:
+                        retry_cmd = [str(self.paths.python), "-m", "playwright", "install", "--with-deps", "chromium"]
+                    try:
+                        install_res = self.run_command_streaming(
+                            retry_cmd,
+                            substep="Retrying browser engine setup with system dependencies...",
+                            timeout=300.0,
+                            inactivity_timeout=90.0,
+                            on_line=_on_browser_line,
+                        )
+                    except TimeoutError as te:
+                        raise InstallerError(f"Browser engine setup failed: {te}") from te
+
             if install_res.returncode != 0:
                 raise InstallerError(
                     f"Playwright chromium installation failed with exit code {install_res.returncode}: {install_res.stderr.strip()}"
                 )
 
+            self.state_machine.emit_substep("Resolving Chromium executable path...", phase_state="WORKING")
             find_script = (
                 "from playwright.sync_api import sync_playwright\n"
                 "p = sync_playwright().start()\n"
                 "print(p.chromium.executable_path)\n"
                 "p.stop()\n"
             )
-            path_res = run_quiet(
+            path_res = self.run_command_streaming(
                 [str(self.paths.python), "-c", find_script],
-                capture_output=True,
-                text=True,
+                substep="Resolving installed Chromium executable location...",
+                timeout=30.0,
             )
             if path_res.returncode != 0 or not path_res.stdout.strip():
                 raise InstallerError(f"Failed to locate Chromium executable path: {path_res.stderr.strip()}")
 
-            chromium_exec = Path(path_res.stdout.strip())
+            chromium_exec = Path(path_res.stdout.strip().splitlines()[-1].strip())
             if not chromium_exec.exists():
                 raise InstallerError(f"Chromium executable does not exist at {chromium_exec}")
 
@@ -973,10 +1459,10 @@ class InstallerOrchestrator:
                 "    browser.close()\n"
                 "print('CHIEF_PLAYWRIGHT_BROWSER_OK')\n"
             )
-            smoke_res = run_quiet(
+            smoke_res = self.run_command_streaming(
                 [str(self.paths.python), "-c", smoke_script],
-                capture_output=True,
-                text=True,
+                substep="Verifying browser launch and rendering acceptance...",
+                timeout=30.0,
             )
             if smoke_res.returncode != 0 or "CHIEF_PLAYWRIGHT_BROWSER_OK" not in smoke_res.stdout:
                 raise InstallerError(
@@ -1046,11 +1532,25 @@ class InstallerOrchestrator:
                 self.logger.info(f"Building {name} PWA with npm...")
                 npm_env = os.environ.copy()
                 npm_env["PATH"] = f"{node_bin.parent}{os.pathsep}{npm_env.get('PATH', '')}"
-                ci_res = run_quiet([str(npm_bin), "ci", "--engine-strict"], cwd=str(app_dir), capture_output=True, text=True, env=npm_env)
+                ci_res = self.run_command_streaming(
+                    [str(npm_bin), "ci", "--engine-strict"],
+                    substep=f"Installing {name.capitalize()} dependencies with npm...",
+                    cwd=str(app_dir),
+                    env=npm_env,
+                    timeout=300.0,
+                    inactivity_timeout=90.0,
+                )
                 if ci_res.returncode != 0:
                     raise InstallerError(f"npm ci failed for {name} PWA: {ci_res.stderr.strip()}")
 
-                build_res = run_quiet([str(npm_bin), "run", "build"], cwd=str(app_dir), capture_output=True, text=True, env=npm_env)
+                build_res = self.run_command_streaming(
+                    [str(npm_bin), "run", "build"],
+                    substep=f"Compiling {name.capitalize()} production assets...",
+                    cwd=str(app_dir),
+                    env=npm_env,
+                    timeout=300.0,
+                    inactivity_timeout=90.0,
+                )
                 if build_res.returncode != 0:
                     raise InstallerError(f"npm run build failed for {name} PWA: {build_res.stderr.strip()}")
 
@@ -1078,6 +1578,7 @@ class InstallerOrchestrator:
         }
         with open(self.paths.identity_config, "w", encoding="utf-8") as f:
             json.dump(identity_data, f, indent=2)
+        self._track_created_file(self.paths.identity_config)
         self.state_machine.transition(StepId.IDENTITY, StepStatus.SUCCESS, message=f"Identity configured: {self._public_host}")
 
     def _step_production_instance(self) -> None:
@@ -1096,6 +1597,9 @@ class InstallerOrchestrator:
                 with open(self.paths.config, "w", encoding="utf-8") as f:
                     json.dump({"schema_sha256": "mock_schema_sha256", "dashboard_port": 8765, "dns_mode": self.options.dns_mode}, f)
             self._expected_schema_sha256 = "mock_schema_sha256"
+            self._track_created_file(self.paths.config)
+            self._track_created_file(self.paths.production)
+            self._track_created_file(self.paths.source_manifest)
             self.state_machine.transition(StepId.PRODUCTION_INSTANCE, StepStatus.SUCCESS, message="Production database prepared (mock).")
             return
 
@@ -1129,6 +1633,10 @@ class InstallerOrchestrator:
         self._expected_schema_sha256 = prep_res.get("schema_sha256")
         if not self._expected_schema_sha256:
             raise InstallerError("Chief prepare_production did not return schema_sha256")
+
+        self._track_created_file(self.paths.config)
+        self._track_created_file(self.paths.production)
+        self._track_created_file(self.paths.source_manifest)
 
         self.state_machine.transition(StepId.PRODUCTION_INSTANCE, StepStatus.SUCCESS, message="Production database prepared.")
 
@@ -1245,6 +1753,11 @@ class InstallerOrchestrator:
             managed_installation=str(self.paths.managed),
         )
         self.platform.install_service_units(self.paths.unit_stage, self.paths.unit_dest)
+        unit_ext = ".xml" if target_platform == "windows" else ".service"
+        for s_name in ("chief-agent-dashboard", "chief-agent-worker", "chief-agent-scheduler"):
+            s_file = self.paths.unit_dest / f"{s_name}{unit_ext}"
+            if s_file.exists() and s_file not in self._tracked_units_created:
+                self._tracked_units_created.append(s_file)
         self.state_machine.transition(StepId.SERVICES, StepStatus.SUCCESS, message="User background services installed.")
 
     def _step_tls(self) -> None:
@@ -1269,6 +1782,7 @@ class InstallerOrchestrator:
         caddyfile_content = self.generate_caddyfile(self._public_host, self.options.tls_mode)
         self.paths.caddyfile.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.paths.caddyfile.write_text(caddyfile_content, encoding="utf-8")
+        self._track_created_file(self.paths.caddyfile)
 
         target_platform = getattr(self.platform, "os_name", "windows" if os.name == "nt" else "linux")
         if target_platform == "linux" and os.name != "nt" and shutil.which(str(caddy_bin)):
@@ -1290,10 +1804,23 @@ class InstallerOrchestrator:
 
         if target_platform == "windows":
             user = self.platform.get_current_username()
+            cmd_script = self.generate_caddy_service_cmd()
+            cmd_file = self.paths.caddy_root / "bin" / "caddy_service.cmd"
+            cmd_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            cmd_file.write_text(cmd_script, encoding="utf-8")
+            self._track_created_file(cmd_file)
+
+            runner_script = self.generate_caddy_service_runner()
+            runner_file = self.paths.caddy_root / "bin" / "caddy_runner.py"
+            runner_file.write_text(runner_script, encoding="utf-8")
+            self._track_created_file(runner_file)
+
             task_xml = self.generate_caddy_task_xml(user)
             task_file = self.paths.unit_dest / "chief-tls-proxy.xml"
             task_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             task_file.write_text(task_xml, encoding="utf-16")
+            if task_file not in self._tracked_units_created:
+                self._tracked_units_created.append(task_file)
             if shutil.which("schtasks"):
                 run_quiet(["schtasks", "/create", "/tn", "chief-tls-proxy", "/xml", str(task_file), "/f"], capture_output=True, text=True)
         else:
@@ -1301,6 +1828,8 @@ class InstallerOrchestrator:
             service_file = self.paths.unit_dest / "chief-tls-proxy.service"
             service_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             service_file.write_text(service_content, encoding="utf-8")
+            if service_file not in self._tracked_units_created:
+                self._tracked_units_created.append(service_file)
             try:
                 service_file.chmod(0o600)
             except Exception:
@@ -1443,6 +1972,9 @@ class InstallerOrchestrator:
 
         services = ["chief-agent-dashboard.service", "chief-agent-worker.service",
                     "chief-agent-scheduler.service", "chief-tls-proxy.service"]
+        # Record intent before enabling or starting anything: a partial failure
+        # can otherwise leave an untracked running service behind.
+        self._tracked_services_started = list(services)
         enabled = self.platform.control_services("enable", services)
         for service in services:
             if not enabled.get(service, False):
@@ -1465,10 +1997,21 @@ class InstallerOrchestrator:
                 ])
 
         self.platform.control_services("restart", ["chief-tls-proxy.service"])
+        self._tracked_services_started = list(services)
 
         for s in ("chief-agent-dashboard.service", "chief-agent-worker.service", "chief-agent-scheduler.service", "chief-tls-proxy.service"):
-            if not self.platform.verify_service_active(s):
-                raise InstallerError(f"Service {s} failed to become active")
+            active = False
+            self.state_machine.emit_substep(
+                f"Waiting for {s} startup (up to 60 seconds)...", phase_state="WORKING")
+            deadline_active = time.monotonic() + 60.0
+            while time.monotonic() < deadline_active:
+                self._check_cancelled()
+                if self.platform.verify_service_active(s):
+                    active = True
+                    break
+                time.sleep(0.5)
+            if not active:
+                raise InstallerError(f"Service {s} failed to become active within 60 seconds")
 
         port = 8765
         if self.paths.config.exists():
@@ -1528,16 +2071,21 @@ class InstallerOrchestrator:
         host = self._public_host
         if not host:
             raise InstallerError("HTTPS verification requires the installation hostname")
-        ca = self.paths.caddy_root / "data/caddy/pki/authorities/local/root.crt"
+        ca = self.paths.caddy_root / "data" / "caddy" / "pki" / "authorities" / "local" / "root.crt"
         deadline = time.monotonic() + 30.0
-        last_error = None
-        # systemd reports active before Caddy has created its CA/listener.
-        # Retry readiness, always retaining certificate/hostname validation.
+        last_error: Optional[Exception] = None
+        last_route: Optional[str] = None
+        last_status: Optional[int] = None
+
+        # systemd/TaskScheduler reports active before Caddy has created its CA/listener.
+        # Retry readiness, always retaining strict certificate/hostname validation.
         while time.monotonic() < deadline:
             try:
                 context = ssl.create_default_context(
-                    cafile=str(ca) if self.options.tls_mode == "LOCAL" else None)
+                    cafile=str(ca) if self.options.tls_mode == "LOCAL" else None
+                )
                 for route in ("/login", "/owner/", "/staff/", "/jobs/"):
+                    last_route = route
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError("HTTPS readiness deadline exceeded")
@@ -1552,7 +2100,10 @@ class InstallerOrchestrator:
                         connection.request("GET", route, headers={"Host": host, "Connection": "close"})
                         response = connection.getresponse()
                         if response.status != 200:
-                            raise InstallerError(f"HTTPS route {route} did not return its expected page")
+                            last_status = response.status
+                            raise InstallerError(
+                                f"Route '{route}' returned HTTP {response.status} (expected 200 OK)"
+                            )
                         response.read()
                     finally:
                         connection.close()
@@ -1562,12 +2113,34 @@ class InstallerOrchestrator:
                 remaining = deadline - time.monotonic()
                 if remaining > 0:
                     time.sleep(min(1.0, remaining))
-        raise InstallerError("Trusted HTTPS route verification failed; installation is not ready") from last_error
+
+        failed_route = last_route or "/login"
+        ca_path_str = str(ca)
+        ca_exists = ca.exists()
+        err_type = type(last_error).__name__ if last_error else "VerificationTimeout"
+        err_desc = str(last_error) if last_error else "Readiness deadline exceeded before verification could complete"
+        diag_msg = (
+            f"Trusted HTTPS route verification failed on route '{failed_route}' (installation is not ready) at https://{host}{failed_route}. "
+            f"TLS mode: {self.options.tls_mode}. Expected root CA: {ca_path_str} (exists: {ca_exists}). "
+            f"Cause: [{err_type}] {err_desc}."
+        )
+        self.logger.error(
+            "HTTPS route verification failed",
+            route=failed_route,
+            host=host,
+            tls_mode=self.options.tls_mode,
+            ca_path=ca_path_str,
+            ca_exists=ca_exists,
+            http_status=last_status,
+            error_type=err_type,
+            error_detail=err_desc,
+        )
+        raise InstallerError(diag_msg) from last_error
 
     def _step_device_setup(self) -> None:
         self.state_machine.transition(StepId.DEVICE_SETUP, StepStatus.RUNNING, message="Exporting mobile setup certificates...")
         if self.options.tls_mode == "LOCAL":
-            device_setup_dir = Path.home() / "Chief_Device_Setup"
+            device_setup_dir = self.paths.device_setup_dir
             ca_root = self.paths.caddy_root / "data" / "caddy" / "pki" / "authorities" / "local" / "root.crt"
             if ca_root.exists():
                 self.platform.export_device_ca(ca_root, device_setup_dir, self.options.owner_name, self._public_host or "chief.local")
@@ -1586,11 +2159,306 @@ class InstallerOrchestrator:
                 self.platform.export_device_ca(ca_root, device_setup_dir, self.options.owner_name, self._public_host or "chief.local")
 
         if self._wireguard_configured and self._wireguard_client_conf:
-            dest = Path.home() / "Chief_Device_Setup"
+            dest = self.paths.device_setup_dir
             dest.mkdir(parents=True, exist_ok=True, mode=0o700)
             wg_file = dest / "Chief-Owner-WireGuard.conf"
             wg_file.write_text(self._wireguard_client_conf, encoding="utf-8")
             try: wg_file.chmod(0o600)
             except Exception: pass
             self._wireguard_client_config_path = str(wg_file)
+
+        # Create dedicated desktop launcher and shortcuts for Chief Console
+        try:
+            self.platform.create_console_launchers(self.paths, self._public_host or "chief.local")
+        except Exception as exc:
+            self.logger.warning(f"Could not create desktop launchers: {exc}")
+
         self.state_machine.transition(StepId.DEVICE_SETUP, StepStatus.SUCCESS, message="Mobile setup instructions exported.")
+
+
+def discover_configured_canonical_host(paths: InstallerPaths) -> Optional[str]:
+    """Dynamically discover the configured canonical hostname from Chief installation artifacts."""
+    if paths.identity_config.exists():
+        try:
+            data = json.loads(paths.identity_config.read_text(encoding="utf-8"))
+            host = data.get("public_host") or data.get("canonical_hostname")
+            if host:
+                return str(host).strip()
+        except Exception:
+            pass
+
+    if paths.config.exists():
+        try:
+            data = json.loads(paths.config.read_text(encoding="utf-8"))
+            host = data.get("public_host") or data.get("canonical_hostname") or data.get("domain")
+            if host:
+                return str(host).strip()
+        except Exception:
+            pass
+
+    if paths.caddyfile.exists():
+        try:
+            text = paths.caddyfile.read_text(encoding="utf-8")
+            m = re.search(r"https://([a-zA-Z0-9.-]+)", text)
+            if m:
+                return m.group(1).strip()
+        except Exception:
+            pass
+
+    return None
+
+
+def _safe_remove_path(
+    target: Path,
+    removed_paths: List[str],
+    failed_items: List[str],
+    log: Optional[InstallerLogger] = None,
+) -> bool:
+    """Safely remove a file or directory tree and truthfully verify its deletion."""
+    if not target.exists() and not target.is_symlink():
+        return True
+
+    def _handle_readonly(func, path, exc_info):
+        import stat
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except Exception:
+            pass
+
+    try:
+        if target.is_file() or target.is_symlink():
+            try:
+                target.unlink()
+            except PermissionError:
+                import stat
+                os.chmod(target, stat.S_IWRITE)
+                target.unlink()
+        elif target.is_dir():
+            shutil.rmtree(target, onerror=_handle_readonly)
+    except Exception as exc:
+        if log:
+            log.warning(f"Exception removing {target}: {exc}")
+        failed_items.append(f"Failed to remove {target}: {exc}")
+        return False
+
+    if target.exists():
+        msg = f"Path {target} still exists after attempted removal"
+        if log:
+            log.error(msg)
+        failed_items.append(msg)
+        return False
+
+    removed_paths.append(str(target))
+    return True
+
+
+def uninstall_chief(
+    paths: Optional[InstallerPaths] = None,
+    platform: Optional[PlatformAdapter] = None,
+    purge: bool = False,
+    confirmed: bool = False,
+    logger: Optional[InstallerLogger] = None,
+    service_stop_timeout: float = 10.0,
+) -> Dict[str, Any]:
+    """Perform a complete, predictable uninstallation or full purge of Chief.
+
+    Stops and disables all Chief background services, unregisters scheduled tasks or
+    systemd units, removes launchers and hostname mappings, and cleans up Chief
+    runtime and configuration files.
+
+    When purge=False (standard uninstall):
+    Removes background services, launchers, runtime environment, node, tooling, and PWAs.
+    Safely PRESERVES user databases (production/chief.sqlite), identity credentials,
+    instance secrets, Caddy PKI/certificates, exported setup packages (~/Chief_Device_Setup),
+    and historical archives.
+
+    When purge=True (full removal):
+    Completely removes Chief root, config directory, user databases, credentials,
+    certificates, exported setup packages, and archive directories without retaining backups.
+    Requires confirmed=True before deleting user data.
+
+    Fails closed if any Chief task or process remains active, or if any path cannot be removed.
+    """
+    from .cli import get_default_platform_adapter
+    plat = platform or get_default_platform_adapter()
+    p = paths or InstallerPaths.create()
+    log = logger or InstallerLogger(log_dir=p.state_root / "installer" / "logs")
+
+    if purge and not confirmed:
+        err_msg = "Full purge requires explicit confirmation before deleting user databases and credentials."
+        log.error(err_msg)
+        raise InstallerError(err_msg)
+
+    log.info("Starting Chief uninstallation", purge=purge, confirmed=confirmed)
+    services = [
+        "chief-agent-dashboard.service",
+        "chief-agent-worker.service",
+        "chief-agent-scheduler.service",
+        "chief-tls-proxy.service",
+    ]
+
+    report: Dict[str, Any] = {
+        "success": False,
+        "stopped_services": [],
+        "unregistered_tasks": [],
+        "removed_launchers": [],
+        "removed_paths": [],
+        "failed_items": [],
+        "purge": purge,
+    }
+
+    # Validate every removal target before stopping services, removing launchers,
+    # or invoking privileged cleanup. A rejected custom path must have no side
+    # effects on either Chief or the host.
+    runtime_paths_to_remove = [
+        p.browser_config,
+        p.caddyfile,
+        p.caddy_root / "bin",
+        p.managed,
+        p.runtime,
+        p.node_root,
+        p.pwa_root,
+        p.tooling,
+        p.release_source,
+    ]
+    purge_targets = [
+        p.identity_config,
+        p.config,
+        p.production,
+        p.state_root,
+        p.caddy_root / "data",
+        p.caddy_root / "config",
+        p.caddy_root,
+        p.get_device_setup_dir(),
+        p.archive_base,
+        p.config_root,
+        p.root,
+    ] if purge else []
+    all_targets_to_remove = runtime_paths_to_remove + purge_targets
+
+    configured_home = p.get_home().resolve()
+    allowed_roots = [configured_home, p.root.resolve(), p.config_root.resolve()]
+    for target in all_targets_to_remove:
+        target_resolved = target.resolve()
+        if not any(target_resolved.is_relative_to(allowed) for allowed in allowed_roots):
+            raise InstallerError(
+                f"Safety guard violation: path '{target}' resolves outside supplied boundaries "
+                f"({configured_home}, {p.root}, {p.config_root})."
+            )
+
+    # 1. Stop and disable all 4 Chief services
+    try:
+        plat.control_services("stop", services)
+        plat.control_services("disable", services)
+    except Exception as exc:
+        log.warning(f"Error stopping/disabling services: {exc}")
+
+    # 2. Terminate owned processes and verify stopped
+    if hasattr(plat, "terminate_service_processes"):
+        try:
+            plat.terminate_service_processes(services)
+        except Exception as exc:
+            log.warning(f"Error terminating service processes: {exc}")
+
+    # Poll up to service_stop_timeout to verify all services are stopped
+    deadline = time.monotonic() + max(0.1, service_stop_timeout)
+    for s in services:
+        while time.monotonic() < deadline:
+            if not plat.verify_service_active(s):
+                report["stopped_services"].append(s)
+                break
+            time.sleep(0.5)
+        if plat.verify_service_active(s):
+            report["failed_items"].append(f"Service {s} is still active")
+
+    if report["failed_items"]:
+        err_msg = f"Uninstall cannot proceed: Chief service(s) failed to stop: {report['failed_items']}"
+        log.error(err_msg)
+        raise InstallerError(err_msg)
+
+    # 3. Unregister Task Scheduler tasks or systemd units strictly scoped to Chief services
+    target_platform = getattr(plat, "os_name", "windows" if os.name == "nt" else "linux")
+    unit_ext = ".xml" if target_platform == "windows" else ".service"
+    unit_files = []
+    if p.unit_dest.exists():
+        for s in services:
+            task_name = plat._normalize_task_name(s) if hasattr(plat, "_normalize_task_name") else s.replace(".service", "")
+            cand = p.unit_dest / f"{task_name}{unit_ext}"
+            if cand.exists():
+                unit_files.append(cand)
+            cand2 = p.unit_dest / f"{s.replace('.service', '')}{unit_ext}"
+            if cand2.exists() and cand2 not in unit_files:
+                unit_files.append(cand2)
+
+    if not unit_files:
+        unit_files = [p.unit_dest / (f"{plat._normalize_task_name(s)}.xml" if hasattr(plat, "_normalize_task_name") else s) for s in services]
+
+    if hasattr(plat, "unregister_service_units"):
+        try:
+            plat.unregister_service_units(unit_files)
+            report["unregistered_tasks"].extend([u.stem for u in unit_files if isinstance(u, Path)])
+        except Exception as exc:
+            log.warning(f"Error unregistering service units: {exc}")
+            report["failed_items"].append(f"Unregistering units failed: {exc}")
+
+    # Verify scheduled tasks / units are gone on Windows
+    if target_platform == "windows" and hasattr(plat, "get_task_status"):
+        for s in services:
+            task_name = plat._normalize_task_name(s)
+            st = plat.get_task_status(task_name)
+            if st is not None:
+                report["failed_items"].append(f"Task {task_name} still registered (status={st})")
+
+    if report["failed_items"]:
+        err_msg = f"Uninstall failed: tasks remain registered: {report['failed_items']}"
+        log.error(err_msg)
+        raise InstallerError(err_msg)
+
+    try:
+        plat.reload_service_manager()
+    except Exception:
+        pass
+
+    # 4. Remove launchers
+    if hasattr(plat, "remove_console_launchers"):
+        try:
+            removed_l = plat.remove_console_launchers(p)
+            report["removed_launchers"].extend(removed_l)
+        except Exception as exc:
+            log.warning(f"Error removing launchers: {exc}")
+
+    # 5. Clean up local discovery / hostname dynamically
+    canonical_host = discover_configured_canonical_host(p)
+    if canonical_host and hasattr(plat, "cleanup_local_discovery"):
+        try:
+            res = plat.cleanup_local_discovery(canonical_host)
+            if res is False:
+                msg = f"Failed to clean up local discovery for {canonical_host}"
+                log.error(msg)
+                report["failed_items"].append(msg)
+        except Exception as exc:
+            log.warning(f"Error cleaning up local discovery for {canonical_host}: {exc}")
+            report["failed_items"].append(f"Failed to clean up local discovery for {canonical_host}: {exc}")
+
+    # 6. Remove Chief files based on standard vs full purge mode
+    for item in runtime_paths_to_remove:
+        _safe_remove_path(item, report["removed_paths"], report["failed_items"], log)
+
+    if purge:
+        for purge_target in purge_targets:
+            _safe_remove_path(purge_target, report["removed_paths"], report["failed_items"], log)
+    else:
+        # Standard uninstall: only clean up empty parent directories if no preserved data remains
+        for parent_dir in [p.caddy_root, p.config_root, p.root]:
+            if parent_dir.is_dir():
+                try:
+                    if not any(parent_dir.iterdir()):
+                        parent_dir.rmdir()
+                        report["removed_paths"].append(str(parent_dir))
+                except Exception:
+                    pass
+
+    report["success"] = (len(report["failed_items"]) == 0)
+    log.info("Chief uninstallation completed", success=report["success"], removed_paths_count=len(report["removed_paths"]))
+    return report

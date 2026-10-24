@@ -211,16 +211,11 @@ class ChiefAgentDeploymentClient:
         serializable_kwargs = {k: str(v) if isinstance(v, Path) else v for k, v in kwargs.items()}
         payload = json.dumps(serializable_kwargs)
 
-        proc = popen_quiet(
-            cmd,
-            cwd=str(root),
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+        proc = run_quiet(
+            cmd, cwd=str(root), env=env, input=payload,
+            capture_output=True, text=True, timeout=300,
         )
-        stdout, stderr = proc.communicate(input=payload)
+        stdout, stderr = proc.stdout, proc.stderr
         if proc.returncode != 0:
             raise ContractCompatibilityError(
                 f"Contract capability '{func_name}' failed with exit code {proc.returncode}: {stderr.strip()}"

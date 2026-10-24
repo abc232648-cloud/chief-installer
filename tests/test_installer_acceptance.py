@@ -256,6 +256,9 @@ def test_clean_host_acceptance_with_real_chief_deployment_contract(tmp_path, mon
     # This contract fixture uses a fake Caddy binary/CA; real TLS is qualified
     # separately against the native installation, not by this fixture.
     monkeypatch.setattr(orchestrator, "_verify_https_routes", lambda: None)
+    # This simulated OS contract does not download a desktop engine or launch
+    # native windows. Native desktop acceptance is a separate test boundary.
+    monkeypatch.setattr('deployment.installer.desktop_runtime.provision', lambda *a, **kw: None)
     result = orchestrator.execute_all()
 
     assert result.status == "SUCCESS", f"Installation failed with: {result.error}"

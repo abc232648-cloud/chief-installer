@@ -58,5 +58,10 @@ if "$PACKAGE_BIN" --non-interactive >/dev/null 2>&1; then
 fi
 echo "[OK] Fail-closed argument validation verified"
 
+# 5. Test Console smoke test
+echo "Testing Console smoke test..."
+"$PACKAGE_BIN" --console-smoke-test >/dev/null
+echo "[OK] --console-smoke-test verified"
+
 echo "=== Packaged artifact qualification passed successfully ==="
 echo "NOTE: Real-host Xubuntu service/mDNS/TLS/health acceptance remains a separate release gate."

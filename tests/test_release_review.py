@@ -21,6 +21,14 @@ def test_current_packaged_manifest_matches_review_and_preserves_history():
     assert review.chief_agent_commit != ACCEPTED_FIRST_RELEASE_MANIFEST.chief_agent_commit
 
 
+def test_release_inspection_does_not_initialize_platform_or_install(monkeypatch, capsys):
+    import json
+    from deployment.installer import cli
+    monkeypatch.setattr(cli, 'get_default_platform_adapter', lambda: pytest.fail('Must not initialize an installation'))
+    assert cli.run_cli(['--print-release-manifest']) == 0
+    assert json.loads(capsys.readouterr().out) == CURRENT_RELEASE_MANIFEST.to_dict()
+
+
 def test_incompatible_client_engine_stops_before_build(tmp_path, monkeypatch):
     paths = InstallerPaths.create(custom_root=tmp_path/'chief', home=tmp_path/'home')
     runner = InstallerOrchestrator(

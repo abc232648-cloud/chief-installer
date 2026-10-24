@@ -4,6 +4,7 @@ Shares the exact same orchestrator, state machine, and contracts as the GUI.
 """
 import argparse
 import getpass
+import json
 import os
 from pathlib import Path
 import platform
@@ -49,7 +50,11 @@ def print_cli_progress(event: InstallEvent) -> None:
         sys.stdout.flush()
 
 
-def run_cli(argv: Optional[List[str]] = None, platform_adapter: Optional[PlatformAdapter] = None) -> int:
+def run_cli(
+    argv: Optional[List[str]] = None,
+    platform_adapter: Optional[PlatformAdapter] = None,
+    paths: Optional[InstallerPaths] = None,
+) -> int:
     parser = argparse.ArgumentParser(
         prog="chief-installer",
         description="Chief Unified Installer — installs Chief and built PWAs with local discovery and TLS.",
@@ -63,14 +68,64 @@ def run_cli(argv: Optional[List[str]] = None, platform_adapter: Optional[Platfor
     parser.add_argument("--public-host", help="Advanced override for external DNS hostname.")
     parser.add_argument("--tls-mode", choices=["LOCAL", "PUBLIC"], default="LOCAL", help="TLS mode.")
     parser.add_argument("--manifest", help="Path to release manifest JSON.")
+    parser.add_argument("--print-release-manifest", action="store_true", help="Print the embedded release pins without installing anything.")
     parser.add_argument("--non-interactive", action="store_true", help="Fail if required fields are missing instead of prompting.")
+    parser.add_argument("--uninstall", action="store_true", help="Uninstall Chief services, launchers, and configuration.")
+    parser.add_argument("--purge", action="store_true", help="Full purge: completely remove Chief services, configuration, and archive directories.")
+    parser.add_argument("--confirm-purge", action="store_true", help="Explicit confirmation required to execute a full purge.")
 
     parser.add_argument('--dns-mode', choices=['quad9', 'system'], default='quad9',
                         help='Chief DNS: Quad9 Secure DoH (default) or System DNS. Host DNS is unchanged.')
     args = parser.parse_args(argv)
+    if args.print_release_manifest:
+        print(json.dumps(CURRENT_RELEASE_MANIFEST.to_dict(), sort_keys=True))
+        return 0
 
     # Resolve platform
     adapter = platform_adapter or get_default_platform_adapter()
+
+    # Handle uninstall / purge
+    if args.uninstall or args.purge:
+        from .orchestrator import uninstall_chief
+        confirmed = False
+        if args.purge:
+            if args.confirm_purge:
+                confirmed = True
+            elif args.non_interactive or not sys.stdin.isatty():
+                sys.stderr.write(
+                    "ERROR: Full purge permanently deletes all user databases, identity credentials, "
+                    "exported setup keys (~/Chief_Device_Setup), and backup archives. "
+                    "To proceed non-interactively, you must pass --confirm-purge.\n"
+                )
+                return 1
+            else:
+                sys.stdout.write(
+                    "\nWARNING: Full purge will permanently delete all farm databases, user accounts, "
+                    "identity credentials, exported setup keys (~/Chief_Device_Setup), TLS certificates, and backup archives.\n"
+                    "Type 'CONFIRM' to proceed: "
+                )
+                sys.stdout.flush()
+                answer = sys.stdin.readline().strip()
+                if answer == "CONFIRM":
+                    confirmed = True
+                else:
+                    sys.stderr.write("Purge cancelled by user.\n")
+                    return 1
+
+        print("Starting Chief uninstallation" + (" (full purge)" if args.purge else "") + "...")
+        try:
+            report = uninstall_chief(platform=adapter, paths=paths, purge=args.purge, confirmed=confirmed)
+            if report.get("success"):
+                print("Chief uninstallation complete.")
+                print(f"Stopped services: {', '.join(report.get('stopped_services', []))}")
+                print(f"Removed items: {len(report.get('removed_paths', []))} paths removed.")
+                return 0
+            else:
+                print(f"Uninstallation finished with warnings: {report.get('failed_items')}")
+                return 1
+        except Exception as exc:
+            sys.stderr.write(f"ERROR: Uninstallation failed: {exc}\n")
+            return 1
 
     # Resolve manifest
     if args.manifest:

@@ -13,6 +13,7 @@ a = Analysis(
     pathex=[str(project_root)],
     binaries=[],
     datas=[
+        (str(project_root / 'deployment' / 'installer' / 'desktop'), 'deployment/installer/desktop'),
         (str(project_root / 'packaging' / 'installer' / 'linux' / 'chief-installer.desktop'), '.'),
     ],
     hiddenimports=[
@@ -34,6 +35,7 @@ a = Analysis(
         'deployment.installer.privileged.linux',
         'deployment.installer.ui.app',
         'deployment.installer.ui.controller',
+        'deployment.installer.console',
     ],
     hookspath=[],
     hooksconfig={},

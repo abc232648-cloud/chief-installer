@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..errors import PrivilegeError, SystemDependencyError
 from ..models import PlatformInfo, PreflightCheck, PreflightReport
@@ -554,3 +554,117 @@ class LinuxPlatformAdapter(PlatformAdapter):
             return True
         import webbrowser
         return webbrowser.open(url)
+
+    def create_console_launchers(self, paths: Any, public_host: str) -> None:
+        """Create distinct desktop entries for Chief Console and Chief Installer."""
+        home = Path.home()
+        apps_dir = home / ".local" / "share" / "applications"
+        desktop_dir = home / "Desktop"
+        apps_dir.mkdir(parents=True, exist_ok=True)
+
+        exec_bin = "/opt/chief-installer/chief-installer"
+        if (paths.root / 'desktop/current.json').is_file():
+            from ..desktop_runtime import installed
+            helper = installed(paths)['helper']
+            # Desktop Entry quoting differs from shell quoting. Percent must be
+            # escaped because it introduces field codes in this file format.
+            exec_bin = '"' + helper.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$').replace('%', '%%') + '"'
+        elif not Path(exec_bin).exists():
+            exec_bin = f"{sys.executable} -m deployment.installer"
+
+        console_desktop = (
+            "[Desktop Entry]\n"
+            "Version=1.0\n"
+            "Type=Application\n"
+            "Name=Chief Console\n"
+            "GenericName=Chief Farm Operations Console\n"
+            "Comment=On-farm Chief Console desktop application\n"
+            f"Exec={exec_bin} --console\n"
+            "Icon=chief-console\n"
+            "Terminal=false\n"
+            "StartupNotify=true\n"
+            "Categories=Office;System;\n"
+            "StartupWMClass=ChiefConsole\n"
+        )
+        installer_desktop = (
+            "[Desktop Entry]\n"
+            "Version=1.0\n"
+            "Type=Application\n"
+            "Name=Chief Installer\n"
+            "GenericName=Chief Installation Setup\n"
+            "Comment=Install or repair Chief deployment\n"
+            f"Exec={exec_bin} --gui\n"
+            "Icon=system-software-install\n"
+            "Terminal=false\n"
+            "StartupNotify=true\n"
+            "Categories=System;Setup;\n"
+        )
+
+        (apps_dir / "chief-console.desktop").write_text(console_desktop, encoding="utf-8")
+        (apps_dir / "chief-installer.desktop").write_text(installer_desktop, encoding="utf-8")
+
+        if desktop_dir.is_dir():
+            dt_console = desktop_dir / "chief-console.desktop"
+            dt_installer = desktop_dir / "chief-installer.desktop"
+            dt_console.write_text(console_desktop, encoding="utf-8")
+            dt_installer.write_text(installer_desktop, encoding="utf-8")
+            try:
+                dt_console.chmod(0o755)
+                dt_installer.chmod(0o755)
+            except OSError:
+                pass
+
+    def unregister_service_units(self, unit_files: List[Any]) -> None:
+        """Stop, disable, and unregister systemd user service units."""
+        names: List[str] = []
+        for unit in unit_files:
+            name = unit.name if isinstance(unit, Path) else str(unit)
+            if not name.endswith(".service"):
+                name = f"{name}.service"
+            names.append(name)
+            if isinstance(unit, Path) and unit.exists():
+                try:
+                    unit.unlink()
+                except Exception:
+                    pass
+
+        if shutil.which("systemctl") and names:
+            subprocess.run(["systemctl", "--user", "stop", *names], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["systemctl", "--user", "disable", *names], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["systemctl", "--user", "daemon-reload"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["systemctl", "--user", "reset-failed"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def terminate_service_processes(self, service_names: List[str]) -> None:
+        """Terminate systemd user service processes."""
+        if shutil.which("systemctl"):
+            units = [s if s.endswith(".service") else f"{s}.service" for s in service_names]
+            subprocess.run(["systemctl", "--user", "stop", *units], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def remove_console_launchers(self, paths: Any) -> List[str]:
+        """Remove desktop launcher files for Chief Console and Chief Installer."""
+        removed: List[str] = []
+        home = Path.home()
+        for p in [
+            home / ".local" / "share" / "applications" / "chief-console.desktop",
+            home / ".local" / "share" / "applications" / "chief-installer.desktop",
+            home / "Desktop" / "chief-console.desktop",
+            home / "Desktop" / "chief-installer.desktop",
+        ]:
+            if p.exists():
+                try:
+                    p.unlink()
+                    removed.append(str(p))
+                except Exception:
+                    pass
+        return removed
+
+    def cleanup_local_discovery(self, public_host: str) -> bool:
+        """Remove configured local discovery entries."""
+        try:
+            self._run_privileged(["cleanup-local-discovery", public_host])
+            return True
+        except Exception as exc:
+            # Do not claim success or delete a globally named Avahi file when
+            # the privileged cleanup did not run. The orchestrator reports this
+            # as a failed uninstall and leaves the remaining state visible.
+            raise PrivilegeError(f"Could not clean up local discovery for {public_host}: {exc}") from exc

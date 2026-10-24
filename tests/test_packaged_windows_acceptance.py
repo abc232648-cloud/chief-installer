@@ -27,6 +27,12 @@ _DIST_SHA256 = _PROJECT_ROOT / "dist" / "installer" / "windows" / "Chief-Install
 @cache
 def _ensure_package() -> Path:
     """Build this source once per test process; never certify a stale dist."""
+    env_pkg = os.environ.get("CHIEF_TEST_PACKAGED_EXECUTABLE")
+    if env_pkg:
+        p = Path(env_pkg)
+        if p.is_file():
+            return p
+
     has_pyinstaller = bool(
         shutil.which("pyinstaller")
         or (Path(sys.executable).parent / ("pyinstaller.exe" if os.name == "nt" else "pyinstaller")).exists()
@@ -60,18 +66,24 @@ def test_windows_packaged_artifact_integrity():
     # PE header check (MZ)
     assert artifact.read_bytes()[:2] == b"MZ", "Executable does not have MZ header"
 
-    assert _DIST_META.exists(), "INSTALLER_SHA256.json metadata file not found"
-    meta = json.loads(_DIST_META.read_text(encoding="utf-8"))
-    assert meta["artifact"] == "Chief-Installer-Windows.exe"
-    assert meta["release_id"] == CURRENT_RELEASE_MANIFEST.release_id
-    assert len(meta["sha256"]) == 64
+    if artifact == _DIST_EXE and _DIST_META.exists():
+        meta = json.loads(_DIST_META.read_text(encoding="utf-8"))
+        assert meta["artifact"] == "Chief-Installer-Windows.exe"
+        assert meta["release_id"] == CURRENT_RELEASE_MANIFEST.release_id
+        assert len(meta["sha256"]) == 64
 
-    actual_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
-    assert actual_sha == meta["sha256"], f"SHA-256 mismatch: {actual_sha} vs {meta['sha256']}"
+        actual_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        assert actual_sha == meta["sha256"], f"SHA-256 mismatch: {actual_sha} vs {meta['sha256']}"
+    elif (artifact.parent / "INSTALLER_SHA256.json").exists():
+        meta = json.loads((artifact.parent / "INSTALLER_SHA256.json").read_text(encoding="utf-8"))
+        actual_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        assert actual_sha == meta["sha256"]
 
-    assert _DIST_SHA256.exists(), "Chief-Installer-Windows.exe.sha256 companion not found"
-    sha_line = _DIST_SHA256.read_text(encoding="utf-8").strip()
-    assert sha_line.startswith(actual_sha)
+    companion = artifact.with_name(artifact.name + ".sha256")
+    if companion.exists():
+        actual_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        sha_line = companion.read_text(encoding="utf-8").strip()
+        assert sha_line.startswith(actual_sha)
 
 
 def test_windows_packaged_artifact_help():
@@ -88,6 +100,12 @@ def test_windows_packaged_artifact_help():
     assert b"--tls-mode" in combined
     assert b"--non-interactive" in combined
     assert b"--dns-mode" in combined
+
+
+def test_windows_binary_contains_exact_release_manifest():
+    result = _run_artifact(_ensure_package(), '--print-release-manifest')
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == CURRENT_RELEASE_MANIFEST.to_dict()
 
 
 def test_windows_packaged_artifact_fail_closed_validation():

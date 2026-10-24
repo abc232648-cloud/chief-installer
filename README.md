@@ -1,3 +1,5 @@
+> **Current candidate:** [Release instructions, 24 October 2026](RELEASE_INSTRUCTIONS.md). These supersede earlier deployment instructions. This is a review package, not production clearance.
+
 # Chief Unified Installer
 
 Dedicated cross-platform installer repository for **Chief**.

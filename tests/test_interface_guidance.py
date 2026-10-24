@@ -64,7 +64,21 @@ def test_orchestrator_urls_distinguish_on_farm_console_and_pwas(tmp_path):
     assert last_transition[2].endswith(result.urls["chief"])
 
 
-def test_ui_completion_renders_on_farm_console_and_distinct_actions():
+def test_ui_completion_renders_on_farm_console_and_distinct_actions(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from deployment.installer.orchestrator import InstallerPaths
+    from deployment.installer import console
+    paths = InstallerPaths.create(custom_root=tmp_path / 'chief', home=tmp_path / 'home')
+    def probe(selected_paths):
+        assert selected_paths is paths
+        return SimpleNamespace(state=SimpleNamespace(value='HEALTHY'))
+    monkeypatch.setattr(console, 'probe_local_console', probe)
+    launches = []
+    def launch(diagnostic, selected_paths):
+        assert selected_paths is paths
+        launches.append(selected_paths)
+        return True
+    monkeypatch.setattr(console, 'launch_console_window', launch)
     class FakePlatform:
         os_name = "windows"
         def __init__(self): self.opened_urls = []
@@ -83,6 +97,7 @@ def test_ui_completion_renders_on_farm_console_and_distinct_actions():
     controller = InstallerUIController(
         platform_adapter=platform,
         orchestrator_factory=lambda opts: None,
+        paths=paths,
     )
     controller.public_host = "chief-server.local"
     controller.install_result = InstallResult(
@@ -98,7 +113,8 @@ def test_ui_completion_renders_on_farm_console_and_distinct_actions():
 
     # Controller can open on-farm console by default
     assert controller.open_chief_url("chief") is True
-    assert platform.opened_urls[-1] == "https://chief-server.local/"
+    assert launches == [paths]
+    assert platform.opened_urls == []
 
     # Controller can open remote owner companion
     assert controller.open_chief_url("owner") is True

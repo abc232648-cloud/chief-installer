@@ -6,7 +6,8 @@ operating system or deployment business logic. Can be tested headlessly.
 from enum import Enum
 import re
 import threading
-from typing import Callable, Dict, List, Optional
+import time
+from typing import Any, Callable, Dict, List, Optional
 
 from ..errors import InstallerError
 from ..events import EventBus, InstallEvent
@@ -27,6 +28,9 @@ class ScreenId(str, Enum):
     PROGRESS = "PROGRESS"
     FAILURE = "FAILURE"
     COMPLETION = "COMPLETION"
+    UNINSTALL_OPTIONS = "UNINSTALL_OPTIONS"
+    UNINSTALL_PROGRESS = "UNINSTALL_PROGRESS"
+    UNINSTALL_RESULT = "UNINSTALL_RESULT"
 
 
 _USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
@@ -40,10 +44,12 @@ class InstallerUIController:
         platform_adapter: PlatformAdapter,
         manifest: Optional[ReleaseManifest] = None,
         orchestrator_factory: Optional[Callable[[InstallOptions], InstallerOrchestrator]] = None,
+        paths: Optional[Any] = None,
     ):
         self.platform = platform_adapter
         self.manifest = manifest or CURRENT_RELEASE_MANIFEST
         self._orchestrator_factory = orchestrator_factory
+        self.paths = paths
 
         self.current_screen: ScreenId = ScreenId.WELCOME
         self.screen_history: List[ScreenId] = []
@@ -69,6 +75,22 @@ class InstallerUIController:
         self.failed_reason: str = ""
         self.failed_step: str = ""
         self.diagnostic_report: str = ""
+
+        # Activity, timing, and progress metrics
+        self.start_time: Optional[float] = None
+        self.last_activity_time: Optional[float] = None
+        self.current_substep: str = ""
+        self.current_phase_state: str = "IDLE"
+        self.bytes_downloaded: Optional[int] = None
+        self.bytes_total: Optional[int] = None
+        self.is_cancelling: bool = False
+
+        # Uninstall state
+        self.uninstall_mode: str = "standard"
+        self.purge_confirmed: bool = False
+        self.uninstall_result: Optional[Dict[str, Any]] = None
+        self.uninstall_error: str = ""
+        self.uninstall_message: str = ""
 
         # Event bus & listeners
         self.event_bus = EventBus()
@@ -118,8 +140,9 @@ class InstallerUIController:
             if callback:
                 callback(report)
 
-        t = threading.Thread(target=worker, daemon=True)
+        t = threading.Thread(target=worker, daemon=False)
         t.start()
+        return t
 
     def next_from_preflight(self) -> None:
         if not self.preflight_report or not self.preflight_report.passed:
@@ -190,6 +213,12 @@ class InstallerUIController:
         }
 
     def start_installation(self) -> None:
+        self.start_time = time.time()
+        self.last_activity_time = self.start_time
+        self.current_phase_state = "WORKING"
+        self.is_cancelling = False
+        self.bytes_downloaded = None
+        self.bytes_total = None
         self.set_screen(ScreenId.PROGRESS)
 
         options = InstallOptions(
@@ -231,10 +260,14 @@ class InstallerUIController:
                 )
                 self.set_screen(ScreenId.FAILURE)
 
-        t = threading.Thread(target=worker, daemon=True)
+        t = threading.Thread(target=worker, daemon=False)
         t.start()
+        return t
 
     def cancel_installation(self) -> None:
+        self.is_cancelling = True
+        self.current_phase_state = "CANCELLING"
+        self.current_substep = "Cancelling installation and safely rolling back partial changes..."
         if self._active_orchestrator:
             self._active_orchestrator.cancel()
 
@@ -243,6 +276,11 @@ class InstallerUIController:
         self.current_step_display = event.display_name
         self.current_step_message = event.message
         self.current_progress = event.progress
+        self.current_substep = event.substep or ""
+        self.current_phase_state = event.phase_state or ("WORKING" if event.status == StepStatus.RUNNING else event.status.value)
+        self.bytes_downloaded = event.bytes_downloaded
+        self.bytes_total = event.bytes_total
+        self.last_activity_time = time.time()
 
         for listener in self._progress_listeners:
             try:
@@ -250,7 +288,26 @@ class InstallerUIController:
             except Exception:
                 pass
 
+    def open_chief_console(self) -> bool:
+        """Launch the on-farm Chief Console desktop application."""
+        try:
+            from ..console import launch_console_window, probe_local_console
+            from ..orchestrator import InstallerPaths
+            paths = self.paths or InstallerPaths.create()
+            diag = probe_local_console(paths)
+            if diag.state.value == "HEALTHY":
+                if launch_console_window(diag, paths):
+                    return True
+        except Exception:
+            pass
+
+        # Never silently replace the dedicated shell with a user's browser.
+        # The installer/recovery view must report that desktop repair is needed.
+        return False
+
     def open_chief_url(self, app_name: str = "chief") -> bool:
+        if app_name == "chief":
+            return self.open_chief_console()
         if not self.install_result or not self.install_result.urls:
             return False
         url = self.install_result.urls.get(app_name)
@@ -259,3 +316,59 @@ class InstallerUIController:
         if url:
             return self.platform.open_url_in_browser(url)
         return False
+
+    def start_uninstall(self) -> None:
+        """Navigate to uninstallation mode selection screen."""
+        self.uninstall_mode = "standard"
+        self.purge_confirmed = False
+        self.uninstall_result = None
+        self.uninstall_error = ""
+        self.uninstall_message = ""
+        self.set_screen(ScreenId.UNINSTALL_OPTIONS)
+
+    def set_uninstall_mode(self, mode: str) -> None:
+        if mode not in ("standard", "purge"):
+            raise ValueError(f"Invalid uninstall mode: {mode}")
+        self.uninstall_mode = mode
+
+    def set_purge_confirmed(self, confirmed: bool) -> None:
+        self.purge_confirmed = bool(confirmed)
+
+    def execute_uninstall(self, callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> threading.Thread:
+        """Run uninstallation or purge asynchronously."""
+        if self.uninstall_mode == "purge" and not self.purge_confirmed:
+            raise ValueError("Confirmation is required before full removal of user data and credentials.")
+
+        self.set_screen(ScreenId.UNINSTALL_PROGRESS)
+        self.uninstall_message = "Stopping services and removing components..."
+
+        def worker():
+            from ..orchestrator import uninstall_chief, InstallerPaths
+            purge = (self.uninstall_mode == "purge")
+            try:
+                paths = self.paths or InstallerPaths.create()
+                report = uninstall_chief(paths=paths, platform=self.platform, purge=purge, confirmed=self.purge_confirmed)
+                self.uninstall_result = report
+                if not report.get("success", False):
+                    failed = report.get("failed_items", [])
+                    self.uninstall_error = "; ".join(failed) if failed else "Uninstallation encountered errors."
+                self.set_screen(ScreenId.UNINSTALL_RESULT)
+            except Exception as exc:
+                self.uninstall_error = str(exc)
+                self.uninstall_result = {
+                    "success": False,
+                    "failed_items": [str(exc)],
+                    "stopped_services": [],
+                    "unregistered_tasks": [],
+                    "removed_launchers": [],
+                    "removed_paths": [],
+                    "purge": purge,
+                }
+                self.set_screen(ScreenId.UNINSTALL_RESULT)
+            if callback and self.uninstall_result:
+                callback(self.uninstall_result)
+
+        t = threading.Thread(target=worker, daemon=False)
+        t.start()
+        return t
+

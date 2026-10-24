@@ -7,19 +7,23 @@ Supports Windows 10 and Windows 11 x64 systems using native Windows conventions:
 - Zero console window requirement (GUI-first)
 - Safe archive and partial recovery without destroying user repositories
 """
+import csv
+import base64
 from datetime import datetime, timezone
 import getpass
+import io
 import json
 import os
 from pathlib import Path
 import platform as py_platform
 import re
 import shutil
+import socket
 import subprocess
 from ..process import run as run_quiet
 import sys
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..errors import PrivilegeError, SystemDependencyError
 from ..models import PlatformInfo, PreflightCheck, PreflightReport
@@ -395,23 +399,156 @@ class WindowsPlatformAdapter(PlatformAdapter):
                 results[s] = False
         return results
 
-    def verify_service_active(self, service_name: str) -> bool:
-        """Query Task Scheduler to determine if a task is running."""
-        if not shutil.which("schtasks"):
-            return False
-
+    def get_task_status(self, service_name: str) -> Optional[str]:
+        """Query Task Scheduler for exact task status string (e.g. 'Running', 'Ready', 'Disabled')."""
         task = self._normalize_task_name(service_name)
         try:
             cmd = ["schtasks", "/query", "/tn", task, "/fo", "CSV", "/nh"]
             res = run_quiet(cmd, capture_output=True, text=True)
-            if res.returncode == 0:
-                output = res.stdout.strip()
-                # If Status is Running or Ready
-                if "Running" in output or "Ready" in output:
-                    return True
+            if res.returncode != 0:
+                return None
+            output = res.stdout.strip()
+            if not output:
+                return None
+            reader = csv.reader(io.StringIO(output))
+            for row in reader:
+                if row and len(row) >= 3:
+                    return row[2].strip()
         except Exception:
-            pass
+            return None
+        return None
+
+    def _is_port_listening(self, port: int, host: str = "127.0.0.1", timeout: float = 0.5) -> bool:
+        """Check if a TCP socket is listening on the specified port."""
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except (socket.error, OSError):
+            return False
+
+    def verify_service_active(self, service_name: str, timeout: float = 0.0) -> bool:
+        """Query Task Scheduler and listeners to determine if a task is actively running.
+
+        Never treats 'Ready' (idle/scheduled) or 'Disabled' as active.
+        """
+        task = self._normalize_task_name(service_name)
+        task_lower = task.lower()
+        deadline = time.monotonic() + max(0.0, timeout)
+
+        while True:
+            status = self.get_task_status(task)
+            if status and status.lower() == "running":
+                # For listener services, also verify that the network port is listening
+                if "proxy" in task_lower or "caddy" in task_lower or "tls" in task_lower:
+                    if self._is_port_listening(443):
+                        return True
+                    if time.monotonic() >= deadline:
+                        return False
+                elif "dashboard" in task_lower:
+                    if self._is_port_listening(8765):
+                        return True
+                    if time.monotonic() >= deadline:
+                        return False
+                else:
+                    return True
+            elif status and status.lower() in {"ready", "disabled"}:
+                # Explicitly not running
+                if time.monotonic() >= deadline:
+                    return False
+            else:
+                if time.monotonic() >= deadline:
+                    return False
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.2, remaining))
+
         return False
+
+    def unregister_service_units(self, unit_files: List[Any]) -> None:
+        """Unregister Task Scheduler tasks and delete definition XML files."""
+        for unit in unit_files:
+            task_name = self._normalize_task_name(unit.stem if isinstance(unit, Path) else str(unit))
+            try:
+                run_quiet(["schtasks", "/end", "/tn", task_name], capture_output=True, text=True)
+            except Exception:
+                pass
+            try:
+                run_quiet(["schtasks", "/change", "/tn", task_name, "/disable"], capture_output=True, text=True)
+            except Exception:
+                pass
+            try:
+                run_quiet(["schtasks", "/delete", "/tn", task_name, "/f"], capture_output=True, text=True)
+            except Exception:
+                pass
+            if isinstance(unit, Path) and unit.exists():
+                try:
+                    unit.unlink()
+                except Exception:
+                    pass
+
+    def terminate_service_processes(self, service_names: List[str]) -> None:
+        """Terminate active processes associated with specified Chief tasks."""
+        for s in service_names:
+            task = self._normalize_task_name(s)
+            try:
+                run_quiet(["schtasks", "/end", "/tn", task], capture_output=True, text=True)
+            except Exception:
+                pass
+
+    def quiesce_installation(self, root: Path, service_names: List[str]) -> None:
+        """Disable owned tasks and verify no executable in this install remains alive.
+
+        Task Scheduler /end alone can leave launcher children running. Never
+        kill by image name: other installations may also use Python or Caddy.
+        """
+        root = Path(root).resolve()
+        if root == root.parent or len(root.parts) < 3:
+            raise ValueError("Refusing an unbounded installation process scope")
+        allowed = {'chief-agent-dashboard', 'chief-agent-worker',
+                   'chief-agent-scheduler', 'chief-tls-proxy'}
+        names = [self._normalize_task_name(s) for s in service_names]
+        if not set(names).issubset(allowed):
+            raise ValueError("Unknown Chief service in cleanup scope")
+        # Quote literal data for PowerShell; never interpolate shell code.
+        literal = lambda value: "'" + str(value).replace("'", "''") + "'"
+        script = """
+$ErrorActionPreference = 'Stop'
+$root = ROOT_LITERAL
+$names = @(NAMES_LITERAL)
+$prefix = $root.TrimEnd('\\') + '\\'
+$tasks = @(Get-ScheduledTask | Where-Object { $_.TaskPath -eq '\\' -and $_.TaskName -in $names })
+foreach ($task in $tasks) {
+    $task | Disable-ScheduledTask | Out-Null
+    $task | Stop-ScheduledTask
+}
+function OwnedProcesses {
+    @(Get-CimInstance Win32_Process | Where-Object {
+        $_.ExecutablePath -and $_.ExecutablePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+    })
+}
+$deadline = [DateTime]::UtcNow.AddSeconds(15)
+do {
+    foreach ($item in @(OwnedProcesses)) {
+        $process = Get-Process -Id $item.ProcessId -ErrorAction SilentlyContinue
+        if ($process -and $process.Path -and $process.Path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+            $process | Stop-Process -Force -ErrorAction Stop
+        }
+    }
+    $remaining = @(OwnedProcesses)
+    $running = @(Get-ScheduledTask | Where-Object { $_.TaskPath -eq '\\' -and $_.TaskName -in $names -and $_.State -eq 'Running' })
+    if ($remaining.Count -eq 0 -and $running.Count -eq 0) { Write-Output 'CHIEF_STOP_VERIFIED'; exit 0 }
+    Start-Sleep -Milliseconds 200
+} while ([DateTime]::UtcNow -lt $deadline)
+throw 'Chief processes or tasks remain active; files must not be moved or removed.'
+""".replace('ROOT_LITERAL', literal(root)).replace('NAMES_LITERAL', ','.join(map(literal, names)))
+        encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
+        result = run_quiet(['powershell.exe', '-NoProfile', '-NonInteractive',
+                            '-WindowStyle', 'Hidden', '-EncodedCommand', encoded],
+                           capture_output=True, text=True, timeout=30)
+        if result.returncode != 0 or 'CHIEF_STOP_VERIFIED' not in result.stdout.splitlines():
+            raise RuntimeError('Chief service shutdown could not be verified; preserving installation files.')
 
     def install_wireguard_system_config(self, source_conf: Path) -> None:
         raise UnsupportedPlatformError("WireGuard server hosting is only supported on Linux (Ubuntu systemd on Folio). WireGuard server cannot be hosted on Windows.")
@@ -468,3 +605,75 @@ class WindowsPlatformAdapter(PlatformAdapter):
             return webbrowser.open(url)
         except Exception:
             return False
+
+    def create_console_launchers(self, paths: Any, public_host: str) -> None:
+        """Create distinct Windows desktop and Start Menu shortcuts for Chief Console and Chief Installer."""
+        desktop_dir = Path(os.environ.get("USERPROFILE") or str(Path.home())) / "Desktop"
+        start_menu_dir = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Chief"
+        start_menu_dir.mkdir(parents=True, exist_ok=True)
+
+        target_exe = sys.executable
+        if (paths.root / 'desktop/current.json').is_file():
+            from ..desktop_runtime import installed
+            target_exe = installed(paths)['helper']
+        elif getattr(sys, "frozen", False):
+            target_exe = os.environ.get("CHIEF_INSTALLER_FROZEN_EXECUTABLE") or sys.executable
+        elif hasattr(paths, "tooling") and (paths.tooling / "Chief-Installer-Windows.exe").exists():
+            target_exe = str(paths.tooling / "Chief-Installer-Windows.exe")
+        elif os.name == "nt" and target_exe.lower().endswith("python.exe"):
+            pyw = Path(target_exe).with_name("pythonw.exe")
+            if pyw.exists():
+                target_exe = str(pyw)
+
+        def _make_shortcut(link_path: Path, args: str, desc: str) -> None:
+            ps_script = (
+                f"$ws = New-Object -ComObject WScript.Shell; "
+                f"$s = $ws.CreateShortcut('{str(link_path).replace(chr(39), chr(39)+chr(39))}'); "
+                f"$s.TargetPath = '{str(target_exe).replace(chr(39), chr(39)+chr(39))}'; "
+                f"$s.Arguments = '{args}'; "
+                f"$s.Description = '{desc}'; "
+                f"$s.Save()"
+            )
+            run_quiet(["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps_script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        if desktop_dir.is_dir():
+            _make_shortcut(desktop_dir / "Chief Console.lnk", "--console", "Chief On-Farm Operations Console")
+
+        _make_shortcut(start_menu_dir / "Chief Console.lnk", "--console", "Chief On-Farm Operations Console")
+        _make_shortcut(start_menu_dir / "Chief Installer.lnk", "--gui", "Install or Repair Chief Deployment")
+        _make_shortcut(start_menu_dir / "Chief Uninstaller.lnk", "--uninstall", "Uninstall Chief Deployment")
+
+    def remove_console_launchers(self, paths: Any) -> List[str]:
+        """Remove Windows desktop and Start Menu shortcuts created by Chief."""
+        removed: List[str] = []
+        desktop_dir = Path(os.environ.get("USERPROFILE") or str(Path.home())) / "Desktop"
+        desktop_shortcut = desktop_dir / "Chief Console.lnk"
+        if desktop_shortcut.exists():
+            try:
+                desktop_shortcut.unlink()
+                removed.append(str(desktop_shortcut))
+            except Exception:
+                pass
+
+        start_menu_dir = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Chief"
+        for name in ("Chief Console.lnk", "Chief Installer.lnk", "Chief Uninstaller.lnk"):
+            p = start_menu_dir / name
+            if p.exists():
+                try:
+                    p.unlink()
+                    removed.append(str(p))
+                except Exception:
+                    pass
+        if start_menu_dir.is_dir():
+            try:
+                if not any(start_menu_dir.iterdir()):
+                    start_menu_dir.rmdir()
+                    removed.append(str(start_menu_dir))
+            except Exception:
+                pass
+        return removed
+
+    def cleanup_local_discovery(self, public_host: str) -> None:
+        """Clean up local discovery on Windows (no-op)."""
+        pass
+

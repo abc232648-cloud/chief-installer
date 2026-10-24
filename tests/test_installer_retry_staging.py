@@ -73,6 +73,40 @@ def test_retry_updates_clean_staging_to_exact_pin(tmp_path, monkeypatch):
         assert (target / 'version').read_text() == 'pinned'
 
 
+@pytest.mark.parametrize('existing', [False, True])
+@pytest.mark.parametrize('missing_pin', [False, True])
+def test_stale_cache_fetches_exact_pin_from_declared_repository(tmp_path, monkeypatch, existing, missing_pin):
+    from dataclasses import replace
+    monkeypatch.delenv('CHIEF_AGENT_SOURCE', raising=False)
+    source = tmp_path / 'declared-source'
+    def git(*args):
+        return subprocess.run(['git', *map(str, args)], check=True, capture_output=True, text=True).stdout.strip()
+    git('init', source)
+    (source / 'version').write_text('old')
+    git('-C', source, 'add', '.')
+    git('-C', source, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'old')
+    old = git('-C', source, 'rev-parse', 'HEAD')
+    installer = make_installer(tmp_path)
+    installer.paths.release_source.parent.mkdir(parents=True, exist_ok=True)
+    git('clone', source, installer.paths.release_source)
+    if existing:
+        git('clone', installer.paths.release_source, installer.paths.tooling)
+    (source / 'version').write_text('new')
+    git('-C', source, 'add', '.')
+    git('-C', source, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'new')
+    pin = 'a' * 40 if missing_pin else git('-C', source, 'rev-parse', 'HEAD')
+    installer.manifest = replace(installer.manifest, chief_agent_commit=pin)
+    if missing_pin:
+        with pytest.raises(InstallerError, match='Failed to fetch pinned'):
+            installer._acquire_repository(installer.paths.tooling, str(source), pin, 'chief_agent')
+        assert git('-C', installer.paths.tooling, 'rev-parse', 'HEAD') == old
+    else:
+        installer._acquire_repository(installer.paths.tooling, str(source), pin, 'chief_agent')
+        assert git('-C', installer.paths.tooling, 'rev-parse', 'HEAD') == pin
+        assert (installer.paths.tooling / 'version').read_text() == 'new'
+    assert git('-C', installer.paths.release_source, 'rev-parse', 'HEAD') == old
+
+
 def test_retry_replaces_non_git_partial_pwa_staging_and_preserves_it(tmp_path):
     from dataclasses import replace
 
@@ -154,3 +188,28 @@ def test_cached_wrong_node_version_is_not_reused(tmp_path, monkeypatch):
         return SimpleNamespace(returncode=0, stdout='v' + (installer.manifest.node_version if command[0] == str(system_node) else '22.23.3'))
     monkeypatch.setattr(module, 'run_quiet', version)
     assert installer._acquire_node_runtime() == (system_node, system_npm)
+
+
+def test_cleanup_failure_preserves_files_before_rollback(tmp_path):
+    installer = make_installer(tmp_path)
+    marker = tmp_path / "owned-partial-file"
+    marker.write_text("preserve until process cleanup is verified")
+    installer._tracked_files_created.append(marker)
+    installer._cleanup_unverified = True
+    installer._rollback_attempt()
+    assert marker.exists()
+
+
+def test_repository_acquisition_uses_cancellable_runner(tmp_path, monkeypatch):
+    from deployment.installer.errors import CancelledError
+    installer = make_installer(tmp_path)
+    calls = []
+    def cancel(command, **kwargs):
+        calls.append((command, kwargs))
+        raise CancelledError('synthetic cancellation')
+    monkeypatch.setattr(installer, 'run_command_streaming', cancel)
+    with pytest.raises(CancelledError):
+        installer._acquire_repository(component='chief-agent', repo_url='https://example.invalid/source',
+                                      commit='a'*40, target_dir=tmp_path/'new-source')
+    assert calls[0][0][0] == 'git'
+    assert calls[0][1]['timeout'] == 600

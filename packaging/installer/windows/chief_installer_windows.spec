@@ -12,7 +12,7 @@ a = Analysis(
     [str(project_root / 'deployment' / 'installer' / '__main__.py')],
     pathex=[str(project_root)],
     binaries=[],
-    datas=[],
+    datas=[(str(project_root / 'deployment' / 'installer' / 'desktop'), 'deployment/installer/desktop')],
     hiddenimports=[
         'tkinter',
         'tkinter.ttk',
@@ -31,6 +31,8 @@ a = Analysis(
         'deployment.installer.platforms.windows',
         'deployment.installer.ui.app',
         'deployment.installer.ui.controller',
+        'deployment.installer.console',
+        'deployment.installer.process',
         'zipfile',
         'xml.etree.ElementTree',
     ],

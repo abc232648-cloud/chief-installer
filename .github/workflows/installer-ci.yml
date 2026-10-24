@@ -28,9 +28,7 @@ jobs:
 
       - name: Checkout chief-agent peer repository at pinned manifest commit
         run: |
-          git clone https://github.com/abc232648-cloud/chief-agent.git ../chief-agent
-          git -C ../chief-agent checkout 3da37353b43109dd28f23ecdb933c5fd9d19db7e
-          test "$(git -C ../chief-agent rev-parse HEAD)" = "3da37353b43109dd28f23ecdb933c5fd9d19db7e" || exit 1
+          python packaging/checkout_release_peer.py ../chief-agent
         shell: bash
 
       - name: Set up Python ${{ matrix.python-version }}
@@ -48,6 +46,14 @@ jobs:
       - name: Run installer test suite
         run: |
           pytest -v
+
+      - name: Set up desktop policy test runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.21.0'
+
+      - name: Verify desktop security policy
+        run: node --test deployment/installer/desktop/tests/policy.test.cjs
 
   package-linux:
     name: Linux Package Build & Verification
@@ -121,9 +127,7 @@ jobs:
 
       - name: Checkout chief-agent peer repository at pinned manifest commit
         run: |
-          git clone https://github.com/abc232648-cloud/chief-agent.git ../chief-agent
-          git -C ../chief-agent checkout 3da37353b43109dd28f23ecdb933c5fd9d19db7e
-          test "$(git -C ../chief-agent rev-parse HEAD)" = "3da37353b43109dd28f23ecdb933c5fd9d19db7e" || exit 1
+          python packaging/checkout_release_peer.py ../chief-agent
         shell: bash
 
       - name: Set up Python 3.12
